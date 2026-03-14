@@ -1,0 +1,8 @@
+# Contains SMTP credentials – never commit
+config.json
+
+# Network state – site-specific data
+state.json
+
+# Downloaded OUI vendor database – regenerated automatically
+oui.csv

@@ -1,0 +1,13 @@
+{
+  "subnet": "",
+  "statePath": "",
+  "ouiPath": "",
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587,
+    "user": "alerts@example.com",
+    "password": "your-smtp-password",
+    "from": "rdd@example.com",
+    "to": "helpdesk@example.com"
+  }
+}
