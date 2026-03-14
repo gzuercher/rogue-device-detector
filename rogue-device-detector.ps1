@@ -44,9 +44,24 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION   = '1.0.0'
+$SCRIPT_VERSION   = '1.1.0'
 $OUI_URL          = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS = 30
+
+$SECURITY_PORTS = @(
+    [PSCustomObject]@{ Port = 21;   Label = 'FTP';        Risk = 'HIGH';     Reason = 'Unencrypted file transfer' },
+    [PSCustomObject]@{ Port = 22;   Label = 'SSH';        Risk = 'LOW';      Reason = 'Remote access (SSH)' },
+    [PSCustomObject]@{ Port = 23;   Label = 'Telnet';     Risk = 'CRITICAL'; Reason = 'Unencrypted remote access (Telnet)' },
+    [PSCustomObject]@{ Port = 25;   Label = 'SMTP';       Risk = 'MEDIUM';   Reason = 'Mail server exposed' },
+    [PSCustomObject]@{ Port = 80;   Label = 'HTTP';       Risk = 'LOW';      Reason = 'Unencrypted web interface' },
+    [PSCustomObject]@{ Port = 443;  Label = 'HTTPS';      Risk = 'NONE';     Reason = '' },
+    [PSCustomObject]@{ Port = 445;  Label = 'SMB';        Risk = 'HIGH';     Reason = 'File sharing exposed (ransomware vector)' },
+    [PSCustomObject]@{ Port = 3389; Label = 'RDP';        Risk = 'HIGH';     Reason = 'Remote Desktop exposed' },
+    [PSCustomObject]@{ Port = 8080; Label = 'HTTP-alt';   Risk = 'LOW';      Reason = 'Alternate web interface' },
+    [PSCustomObject]@{ Port = 8443; Label = 'HTTPS-alt';  Risk = 'NONE';     Reason = '' }
+)
+
+$RISK_ORDER = @{ 'NONE' = 0; 'LOW' = 1; 'MEDIUM' = 2; 'HIGH' = 3; 'CRITICAL' = 4 }
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -86,10 +101,12 @@ function Get-Configuration {
     )
 
     $cfg = @{
-        subnet    = ''
-        statePath = Join-Path $PSScriptRoot 'state.json'
-        ouiPath   = Join-Path $PSScriptRoot 'oui.csv'
-        smtp      = @{
+        subnet     = ''
+        statePath  = Join-Path $PSScriptRoot 'state.json'
+        ouiPath    = Join-Path $PSScriptRoot 'oui.csv'
+        logPath    = Join-Path $PSScriptRoot 'rdd-audit.csv'
+        enrichment = $true
+        smtp       = @{
             host     = ''
             port     = 587
             user     = ''
@@ -102,9 +119,11 @@ function Get-Configuration {
     if (Test-Path $ConfigPath) {
         try {
             $file = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-            if ($file.subnet)    { $cfg.subnet    = $file.subnet }
-            if ($file.statePath) { $cfg.statePath = $file.statePath }
-            if ($file.ouiPath)   { $cfg.ouiPath   = $file.ouiPath }
+            if ($file.subnet)                    { $cfg.subnet     = $file.subnet }
+            if ($file.statePath)                 { $cfg.statePath  = $file.statePath }
+            if ($file.ouiPath)                   { $cfg.ouiPath    = $file.ouiPath }
+            if ($file.logPath)                   { $cfg.logPath    = $file.logPath }
+            if ($null -ne $file.enrichment)      { $cfg.enrichment = [bool]$file.enrichment }
             if ($null -ne $file.smtp) {
                 if ($file.smtp.host)     { $cfg.smtp.host     = $file.smtp.host }
                 if ($file.smtp.port)     { $cfg.smtp.port     = [int]$file.smtp.port }
@@ -305,6 +324,214 @@ function Resolve-Hostnames {
     Write-Log "Hostname resolution complete: $resolved/$total resolved."
 }
 
+# ── Enrichment ─────────────────────────────────────────────────────────────────
+
+function Invoke-PortScan {
+    <#
+    .SYNOPSIS
+        Scans security-relevant TCP ports on a single host concurrently.
+    .PARAMETER IP Target IP address.
+    .PARAMETER TimeoutMs Connection timeout per port in milliseconds.
+    .RETURNS Array of open port numbers.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$TimeoutMs = 500
+    )
+
+    $tasks = $SECURITY_PORTS | ForEach-Object {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        [PSCustomObject]@{
+            Port    = $_.Port
+            Client  = $client
+            Task    = $client.ConnectAsync($IP, $_.Port)
+            Timeout = [System.Threading.Tasks.Task]::Delay($TimeoutMs)
+        }
+    }
+
+    $open = [System.Collections.Generic.List[int]]::new()
+    foreach ($t in $tasks) {
+        try {
+            $arr    = [System.Threading.Tasks.Task[]]@($t.Task, $t.Timeout)
+            $winner = [System.Threading.Tasks.Task]::WhenAny($arr).GetAwaiter().GetResult()
+            if ($winner -eq $t.Task -and $t.Task.Status -eq 'RanToCompletion') {
+                $open.Add($t.Port)
+            }
+        } catch { }
+        finally { try { $t.Client.Dispose() } catch { } }
+    }
+
+    return $open.ToArray()
+}
+
+function Get-HttpBanner {
+    <#
+    .SYNOPSIS
+        Grabs the page title and Server header from a device's web interface.
+    .PARAMETER IP Target IP address.
+    .PARAMETER OpenPorts Array of open port numbers to check.
+    .RETURNS Descriptive string, or empty string if no web interface found.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int[]]$OpenPorts
+    )
+
+    $webPorts = @($OpenPorts | Where-Object { $_ -in @(80, 443, 8080, 8443) })
+    if ($webPorts.Count -eq 0) { return '' }
+
+    foreach ($port in $webPorts) {
+        $scheme = if ($port -in @(443, 8443)) { 'https' } else { 'http' }
+        $url    = "${scheme}://${IP}:${port}/"
+        try {
+            $response = Invoke-WebRequest -Uri $url -TimeoutSec 3 -UseBasicParsing `
+                -ErrorAction Stop `
+                -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            $parts = [System.Collections.Generic.List[string]]::new()
+            if ($response.Content -match '<title[^>]*>([^<]{2,80})</title>') {
+                $parts.Add($Matches[1].Trim())
+            }
+            $server = $response.Headers['Server']
+            if ($server) { $parts.Add("Server: $server") }
+            if ($parts.Count -gt 0) { return $parts -join ' | ' }
+        } catch { }
+    }
+    return ''
+}
+
+function Invoke-UpnpDiscovery {
+    <#
+    .SYNOPSIS
+        Sends a UPnP/SSDP M-SEARCH broadcast and collects device responses.
+    .PARAMETER ListenSeconds How long to listen for responses.
+    .RETURNS Hashtable of IP address -> SERVER string.
+    #>
+    param([int]$ListenSeconds = 3)
+
+    $results = @{}
+    try {
+        $client = [System.Net.Sockets.UdpClient]::new()
+        $client.Client.ReceiveTimeout = 500
+        $msg   = "M-SEARCH * HTTP/1.1`r`nHOST: 239.255.255.250:1900`r`nMAN: `"ssdp:discover`"`r`nMX: $ListenSeconds`r`nST: upnp:rootdevice`r`n`r`n"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($msg)
+        $ep    = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse('239.255.255.250'), 1900)
+        $client.Send($bytes, $bytes.Length, $ep) | Out-Null
+
+        $stop = (Get-Date).AddSeconds($ListenSeconds)
+        while ((Get-Date) -lt $stop) {
+            try {
+                $remote   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+                $data     = $client.Receive([ref]$remote)
+                $response = [System.Text.Encoding]::ASCII.GetString($data)
+                $ip       = $remote.Address.ToString()
+                if ($response -match '(?i)SERVER:\s*(.+)') {
+                    $results[$ip] = $Matches[1].Trim()
+                } elseif (-not $results.ContainsKey($ip)) {
+                    $results[$ip] = 'UPnP device'
+                }
+            } catch { }
+        }
+        $client.Dispose()
+    } catch { }
+
+    return $results
+}
+
+function Get-DeviceRisk {
+    <#
+    .SYNOPSIS
+        Evaluates the risk level of a device based on its open ports.
+    .PARAMETER OpenPorts Array of open port numbers.
+    .RETURNS PSCustomObject with Level (string) and Reasons (string array).
+    #>
+    param([int[]]$OpenPorts)
+
+    $level   = 'NONE'
+    $reasons = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($port in $OpenPorts) {
+        $def = $SECURITY_PORTS | Where-Object { $_.Port -eq $port } | Select-Object -First 1
+        if (-not $def -or $def.Risk -eq 'NONE' -or -not $def.Reason) { continue }
+        $reasons.Add("$($def.Reason) (port $port)")
+        if ($RISK_ORDER[$def.Risk] -gt $RISK_ORDER[$level]) { $level = $def.Risk }
+    }
+
+    return [PSCustomObject]@{ Level = $level; Reasons = $reasons.ToArray() }
+}
+
+function Invoke-DeviceEnrichment {
+    <#
+    .SYNOPSIS
+        Enriches a device list with port scan, HTTP banner, UPnP, and risk data.
+        Updates device objects in place.
+    .PARAMETER Devices Array of device PSCustomObjects.
+    #>
+    param([Parameter(Mandatory)][array]$Devices)
+
+    Write-Log "Enriching $($Devices.Count) device(s) (ports / banner / UPnP)..."
+    Write-Log 'Running UPnP discovery...'
+    $upnpMap = Invoke-UpnpDiscovery
+
+    $i = 0
+    foreach ($d in $Devices) {
+        $i++
+        Write-Progress -Activity 'Enriching devices' `
+                       -Status "$i/$($Devices.Count) - $($d.ip)" `
+                       -PercentComplete ([int]($i / $Devices.Count * 100))
+
+        $d.openPorts   = Invoke-PortScan -IP $d.ip
+        $d.httpBanner  = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
+        $d.upnpInfo    = if ($upnpMap.ContainsKey($d.ip)) { $upnpMap[$d.ip] } else { '' }
+        $risk          = Get-DeviceRisk  -OpenPorts $d.openPorts
+        $d.riskLevel   = $risk.Level
+        $d.riskReasons = $risk.Reasons
+    }
+
+    Write-Progress -Activity 'Enriching devices' -Completed
+    $risky = @($Devices | Where-Object { $_.riskLevel -ne 'NONE' }).Count
+    Write-Log "Enrichment done: $risky/$($Devices.Count) device(s) with risk findings."
+}
+
+# ── Audit Log ──────────────────────────────────────────────────────────────────
+
+function Write-AuditLog {
+    <#
+    .SYNOPSIS
+        Appends a single event to the CSV audit log (append-only).
+        Creates the file with headers on first use.
+    .PARAMETER LogPath  Path to the audit CSV file.
+    .PARAMETER Event    SCAN_START | SCAN_DONE | DEVICE_NEW | DEVICE_ROGUE | RISK_FOUND
+    .PARAMETER Device   Optional device PSCustomObject (for device events).
+    .PARAMETER Details  Optional free-text details field.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$Event,
+        [PSCustomObject]$Device  = $null,
+        [string]$Details         = ''
+    )
+
+    if (-not (Test-Path $LogPath)) {
+        Set-Content -Path $LogPath -Encoding UTF8 `
+            -Value 'Timestamp,Event,Scanner,MAC,IP,Hostname,Vendor,OpenPorts,Risk,Details'
+    }
+
+    $fields = @(
+        (Get-Date).ToUniversalTime().ToString('o'),
+        $Event,
+        $env:COMPUTERNAME,
+        $(if ($Device) { $Device.mac }                                       else { '' }),
+        $(if ($Device) { $Device.ip }                                        else { '' }),
+        $(if ($Device) { $Device.hostname }                                  else { '' }),
+        $(if ($Device) { $Device.vendor }                                    else { '' }),
+        $(if ($Device -and $Device.openPorts) { $Device.openPorts -join ' '} else { '' }),
+        $(if ($Device -and $Device.riskLevel) { $Device.riskLevel }          else { '' }),
+        $Details
+    ) | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }
+
+    Add-Content -Path $LogPath -Value ($fields -join ',') -Encoding UTF8
+}
+
 # ── OUI Lookup ─────────────────────────────────────────────────────────────────
 
 function Get-OuiDatabase {
@@ -428,7 +655,25 @@ function Send-RogueAlert {
     }
 
     $deviceLines = ($Devices | ForEach-Object {
-        "  MAC:      $($_.mac)`n  IP:       $($_.ip)`n  Hostname: $($_.hostname)`n  Vendor:   $($_.vendor)"
+        $d     = $_
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("  MAC:      $($d.mac)")
+        $lines.Add("  IP:       $($d.ip)")
+        $lines.Add("  Hostname: $($d.hostname)")
+        $lines.Add("  Vendor:   $($d.vendor)")
+        if ($d.openPorts -and $d.openPorts.Count -gt 0) {
+            $labels = $d.openPorts | ForEach-Object {
+                $def = $SECURITY_PORTS | Where-Object { $_.Port -eq $_ } | Select-Object -First 1
+                if ($def) { "$_/$($def.Label)" } else { "$_" }
+            }
+            $lines.Add("  Ports:    $($labels -join ', ')")
+        }
+        if ($d.riskLevel -and $d.riskLevel -ne 'NONE') {
+            $lines.Add("  RISK:     [$($d.riskLevel)] $($d.riskReasons -join '; ')")
+        }
+        if ($d.httpBanner) { $lines.Add("  Banner:   $($d.httpBanner)") }
+        if ($d.upnpInfo)   { $lines.Add("  UPnP:     $($d.upnpInfo)") }
+        $lines -join "`n"
     }) -join "`n`n"
 
     $body = @"
@@ -479,6 +724,7 @@ $cfg        = Get-Configuration -ConfigPath $configPath -SubnetOverride $Subnet
 
 # Resolve target subnet
 $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
+Write-AuditLog -LogPath $cfg.logPath -Event 'SCAN_START' -Details "subnet=$targetSubnet mode=$(if ($LearningMode) { 'learning' } else { 'normal' })"
 Write-Log "Target subnet: $targetSubnet"
 $subnetInfo = Get-SubnetInfo -Cidr $targetSubnet
 
@@ -498,10 +744,15 @@ if ($arpEntries.Count -eq 0) {
 # Build device list, resolve hostnames concurrently, then look up vendors
 $foundDevices = $arpEntries | ForEach-Object {
     [PSCustomObject]@{
-        mac      = $_.MAC
-        ip       = $_.IP
-        hostname = $_.IP   # placeholder, overwritten by Resolve-Hostnames
-        vendor   = ''
+        mac        = $_.MAC
+        ip         = $_.IP
+        hostname   = $_.IP   # placeholder, overwritten by Resolve-Hostnames
+        vendor     = ''
+        openPorts  = @()
+        httpBanner = ''
+        upnpInfo   = ''
+        riskLevel  = 'NONE'
+        riskReasons = @()
     }
 }
 
@@ -509,6 +760,10 @@ Resolve-Hostnames -Devices $foundDevices
 
 foreach ($d in $foundDevices) {
     $d.vendor = Get-MacVendor -Mac $d.mac -OuiDb $ouiDb
+}
+
+if ($cfg.enrichment) {
+    Invoke-DeviceEnrichment -Devices $foundDevices
 }
 
 # Load state
@@ -552,13 +807,20 @@ if ($LearningMode -or -not $stateFileExists) {
     if ($newDevices.Count -gt 0) {
         Write-Log "--- SIMULATED ALERT: $($newDevices.Count) new device(s) added to baseline ---"
         foreach ($d in $newDevices) {
-            Write-Log "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $($d.hostname)  Vendor: $($d.vendor)"
+            $riskTag = if ($d.riskLevel -ne 'NONE') { " [$($d.riskLevel)]" } else { '' }
+            Write-Log "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $($d.hostname)  Vendor: $($d.vendor)$riskTag"
+            if ($d.riskReasons -and $d.riskReasons.Count -gt 0) {
+                Write-Log "       RISK: $($d.riskReasons -join '; ')" -Level WARN
+            }
+            Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_NEW' -Device $d -Details 'Added to baseline'
         }
         Write-Log "--- In normal scan mode these would trigger an alert email. ---"
     } else {
         Write-Log 'No new devices found - baseline unchanged.'
     }
 
+    Write-AuditLog -LogPath $cfg.logPath -Event 'SCAN_DONE' `
+        -Details "found=$($foundDevices.Count) new=$($newDevices.Count) mode=learning"
     exit 0
 }
 
@@ -572,20 +834,32 @@ foreach ($device in $foundDevices) {
         $known.ip       = $device.ip
         $known.hostname = $device.hostname
     } else {
-        Write-Log "ROGUE: $($device.mac)  $($device.ip)  $($device.hostname)  [$($device.vendor)]" -Level WARN
-        $rogueDevices.Add([PSCustomObject]@{
-            mac       = $device.mac
-            ip        = $device.ip
-            hostname  = $device.hostname
-            vendor    = $device.vendor
-            firstSeen = $now
-            lastSeen  = $now
-        })
+        $riskTag = if ($device.riskLevel -ne 'NONE') { " [$($device.riskLevel)]" } else { '' }
+        Write-Log "ROGUE: $($device.mac)  $($device.ip)  $($device.hostname)  [$($device.vendor)]$riskTag" -Level WARN
+        $rogueDevices.Add($device)
+        Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_ROGUE' -Device $device `
+            -Details ($device.riskReasons -join '; ')
+    }
+}
+
+# Log risk findings for known devices with HIGH or CRITICAL risk
+foreach ($device in $foundDevices) {
+    if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
+        $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
+        if (-not $isRogue) {
+            Write-Log "RISK [$($device.riskLevel)]: $($device.ip) $($device.hostname) - $($device.riskReasons -join '; ')" -Level WARN
+            Write-AuditLog -LogPath $cfg.logPath -Event 'RISK_FOUND' -Device $device `
+                -Details ($device.riskReasons -join '; ')
+        }
     }
 }
 
 $state.lastScan = $now
 Save-State -State $state -StatePath $cfg.statePath
+
+$riskCount = @($foundDevices | Where-Object { $_.riskLevel -ne 'NONE' }).Count
+Write-AuditLog -LogPath $cfg.logPath -Event 'SCAN_DONE' `
+    -Details "found=$($foundDevices.Count) rogue=$($rogueDevices.Count) risks=$riskCount mode=normal"
 
 if ($rogueDevices.Count -gt 0) {
     Write-Log "$($rogueDevices.Count) rogue device(s) detected."

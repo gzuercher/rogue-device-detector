@@ -2,6 +2,8 @@
   "subnet": "",
   "statePath": "C:\\temp\\state.json",
   "ouiPath": "C:\\temp\\oui.csv",
+  "logPath": "C:\\temp\\rdd-audit.csv",
+  "enrichment": true,
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
