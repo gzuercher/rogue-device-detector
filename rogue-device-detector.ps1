@@ -23,7 +23,7 @@
     Use for initial setup or after deliberately adding new devices.
 
 .EXAMPLE
-    # First-time setup – establish baseline
+    # First-time setup - establish baseline
     .\rogue-device-detector.ps1 -LearningMode
 
     # Regular scan (run via scheduler)
@@ -195,7 +195,7 @@ function Invoke-PingSweep {
     param([Parameter(Mandatory)][hashtable]$SubnetInfo)
 
     if ($SubnetInfo.HostCount -gt 2046) {
-        Write-Log "Subnet has $($SubnetInfo.HostCount) hosts – scan may take a while." -Level WARN
+        Write-Log "Subnet has $($SubnetInfo.HostCount) hosts - scan may take a while." -Level WARN
     }
 
     Write-Log "Pinging $($SubnetInfo.HostCount) host(s) in $($SubnetInfo.NetworkAddress)/$($SubnetInfo.PrefixLength)..."
@@ -391,7 +391,7 @@ function Send-RogueAlert {
     )
 
     if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
-        Write-Log 'SMTP not configured – skipping email alert.' -Level WARN
+        Write-Log 'SMTP not configured - skipping email alert.' -Level WARN
         return
     }
 
@@ -400,7 +400,7 @@ function Send-RogueAlert {
     }) -join "`n`n"
 
     $body = @"
-Rogue Device Detector – Alert
+Rogue Device Detector - Alert
 
 The following unknown device(s) were found on the network:
 
@@ -417,7 +417,7 @@ Action required:
     $mailParams = @{
         From       = $SmtpConfig.from
         To         = $SmtpConfig.to
-        Subject    = "[$env:COMPUTERNAME] $($Devices.Count) rogue device(s) detected – $(Get-Date -Format 'yyyy-MM-dd')"
+        Subject    = "[$env:COMPUTERNAME] $($Devices.Count) rogue device(s) detected - $(Get-Date -Format 'yyyy-MM-dd')"
         Body       = $body
         SmtpServer = $SmtpConfig.host
         Port       = [int]$SmtpConfig.port
@@ -482,9 +482,9 @@ $now             = (Get-Date).ToUniversalTime().ToString('o')
 # Learning mode: merge found devices into baseline without alerts
 if ($LearningMode -or -not $stateFileExists) {
     if (-not $stateFileExists) {
-        Write-Log 'No state file found – creating baseline (learning mode).'
+        Write-Log 'No state file found - creating baseline (learning mode).'
     } else {
-        Write-Log 'Learning mode – merging found devices into baseline.'
+        Write-Log 'Learning mode - merging found devices into baseline.'
     }
 
     foreach ($device in $foundDevices) {
@@ -540,5 +540,5 @@ if ($rogueDevices.Count -gt 0) {
     Write-Log "$($rogueDevices.Count) rogue device(s) detected."
     Send-RogueAlert -Devices $rogueDevices.ToArray() -SmtpConfig $cfg.smtp
 } else {
-    Write-Log 'Scan complete – all devices are known.'
+    Write-Log 'Scan complete - all devices are known.'
 }
