@@ -258,23 +258,51 @@ function Get-ArpEntries {
     return $entries.ToArray()
 }
 
-function Resolve-DeviceHostname {
+function Resolve-Hostnames {
     <#
     .SYNOPSIS
-        Resolves an IP address to a hostname via reverse DNS.
-    .PARAMETER IP IP address to resolve.
-    .RETURNS Hostname string, or the IP address if resolution fails.
+        Resolves hostnames for an array of devices concurrently via async DNS.
+        All requests are fired simultaneously, each with a 2-second timeout.
+        Updates the hostname property of each device object in place.
+    .PARAMETER Devices Array of PSCustomObjects with an 'ip' property.
     #>
-    param([Parameter(Mandatory)][string]$IP)
+    param([Parameter(Mandatory)][array]$Devices)
 
-    try {
-        $entry = [System.Net.Dns]::GetHostEntry($IP)
-        if ($entry.HostName -and $entry.HostName -ne $IP) {
-            return $entry.HostName
+    $timeoutMs = 2000
+
+    # Fire all DNS requests concurrently before waiting for any
+    $tasks = $Devices | ForEach-Object {
+        [PSCustomObject]@{
+            Device      = $_
+            DnsTask     = [System.Net.Dns]::GetHostEntryAsync($_.ip)
+            TimeoutTask = [System.Threading.Tasks.Task]::Delay($timeoutMs)
         }
-    } catch { }
+    }
 
-    return $IP
+    $resolved = 0
+    $total    = $tasks.Count
+    $i        = 0
+
+    foreach ($t in $tasks) {
+        $i++
+        Write-Progress -Activity 'Resolving hostnames' `
+                       -Status "$i/$total - $($t.Device.ip)" `
+                       -PercentComplete ([int]($i / $total * 100))
+        try {
+            $taskArray = [System.Threading.Tasks.Task[]]@($t.DnsTask, $t.TimeoutTask)
+            $winner    = [System.Threading.Tasks.Task]::WhenAny($taskArray).GetAwaiter().GetResult()
+            if ($winner -eq $t.DnsTask -and $t.DnsTask.Status -eq 'RanToCompletion') {
+                $h = $t.DnsTask.Result.HostName
+                if ($h -and $h -ne $t.Device.ip) {
+                    $t.Device.hostname = $h
+                    $resolved++
+                }
+            }
+        } catch { }
+    }
+
+    Write-Progress -Activity 'Resolving hostnames' -Completed
+    Write-Log "Hostname resolution complete: $resolved/$total resolved."
 }
 
 # ── OUI Lookup ─────────────────────────────────────────────────────────────────
@@ -463,15 +491,20 @@ if ($arpEntries.Count -eq 0) {
     exit 0
 }
 
-# Enrich each entry with hostname and vendor
-Write-Log 'Resolving hostnames...'
+# Build device list, resolve hostnames concurrently, then look up vendors
 $foundDevices = $arpEntries | ForEach-Object {
     [PSCustomObject]@{
         mac      = $_.MAC
         ip       = $_.IP
-        hostname = Resolve-DeviceHostname -IP $_.IP
-        vendor   = Get-MacVendor -Mac $_.MAC -OuiDb $ouiDb
+        hostname = $_.IP   # placeholder, overwritten by Resolve-Hostnames
+        vendor   = ''
     }
+}
+
+Resolve-Hostnames -Devices $foundDevices
+
+foreach ($d in $foundDevices) {
+    $d.vendor = Get-MacVendor -Mac $d.mac -OuiDb $ouiDb
 }
 
 # Load state
