@@ -271,6 +271,10 @@ function Get-ArpEntries {
         $ipInt = [System.BitConverter]::ToUInt32($ipBytes, 0)
         if (($ipInt -band $mask) -ne $SubnetInfo.BaseInt) { continue }
 
+        # Skip network address (host bits all 0) and broadcast (host bits all 1)
+        $hostMask = [uint32]([Math]::Pow(2, 32 - $SubnetInfo.PrefixLength) - 1)
+        if (($ipInt -band $hostMask) -eq 0 -or ($ipInt -band $hostMask) -eq $hostMask) { continue }
+
         $entries.Add([PSCustomObject]@{ IP = $ip; MAC = $mac })
     }
 
