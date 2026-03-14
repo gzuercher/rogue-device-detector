@@ -322,7 +322,11 @@ function Get-OuiDatabase {
     if ($stale) {
         try {
             Write-Log 'Updating OUI database from IEEE...'
-            Invoke-WebRequest -Uri $OUI_URL -OutFile $CachePath -TimeoutSec 60 -UseBasicParsing
+            # Use system proxy and a browser User-Agent to pass corporate firewalls
+            [System.Net.WebRequest]::DefaultWebProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+            [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+            Invoke-WebRequest -Uri $OUI_URL -OutFile $CachePath -TimeoutSec 60 -UseBasicParsing `
+                -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             Write-Log 'OUI database updated.'
         } catch {
             Write-Log "OUI download failed: $_. Vendor names will show as 'Unknown'." -Level WARN
@@ -520,6 +524,8 @@ if ($LearningMode -or -not $stateFileExists) {
         Write-Log 'Learning mode - merging found devices into baseline.'
     }
 
+    $newDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
+
     foreach ($device in $foundDevices) {
         $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
         if ($known) {
@@ -527,6 +533,7 @@ if ($LearningMode -or -not $stateFileExists) {
             $known.ip       = $device.ip
             $known.hostname = $device.hostname
         } else {
+            $newDevices.Add($device)
             $state.knownDevices += [PSCustomObject]@{
                 mac       = $device.mac
                 ip        = $device.ip
@@ -540,7 +547,18 @@ if ($LearningMode -or -not $stateFileExists) {
 
     $state.lastScan = $now
     Save-State -State $state -StatePath $cfg.statePath
-    Write-Log "Baseline saved: $($state.knownDevices.Count) device(s) → $($cfg.statePath)"
+    Write-Log "Baseline saved: $($state.knownDevices.Count) device(s) -> $($cfg.statePath)"
+
+    if ($newDevices.Count -gt 0) {
+        Write-Log "--- SIMULATED ALERT: $($newDevices.Count) new device(s) added to baseline ---"
+        foreach ($d in $newDevices) {
+            Write-Log "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $($d.hostname)  Vendor: $($d.vendor)"
+        }
+        Write-Log "--- In normal scan mode these would trigger an alert email. ---"
+    } else {
+        Write-Log 'No new devices found - baseline unchanged.'
+    }
+
     exit 0
 }
 
