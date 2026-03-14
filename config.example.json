@@ -1,7 +1,7 @@
 {
   "subnet": "",
-  "statePath": "",
-  "ouiPath": "",
+  "statePath": "C:\\temp\\state.json",
+  "ouiPath": "C:\\temp\\oui.csv",
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,

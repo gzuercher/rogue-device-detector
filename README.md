@@ -50,8 +50,8 @@ Copy `config.example.json` to `config.json` and adjust:
 | Field | Default | Description |
 |---|---|---|
 | `subnet` | auto-detect | CIDR subnet to scan, e.g. `192.168.1.0/24` |
-| `statePath` | `state.json` in script dir | Path to the known-device state file |
-| `ouiPath` | `oui.csv` in script dir | Path to the OUI vendor cache |
+| `statePath` | `state.json` in script dir | Full path to the known-device state file, e.g. `C:\\temp\\state.json` |
+| `ouiPath` | `oui.csv` in script dir | Full path to the OUI vendor cache file, e.g. `C:\\temp\\oui.csv` |
 | `smtp.host` | – | SMTP server hostname |
 | `smtp.port` | `587` | SMTP port (STARTTLS) |
 | `smtp.user` | – | SMTP username |
