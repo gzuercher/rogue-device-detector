@@ -868,6 +868,8 @@ function Show-Baseline {
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
+# Guard: skip main body when dot-sourced for unit testing (e.g. Pester)
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 Write-Log "Rogue Device Detector v$SCRIPT_VERSION starting on $env:COMPUTERNAME"
 
