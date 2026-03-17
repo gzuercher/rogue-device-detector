@@ -22,6 +22,23 @@
     Merges all currently found devices into the baseline without alerts.
     Use for initial setup or after deliberately adding new devices.
 
+.PARAMETER Approve
+    MAC address to approve and add to the baseline (e.g. "AA:BB:CC:DD:EE:FF").
+    Optionally combine with -Label to store a human-readable device name.
+    Use this to approve a specific device shown in an alert without a full scan.
+
+.PARAMETER Label
+    Human-readable name for the device being approved (e.g. "John's laptop").
+    Only used together with -Approve.
+
+.PARAMETER Remove
+    MAC address to remove from the baseline (e.g. "AA:BB:CC:DD:EE:FF").
+    Use this to un-approve a device that was added by mistake or left the network.
+
+.PARAMETER List
+    Displays all approved devices in the baseline and exits.
+    No scan is performed.
+
 .EXAMPLE
     # First-time setup - establish baseline
     .\rogue-device-detector.ps1 -LearningMode
@@ -31,12 +48,25 @@
 
     # Override subnet
     .\rogue-device-detector.ps1 -Subnet "10.0.1.0/24"
+
+    # Approve a specific device from an alert (copy-paste the command from the email)
+    .\rogue-device-detector.ps1 -Approve "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
+
+    # Remove a device that left the network
+    .\rogue-device-detector.ps1 -Remove "AA:BB:CC:DD:EE:FF"
+
+    # Show all approved devices
+    .\rogue-device-detector.ps1 -List
 #>
 [CmdletBinding()]
 param(
     [string]$Config = '',
     [string]$Subnet = '',
-    [switch]$LearningMode
+    [switch]$LearningMode,
+    [string]$Approve = '',
+    [string]$Label   = '',
+    [string]$Remove  = '',
+    [switch]$List
 )
 
 Set-StrictMode -Version Latest
@@ -658,6 +688,8 @@ function Send-RogueAlert {
         return
     }
 
+    $scriptPath = $PSCommandPath
+
     $deviceLines = ($Devices | ForEach-Object {
         $d     = $_
         $lines = [System.Collections.Generic.List[string]]::new()
@@ -677,22 +709,26 @@ function Send-RogueAlert {
         }
         if ($d.httpBanner) { $lines.Add("  Banner:   $($d.httpBanner)") }
         if ($d.upnpInfo)   { $lines.Add("  UPnP:     $($d.upnpInfo)") }
+        $lines.Add("")
+        $lines.Add("  -> If AUTHORIZED, run on $($env:COMPUTERNAME):")
+        $lines.Add("     & `"$scriptPath`" -Approve `"$($d.mac)`" -Label `"<device description>`"")
+        $lines.Add("  -> If UNAUTHORIZED: isolate/remove from network immediately.")
         $lines -join "`n"
-    }) -join "`n`n"
+    }) -join "`n`n---`n`n"
 
     $body = @"
 Rogue Device Detector - Alert
 
-The following unknown device(s) were found on the network:
+$($Devices.Count) unknown device(s) found on the network:
 
 $deviceLines
 
+---
 Scan time : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 Scanner   : $env:COMPUTERNAME
 
-Action required:
-  Authorized device   -> Re-run with -LearningMode to add to baseline
-  Unauthorized device -> Remove from the network immediately
+To review the full baseline:
+  & "$scriptPath" -List
 "@
 
     $mailParams = @{
@@ -718,6 +754,119 @@ Action required:
     }
 }
 
+# ── Baseline Management ────────────────────────────────────────────────────────
+
+function Invoke-ApproveDevice {
+    <#
+    .SYNOPSIS
+        Adds or updates a device in the baseline without running a scan.
+    .PARAMETER Mac     MAC address to approve (normalized to uppercase AA:BB:CC:DD:EE:FF).
+    .PARAMETER Label   Optional human-readable device name.
+    .PARAMETER State   State object loaded from state.json.
+    .PARAMETER Now     ISO timestamp string for approvedAt / lastSeen.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Mac,
+        [string]$Label = '',
+        [Parameter(Mandatory)][PSCustomObject]$State,
+        [Parameter(Mandatory)][string]$Now
+    )
+
+    # Normalize MAC to uppercase colon-separated
+    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
+    $mac = $mac.ToUpper()
+    if ($mac.Length -ne 17) {
+        throw "Invalid MAC address format: '$Mac'. Expected AA:BB:CC:DD:EE:FF."
+    }
+
+    $existing = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
+    if ($existing) {
+        if ($Label) { $existing.label = $Label }
+        $existing.approvedBy = "$env:USERDOMAIN\$env:USERNAME"
+        $existing.approvedAt = $Now
+        Write-Log "Updated existing device $mac in baseline$(if ($Label) { " (label: '$Label')" } else { '' })."
+    } else {
+        $State.knownDevices += [PSCustomObject]@{
+            mac        = $mac
+            ip         = ''
+            hostname   = ''
+            vendor     = ''
+            label      = $Label
+            firstSeen  = $Now
+            lastSeen   = $Now
+            approvedBy = "$env:USERDOMAIN\$env:USERNAME"
+            approvedAt = $Now
+        }
+        Write-Log "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
+    }
+}
+
+function Invoke-RemoveDevice {
+    <#
+    .SYNOPSIS
+        Removes a device from the baseline by MAC address.
+    .PARAMETER Mac   MAC address to remove.
+    .PARAMETER State State object loaded from state.json.
+    .RETURNS $true if removed, $false if not found.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Mac,
+        [Parameter(Mandatory)][PSCustomObject]$State
+    )
+
+    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
+    $mac = $mac.ToUpper()
+
+    $before = @($State.knownDevices).Count
+    $State.knownDevices = @($State.knownDevices) | Where-Object { $_.mac -ne $mac }
+    $removed = @($State.knownDevices).Count -lt $before
+
+    if ($removed) {
+        Write-Log "Removed device $mac from baseline."
+    } else {
+        Write-Log "Device $mac not found in baseline." -Level WARN
+    }
+    return $removed
+}
+
+function Show-Baseline {
+    <#
+    .SYNOPSIS
+        Displays all approved devices in the baseline in a human-readable format.
+    .PARAMETER State     State object loaded from state.json.
+    .PARAMETER StatePath Path shown in the header for reference.
+    #>
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$State,
+        [Parameter(Mandatory)][string]$StatePath
+    )
+
+    $devices = @($State.knownDevices)
+    $lastScan = if ($State.lastScan) { $State.lastScan } else { 'never' }
+
+    Write-Host ""
+    Write-Host "Approved devices baseline - $StatePath"
+    Write-Host "Last scan : $lastScan"
+    Write-Host "Devices   : $($devices.Count)"
+    Write-Host ("-" * 80)
+
+    if ($devices.Count -eq 0) {
+        Write-Host "  (no devices in baseline)"
+    } else {
+        foreach ($d in ($devices | Sort-Object mac)) {
+            $label      = if ($d.label)      { " | Label: $($d.label)" }          else { '' }
+            $approvedBy = if ($d.approvedBy) { " | Approved by: $($d.approvedBy)" } else { '' }
+            $approvedAt = if ($d.approvedAt) { " | Approved: $($d.approvedAt)" }   else { '' }
+            $hostname   = if ($d.hostname -and $d.hostname -ne $d.ip) { " | Host: $($d.hostname)" } else { '' }
+            $vendor     = if ($d.vendor)     { " | Vendor: $($d.vendor)" }         else { '' }
+            Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$label$approvedBy$approvedAt"
+        }
+    }
+
+    Write-Host ("-" * 80)
+    Write-Host ""
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 Write-Log "Rogue Device Detector v$SCRIPT_VERSION starting on $env:COMPUTERNAME"
@@ -725,6 +874,34 @@ Write-Log "Rogue Device Detector v$SCRIPT_VERSION starting on $env:COMPUTERNAME"
 # Load configuration
 $configPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot 'config.json' }
 $cfg        = Get-Configuration -ConfigPath $configPath -SubnetOverride $Subnet
+
+# ── Management commands (no scan required) ─────────────────────────────────────
+
+if ($List) {
+    $state = Get-State -StatePath $cfg.statePath
+    Show-Baseline -State $state -StatePath $cfg.statePath
+    exit 0
+}
+
+if ($Approve) {
+    $state = Get-State -StatePath $cfg.statePath
+    $now   = (Get-Date).ToUniversalTime().ToString('o')
+    Invoke-ApproveDevice -Mac $Approve -Label $Label -State $state -Now $now
+    Save-State -State $state -StatePath $cfg.statePath
+    Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_APPROVED' `
+        -Details "mac=$Approve label=$Label approvedBy=$env:USERDOMAIN\$env:USERNAME"
+    exit 0
+}
+
+if ($Remove) {
+    $state   = Get-State -StatePath $cfg.statePath
+    $removed = Invoke-RemoveDevice -Mac $Remove -State $state
+    if ($removed) {
+        Save-State -State $state -StatePath $cfg.statePath
+        Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_REMOVED' -Details "mac=$Remove removedBy=$env:USERDOMAIN\$env:USERNAME"
+    }
+    exit 0
+}
 
 # Resolve target subnet
 $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
@@ -794,12 +971,15 @@ if ($LearningMode -or -not $stateFileExists) {
         } else {
             $newDevices.Add($device)
             $state.knownDevices += [PSCustomObject]@{
-                mac       = $device.mac
-                ip        = $device.ip
-                hostname  = $device.hostname
-                vendor    = $device.vendor
-                firstSeen = $now
-                lastSeen  = $now
+                mac        = $device.mac
+                ip         = $device.ip
+                hostname   = $device.hostname
+                vendor     = $device.vendor
+                label      = ''
+                firstSeen  = $now
+                lastSeen   = $now
+                approvedBy = "$env:USERDOMAIN\$env:USERNAME"
+                approvedAt = $now
             }
         }
     }
