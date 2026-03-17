@@ -9,27 +9,34 @@ Detect unknown (rogue) devices on a network. Standalone PowerShell script, no ex
 ## Data Flow
 
 ```
-Scheduled execution (any scheduler, recommended: weekly)
+Any invocation
   └─ PowerShell Script
        ├─ 1. Load config (config.json + parameter overrides)
-       ├─ 2. Determine subnet (auto-detect from NIC or config override)
-       ├─ 3. Ping sweep → populate ARP cache (async, ~500ms for /24)
-       ├─ 4. Read ARP table → list of MACs + IPs (broadcast/network addr filtered)
-       ├─ 5. Resolve hostnames (async reverse DNS, 2s timeout, concurrent)
-       ├─ 6. Lookup MAC vendor (OUI database, offline)
-       ├─ 7. Enrichment (if enabled):
-       │       ├─ UPnP/SSDP broadcast → IoT device identification
-       │       ├─ TCP port scan (10 security ports, async, per device)
-       │       ├─ HTTP/HTTPS banner grab (title + Server header)
-       │       └─ Risk evaluation → NONE / LOW / MEDIUM / HIGH / CRITICAL
-       ├─ 8. Load state file → known MACs
-       ├─ 9. Compare: found vs known
-       ├─ 10a. Learning Mode ON  → merge new devices into state, no alerts
-       │         └─ Print simulated alert to console for new devices
-       └─ 10b. Learning Mode OFF → delta (new MACs only):
-                 ├─ Send alert email via SMTP (with enrichment data)
-                 ├─ Log RISK_FOUND for known devices with HIGH/CRITICAL risk
-                 └─ Write audit log entries
+       │
+       ├─ Management commands (no scan; exit immediately after):
+       │     -List    → print baseline in human-readable format
+       │     -Approve → add/update one device in baseline (with label + audit metadata)
+       │     -Remove  → remove one device from baseline
+       │
+       └─ Scheduled scan:
+            ├─ 2. Determine subnet (auto-detect from NIC or config override)
+            ├─ 3. Ping sweep → populate ARP cache (async, ~500ms for /24)
+            ├─ 4. Read ARP table → list of MACs + IPs (broadcast/network addr filtered)
+            ├─ 5. Resolve hostnames (async reverse DNS, 2s timeout, concurrent)
+            ├─ 6. Lookup MAC vendor (OUI database, offline)
+            ├─ 7. Enrichment (if enabled):
+            │       ├─ UPnP/SSDP broadcast → IoT device identification
+            │       ├─ TCP port scan (10 security ports, async, per device)
+            │       ├─ HTTP/HTTPS banner grab (title + Server header)
+            │       └─ Risk evaluation → NONE / LOW / MEDIUM / HIGH / CRITICAL
+            ├─ 8. Load state file → known MACs
+            ├─ 9. Compare: found vs known
+            ├─ 10a. Learning Mode ON  → merge new devices into state, no alerts
+            │         └─ Print simulated alert to console for new devices
+            └─ 10b. Learning Mode OFF → delta (new MACs only):
+                      ├─ Send alert email (enrichment data + per-device -Approve command)
+                      ├─ Log RISK_FOUND for known devices with HIGH/CRITICAL risk
+                      └─ Write audit log entries
 ```
 
 ## State File
@@ -41,18 +48,23 @@ Local JSON file. Path configurable. Can be moved to another device to migrate st
   "lastScan": "2025-03-14T08:00:00Z",
   "knownDevices": [
     {
-      "mac": "aa:bb:cc:dd:ee:ff",
+      "mac": "AA:BB:CC:DD:EE:FF",
       "ip": "192.168.1.42",
       "hostname": "LAPTOP-XYZ",
       "vendor": "Apple Inc.",
+      "label": "John's laptop",
       "firstSeen": "2025-03-01T10:00:00Z",
-      "lastSeen": "2025-03-14T08:00:00Z"
+      "lastSeen": "2025-03-14T08:00:00Z",
+      "approvedBy": "DOMAIN\\admin",
+      "approvedAt": "2025-03-01T10:00:00Z"
     }
   ]
 }
 ```
 
 Note: enrichment data (ports, banner, risk) is not persisted in the state file – it is re-evaluated on every scan.
+
+`label`, `approvedBy`, and `approvedAt` are written on every approval (via `-LearningMode`, `-Approve`, or first-run baseline creation). They provide an audit trail of who approved each device and when.
 
 ## Audit Log
 
@@ -69,6 +81,8 @@ Events logged (minimal noise principle):
 | `DEVICE_NEW` | Learning mode: new device added to baseline |
 | `DEVICE_ROGUE` | Normal scan: unknown device detected |
 | `RISK_FOUND` | Normal scan: known device with HIGH or CRITICAL risk |
+| `DEVICE_APPROVED` | `-Approve` command: device manually approved |
+| `DEVICE_REMOVED` | `-Remove` command: device removed from baseline |
 
 A quiet network produces exactly 2 log lines per week.
 
@@ -122,7 +136,11 @@ All path values must include the full filename. Backslashes must be escaped as `
 - **UPnP discovery** – Single SSDP broadcast, identifies IoT/smart devices
 - **Risk evaluation** – NONE / LOW / MEDIUM / HIGH / CRITICAL based on open ports
 - **Learning mode** – Baseline creation: merges found devices into state, no alerts; simulates alert output on console for new devices
-- **SMTP alert** – Enriched with ports, risk, banner, UPnP info; Azure ACS compatible
+- **Per-device approval** – `-Approve <MAC> [-Label <text>]` approves a single device without rescanning; email includes a ready-to-paste command per rogue device
+- **Device labeling** – Human-readable name stored alongside MAC in the baseline
+- **Baseline management** – `-Remove <MAC>` removes a device; `-List` displays the full baseline without scanning
+- **Approval audit trail** – `approvedBy` (domain\user) and `approvedAt` timestamp stored per device
+- **SMTP alert** – Enriched with ports, risk, banner, UPnP info, and per-device approve commands; Azure ACS compatible
 - **Portable state file** – JSON, path configurable, easy to migrate between hosts
 - **Audit log** – Append-only CSV, minimal noise, suitable for compliance/forensics
 
@@ -164,7 +182,11 @@ Works with any scheduler:
 1. Copy script + `config.json` to target device
 2. Fill in `config.json` (SMTP, paths, optional subnet override)
 3. Run once with `-LearningMode` to establish baseline
-4. Review console output and `state.json` – remove any entries that should not be trusted
+4. Review with `-List` and remove any entries that should not be trusted:
+   ```powershell
+   .\rogue-device-detector.ps1 -List
+   .\rogue-device-detector.ps1 -Remove "AA:BB:CC:DD:EE:FF"
+   ```
 5. Schedule weekly run without `-LearningMode`
 
 ## Security Notes

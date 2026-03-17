@@ -41,6 +41,15 @@ Standalone PowerShell script that detects rogue/unauthorized devices on a networ
 
 # Override subnet
 .\rogue-device-detector.ps1 -Subnet "10.0.1.0/24"
+
+# Approve a specific device from an alert (copy-paste the command from the email)
+.\rogue-device-detector.ps1 -Approve "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
+
+# Remove a device that left the network
+.\rogue-device-detector.ps1 -Remove "AA:BB:CC:DD:EE:FF"
+
+# Show all approved devices (no scan)
+.\rogue-device-detector.ps1 -List
 ```
 
 ## Configuration
@@ -77,14 +86,19 @@ Arguments: -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\rdd\rogue-d
 
 ## When a rogue device is detected
 
-An email alert is sent with MAC, IP, hostname, and vendor for each unknown device.
+An email alert is sent with MAC, IP, hostname, vendor, and open ports for each unknown device. The email includes a ready-to-run command per device:
 
-- **Authorized device** (e.g. new laptop, printer): re-run with `-LearningMode` to add it to the baseline
-- **Unauthorized device**: investigate and remove from the network
+- **Authorized device** (e.g. new laptop, printer): copy the `-Approve` command from the email, add a label, and run it — no rescan needed:
+  ```powershell
+  .\rogue-device-detector.ps1 -Approve "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
+  ```
+- **Unauthorized device**: investigate and remove from the network immediately
 
 ## State file
 
 `state.json` stores all known devices. It is the sole source of truth – there is no external database. The file can be moved to another host by copying it alongside the script.
+
+Each device entry records `mac`, `ip`, `hostname`, `vendor`, `label` (optional free-text name), `firstSeen`, `lastSeen`, `approvedBy` (domain\user), and `approvedAt` — providing a full audit trail of who approved what and when.
 
 ## OUI database
 
