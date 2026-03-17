@@ -678,6 +678,12 @@ function Send-RogueAlert {
     .PARAMETER Devices Array of rogue device PSCustomObjects.
     .PARAMETER SmtpConfig Hashtable with SMTP connection settings from config.
     #>
+    # Password is read from a plain-text config file; SecureString conversion at this
+    # boundary is unavoidable without a full credential-store integration.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'Password sourced from config file; plain-text conversion is unavoidable at this integration point.'
+    )]
     param(
         [Parameter(Mandatory)][array]$Devices,
         [Parameter(Mandatory)][hashtable]$SmtpConfig
@@ -817,9 +823,13 @@ function Invoke-RemoveDevice {
     $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
     $mac = $mac.ToUpper()
 
-    $before = @($State.knownDevices).Count
-    $State.knownDevices = @($State.knownDevices) | Where-Object { $_.mac -ne $mac }
-    $removed = @($State.knownDevices).Count -lt $before
+    $before  = @($State.knownDevices).Count
+    $filtered = $State.knownDevices | Where-Object { $_.mac -ne $mac }
+    # Where-Object returns $null (not @()) when nothing passes the filter;
+    # @($null).Count equals 1, so we must normalise explicitly to avoid a
+    # false "not removed" result when the last device is deleted.
+    $State.knownDevices = if ($null -ne $filtered) { @($filtered) } else { @() }
+    $removed = $State.knownDevices.Count -lt $before
 
     if ($removed) {
         Write-Log "Removed device $mac from baseline."
