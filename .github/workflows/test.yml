@@ -1,4 +1,4 @@
-name: Pester Tests
+name: CI
 
 on:
   push:
@@ -7,6 +7,50 @@ on:
     branches: [main, master]
 
 jobs:
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Run linter (quality)
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning `
+            -ExcludeRule PSAvoidUsingWriteHost
+          if ($results) {
+            $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize
+            Write-Error "$($results.Count) issue(s) found."
+            exit 1
+          }
+          Write-Host "Quality check passed."
+
+      - name: Run security rules
+        shell: pwsh
+        run: |
+          # Security rules that matter for MSP/SMB scripts
+          $securityRules = @(
+            'PSAvoidUsingInvokeExpression',
+            'PSAvoidUsingPlainTextForPassword',
+            'PSAvoidUsingConvertToSecureStringWithPlainText',
+            'PSAvoidUsingUsernameAndPasswordParams',
+            'PSUsePSCredentialType'
+          )
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -IncludeRule $securityRules
+          if ($results) {
+            $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize
+            Write-Error "Security check failed: $($results.Count) issue(s) found."
+            exit 1
+          }
+          Write-Host "Security check passed."
+
   test:
     name: Run Pester unit tests
     runs-on: windows-latest
