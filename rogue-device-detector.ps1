@@ -429,6 +429,8 @@ function Resolve-Hostname {
     $timeoutMs = 2000
     $total     = @($Devices).Count
 
+    Write-RddLog "Resolving hostnames via DNS for $total device(s)..."
+
     # Fire all DNS requests concurrently before waiting for any
     $tasks = $Devices | ForEach-Object {
         [PSCustomObject]@{
@@ -537,13 +539,29 @@ function Get-HttpBanner {
     $webPorts = @($OpenPorts | Where-Object { $_ -in @(80, 443, 8080, 8443) })
     if ($webPorts.Count -eq 0) { return '' }
 
+    # Disable certificate validation once for all HTTPS banner grabs (self-signed certs are common on network devices)
+    $isPS5 = $PSVersionTable.PSVersion.Major -lt 7
+    if ($isPS5) {
+        $prevCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    }
+
+    try {
     foreach ($port in $webPorts) {
         $scheme = if ($port -in @(443, 8443)) { 'https' } else { 'http' }
         $url    = "${scheme}://${IP}:${port}/"
         try {
-            $response = Invoke-WebRequest -Uri $url -TimeoutSec 3 -UseBasicParsing `
-                -ErrorAction Stop `
-                -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            $iwrParams = @{
+                Uri            = $url
+                TimeoutSec     = 3
+                UseBasicParsing = $true
+                ErrorAction    = 'Stop'
+                UserAgent      = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            }
+            if (-not $isPS5) {
+                $iwrParams['SkipCertificateCheck'] = $true
+            }
+            $response = Invoke-WebRequest @iwrParams
             $parts = [System.Collections.Generic.List[string]]::new()
             if ($response.Content -match '<title[^>]*>([^<]{2,80})</title>') {
                 $parts.Add($Matches[1].Trim())
@@ -552,7 +570,14 @@ function Get-HttpBanner {
             if ($server) { $parts.Add("Server: $server") }
             if ($parts.Count -gt 0) { return $parts -join ' | ' }
         } catch {
+            # HTTPS cert errors and connection resets are expected for network devices; only log other failures
+            if ($scheme -eq 'https') { continue }
             Write-RddLog "HTTP banner grab failed for ${url}: $_" -Level WARN
+        }
+    }
+    } finally {
+        if ($isPS5) {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCallback
         }
     }
     return ''
@@ -772,6 +797,19 @@ function Get-State {
 
     if (Test-Path $StatePath) {
         $raw = Get-Content $StatePath -Raw | ConvertFrom-Json
+        # Guard against empty/corrupt state file
+        if ($null -eq $raw) {
+            Write-RddLog "State file '$StatePath' is empty or corrupt - creating fresh baseline." -Level WARN
+            return [PSCustomObject]@{
+                schemaVersion = $STATE_SCHEMA_VERSION
+                lastScan      = $null
+                knownDevices  = @()
+            }
+        }
+        # Ensure lastScan property exists (older state files may lack it)
+        if (-not ($raw.PSObject.Properties['lastScan'])) {
+            Add-Member -InputObject $raw -NotePropertyName 'lastScan' -NotePropertyValue $null -Force
+        }
         # PowerShell 7 ConvertFrom-Json auto-parses ISO-8601 strings as DateTime;
         # normalise back to the string format the rest of the code expects.
         if ($raw.lastScan -is [datetime]) {
