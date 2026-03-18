@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Run linter (quality)
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning `
+            -ExcludeRule PSAvoidUsingWriteHost
+          if ($results) {
+            $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize
+            Write-Error "$($results.Count) issue(s) found."
+            exit 1
+          }
+          Write-Host "Quality check passed."
+
+      - name: Run security rules
+        shell: pwsh
+        run: |
+          # Security rules that matter for MSP/SMB scripts
+          $securityRules = @(
+            'PSAvoidUsingInvokeExpression',
+            'PSAvoidUsingPlainTextForPassword',
+            'PSAvoidUsingConvertToSecureStringWithPlainText',
+            'PSAvoidUsingUsernameAndPasswordParams',
+            'PSUsePSCredentialType'
+          )
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -IncludeRule $securityRules
+          if ($results) {
+            $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize
+            Write-Error "Security check failed: $($results.Count) issue(s) found."
+            exit 1
+          }
+          Write-Host "Security check passed."
+
+  test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Pester 5
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path       = './tests'
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled    = $true
+          $config.TestResult.OutputPath = 'test-results.xml'
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $result = Invoke-Pester -Configuration $config
+          if ($result.FailedCount -gt 0) {
+            Write-Error "$($result.FailedCount) test(s) failed."
+            exit 1
+          }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: test-results.xml
