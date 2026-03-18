@@ -715,10 +715,10 @@ function Send-RogueAlert {
         }
         if ($d.httpBanner) { $lines.Add("  Banner:   $($d.httpBanner)") }
         if ($d.upnpInfo)   { $lines.Add("  UPnP:     $($d.upnpInfo)") }
-        $lines.Add("")
+        $lines.Add('')
         $lines.Add("  -> If AUTHORIZED, run on $($env:COMPUTERNAME):")
         $lines.Add("     & `"$scriptPath`" -Approve `"$($d.mac)`" -Label `"<device description>`"")
-        $lines.Add("  -> If UNAUTHORIZED: isolate/remove from network immediately.")
+        $lines.Add('  -> If UNAUTHORIZED: isolate/remove from network immediately.')
         $lines -join "`n"
     }) -join "`n`n---`n`n"
 
@@ -854,14 +854,14 @@ function Show-Baseline {
     $devices = @($State.knownDevices)
     $lastScan = if ($State.lastScan) { $State.lastScan } else { 'never' }
 
-    Write-Host ""
+    Write-Host ''
     Write-Host "Approved devices baseline - $StatePath"
     Write-Host "Last scan : $lastScan"
     Write-Host "Devices   : $($devices.Count)"
     Write-Host ("-" * 80)
 
     if ($devices.Count -eq 0) {
-        Write-Host "  (no devices in baseline)"
+        Write-Host '  (no devices in baseline)'
     } else {
         foreach ($d in ($devices | Sort-Object mac)) {
             $label      = if ($d.label)      { " | Label: $($d.label)" }          else { '' }
@@ -874,7 +874,7 @@ function Show-Baseline {
     }
 
     Write-Host ("-" * 80)
-    Write-Host ""
+    Write-Host ''
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1010,7 +1010,7 @@ if ($LearningMode -or -not $stateFileExists) {
             }
             Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_NEW' -Device $d -Details 'Added to baseline'
         }
-        Write-Log "--- In normal scan mode these would trigger an alert email. ---"
+        Write-Log '--- In normal scan mode these would trigger an alert email. ---'
     } else {
         Write-Log 'No new devices found - baseline unchanged.'
     }
