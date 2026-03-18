@@ -1,4 +1,4 @@
-#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
+﻿#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
 <#
 .SYNOPSIS
     Pester unit tests for rogue-device-detector.ps1
@@ -503,7 +503,7 @@ Describe 'Write-AuditLog' {
     It 'creates the log file with a header row on first use' {
         $logPath = Join-Path $TestDrive 'audit-new.csv'
 
-        Write-AuditLog -LogPath $logPath -Event 'SCAN_START' -Details 'subnet=192.168.1.0/24'
+        Write-AuditLog -LogPath $logPath -EventName 'SCAN_START' -Details 'subnet=192.168.1.0/24'
 
         Test-Path $logPath | Should -Be $true
         $lines = Get-Content $logPath
@@ -515,8 +515,8 @@ Describe 'Write-AuditLog' {
     It 'appends event rows without overwriting the header' {
         $logPath = Join-Path $TestDrive 'audit-append.csv'
 
-        Write-AuditLog -LogPath $logPath -Event 'SCAN_START'
-        Write-AuditLog -LogPath $logPath -Event 'SCAN_DONE' -Details 'found=3'
+        Write-AuditLog -LogPath $logPath -EventName 'SCAN_START'
+        Write-AuditLog -LogPath $logPath -EventName 'SCAN_DONE' -Details 'found=3'
 
         $lines = Get-Content $logPath
         $lines.Count | Should -Be 3   # header + 2 events
@@ -535,7 +535,7 @@ Describe 'Write-AuditLog' {
             riskLevel  = 'CRITICAL'
         }
 
-        Write-AuditLog -LogPath $logPath -Event 'DEVICE_ROGUE' -Device $device
+        Write-AuditLog -LogPath $logPath -EventName 'DEVICE_ROGUE' -Device $device
 
         $content = Get-Content $logPath -Raw
         $content | Should -Match 'AA:BB:CC:DD:EE:FF'
@@ -546,7 +546,7 @@ Describe 'Write-AuditLog' {
     It 'escapes double-quotes in the Details field per CSV spec' {
         $logPath = Join-Path $TestDrive 'audit-escape.csv'
 
-        Write-AuditLog -LogPath $logPath -Event 'SCAN_START' -Details 'label="test"'
+        Write-AuditLog -LogPath $logPath -EventName 'SCAN_START' -Details 'label="test"'
 
         $content = Get-Content $logPath -Raw
         # CSV escaping: " becomes ""
@@ -555,6 +555,6 @@ Describe 'Write-AuditLog' {
 
     It 'does not throw when called without a device object' {
         $logPath = Join-Path $TestDrive 'audit-nodevice.csv'
-        { Write-AuditLog -LogPath $logPath -Event 'SCAN_START' } | Should -Not -Throw
+        { Write-AuditLog -LogPath $logPath -EventName 'SCAN_START' } | Should -Not -Throw
     }
 }

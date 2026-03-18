@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Detects rogue/unauthorized devices on a network.
@@ -95,7 +95,7 @@ $RISK_ORDER = @{ 'NONE' = 0; 'LOW' = 1; 'MEDIUM' = 2; 'HIGH' = 3; 'CRITICAL' = 4
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
-function Write-Log {
+function Write-RddLog {
     <#
     .SYNOPSIS
         Writes a timestamped log message to the console.
@@ -149,24 +149,26 @@ function Get-Configuration {
     if (Test-Path $ConfigPath) {
         try {
             $file = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-            if ($file.subnet)                    { $cfg.subnet     = $file.subnet }
-            if ($file.statePath)                 { $cfg.statePath  = $file.statePath }
-            if ($file.ouiPath)                   { $cfg.ouiPath    = $file.ouiPath }
-            if ($file.logPath)                   { $cfg.logPath    = $file.logPath }
-            if ($null -ne $file.enrichment)      { $cfg.enrichment = [bool]$file.enrichment }
-            if ($null -ne $file.smtp) {
-                if ($file.smtp.host)     { $cfg.smtp.host     = $file.smtp.host }
-                if ($file.smtp.port)     { $cfg.smtp.port     = [int]$file.smtp.port }
-                if ($file.smtp.user)     { $cfg.smtp.user     = $file.smtp.user }
-                if ($file.smtp.password) { $cfg.smtp.password = $file.smtp.password }
-                if ($file.smtp.from)     { $cfg.smtp.from     = $file.smtp.from }
-                if ($file.smtp.to)       { $cfg.smtp.to       = $file.smtp.to }
+            $p = $file.PSObject.Properties
+            if ($p['subnet']     -and $file.subnet)    { $cfg.subnet     = $file.subnet }
+            if ($p['statePath']  -and $file.statePath) { $cfg.statePath  = $file.statePath }
+            if ($p['ouiPath']    -and $file.ouiPath)   { $cfg.ouiPath    = $file.ouiPath }
+            if ($p['logPath']    -and $file.logPath)   { $cfg.logPath    = $file.logPath }
+            if ($p['enrichment'] -and $null -ne $file.enrichment) { $cfg.enrichment = [bool]$file.enrichment }
+            if ($p['smtp'] -and $null -ne $file.smtp) {
+                $sp = $file.smtp.PSObject.Properties
+                if ($sp['host']     -and $file.smtp.host)     { $cfg.smtp.host     = $file.smtp.host }
+                if ($sp['port']     -and $file.smtp.port)     { $cfg.smtp.port     = [int]$file.smtp.port }
+                if ($sp['user']     -and $file.smtp.user)     { $cfg.smtp.user     = $file.smtp.user }
+                if ($sp['password'] -and $file.smtp.password) { $cfg.smtp.password = $file.smtp.password }
+                if ($sp['from']     -and $file.smtp.from)     { $cfg.smtp.from     = $file.smtp.from }
+                if ($sp['to']       -and $file.smtp.to)       { $cfg.smtp.to       = $file.smtp.to }
             }
         } catch {
-            Write-Log "Could not parse config file '$ConfigPath': $_" -Level WARN
+            Write-RddLog "Could not parse config file '$ConfigPath': $_" -Level WARN
         }
     } else {
-        Write-Log "Config file not found at '$ConfigPath'. Using defaults." -Level WARN
+        Write-RddLog "Config file not found at '$ConfigPath'. Using defaults." -Level WARN
     }
 
     if ($SubnetOverride) { $cfg.subnet = $SubnetOverride }
@@ -244,10 +246,10 @@ function Invoke-PingSweep {
     param([Parameter(Mandatory)][hashtable]$SubnetInfo)
 
     if ($SubnetInfo.HostCount -gt 2046) {
-        Write-Log "Subnet has $($SubnetInfo.HostCount) hosts - scan may take a while." -Level WARN
+        Write-RddLog "Subnet has $($SubnetInfo.HostCount) hosts - scan may take a while." -Level WARN
     }
 
-    Write-Log "Pinging $($SubnetInfo.HostCount) host(s) in $($SubnetInfo.NetworkAddress)/$($SubnetInfo.PrefixLength)..."
+    Write-RddLog "Pinging $($SubnetInfo.HostCount) host(s) in $($SubnetInfo.NetworkAddress)/$($SubnetInfo.PrefixLength)..."
 
     $tasks = [System.Collections.Generic.List[hashtable]]::new()
 
@@ -269,7 +271,7 @@ function Invoke-PingSweep {
         finally { $t.Ping.Dispose() }
     }
 
-    Write-Log "Ping sweep complete: $count host(s) responded."
+    Write-RddLog "Ping sweep complete: $count host(s) responded."
 }
 
 function Get-ArpEntry {
@@ -355,7 +357,7 @@ function Resolve-Hostname {
     }
 
     Write-Progress -Activity 'Resolving hostnames' -Completed
-    Write-Log "Hostname resolution complete: $resolved/$total resolved."
+    Write-RddLog "Hostname resolution complete: $resolved/$total resolved."
 }
 
 # ── Enrichment ─────────────────────────────────────────────────────────────────
@@ -502,8 +504,8 @@ function Invoke-DeviceEnrichment {
     #>
     param([Parameter(Mandatory)][array]$Devices)
 
-    Write-Log "Enriching $($Devices.Count) device(s) (ports / banner / UPnP)..."
-    Write-Log 'Running UPnP discovery...'
+    Write-RddLog "Enriching $($Devices.Count) device(s) (ports / banner / UPnP)..."
+    Write-RddLog 'Running UPnP discovery...'
     $upnpMap = Invoke-UpnpDiscovery
 
     $i = 0
@@ -523,7 +525,7 @@ function Invoke-DeviceEnrichment {
 
     Write-Progress -Activity 'Enriching devices' -Completed
     $risky = @($Devices | Where-Object { $_.riskLevel -ne 'NONE' }).Count
-    Write-Log "Enrichment done: $risky/$($Devices.Count) device(s) with risk findings."
+    Write-RddLog "Enrichment done: $risky/$($Devices.Count) device(s) with risk findings."
 }
 
 # ── Audit Log ──────────────────────────────────────────────────────────────────
@@ -540,7 +542,7 @@ function Write-AuditLog {
     #>
     param(
         [Parameter(Mandatory)][string]$LogPath,
-        [Parameter(Mandatory)][string]$Event,
+        [Parameter(Mandatory)][string]$EventName,
         [PSCustomObject]$Device  = $null,
         [string]$Details         = ''
     )
@@ -552,7 +554,7 @@ function Write-AuditLog {
 
     $fields = @(
         (Get-Date).ToUniversalTime().ToString('o'),
-        $Event,
+        $EventName,
         $env:COMPUTERNAME,
         $(if ($Device) { $Device.mac }                                       else { '' }),
         $(if ($Device) { $Device.ip }                                        else { '' }),
@@ -582,15 +584,15 @@ function Get-OuiDatabase {
 
     if ($stale) {
         try {
-            Write-Log 'Updating OUI database from IEEE...'
+            Write-RddLog 'Updating OUI database from IEEE...'
             # Use system proxy and a browser User-Agent to pass corporate firewalls
             [System.Net.WebRequest]::DefaultWebProxy = [System.Net.WebRequest]::GetSystemWebProxy()
             [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
             Invoke-WebRequest -Uri $OUI_URL -OutFile $CachePath -TimeoutSec 60 -UseBasicParsing `
                 -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            Write-Log 'OUI database updated.'
+            Write-RddLog 'OUI database updated.'
         } catch {
-            Write-Log "OUI download failed: $_. Vendor names will show as 'Unknown'." -Level WARN
+            Write-RddLog "OUI download failed: $_. Vendor names will show as 'Unknown'." -Level WARN
             if (-not (Test-Path $CachePath)) { return @{} }
         }
     }
@@ -603,9 +605,9 @@ function Get-OuiDatabase {
                 $db[$key.Substring(0, 6).ToUpper()] = $_.'Organization Name'
             }
         }
-        Write-Log "OUI database loaded: $($db.Count) vendor entries."
+        Write-RddLog "OUI database loaded: $($db.Count) vendor entries."
     } catch {
-        Write-Log "Failed to parse OUI database: $_" -Level WARN
+        Write-RddLog "Failed to parse OUI database: $_" -Level WARN
         return @{}
     }
 
@@ -644,7 +646,17 @@ function Get-State {
 
     if (Test-Path $StatePath) {
         $raw = Get-Content $StatePath -Raw | ConvertFrom-Json
-        if ($null -eq $raw.knownDevices) { $raw.knownDevices = @() }
+        # PowerShell 7 ConvertFrom-Json auto-parses ISO-8601 strings as DateTime;
+        # normalise back to the string format the rest of the code expects.
+        if ($raw.lastScan -is [datetime]) {
+            Add-Member -InputObject $raw -NotePropertyName 'lastScan' `
+                -NotePropertyValue ($raw.lastScan.ToUniversalTime().ToString('o')) -Force
+        }
+        # Ensure knownDevices is always an array (ConvertFrom-Json yields $null for "null").
+        if ($null -eq $raw.knownDevices) {
+            Add-Member -InputObject $raw -NotePropertyName 'knownDevices' `
+                -NotePropertyValue ([object[]]@()) -Force
+        }
         return $raw
     }
 
@@ -690,7 +702,7 @@ function Send-RogueAlert {
     )
 
     if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
-        Write-Log 'SMTP not configured - skipping email alert.' -Level WARN
+        Write-RddLog 'SMTP not configured - skipping email alert.' -Level WARN
         return
     }
 
@@ -754,9 +766,9 @@ To review the full baseline:
 
     try {
         Send-MailMessage @mailParams
-        Write-Log "Alert sent to $($SmtpConfig.to)."
+        Write-RddLog "Alert sent to $($SmtpConfig.to)."
     } catch {
-        Write-Log "Failed to send alert: $_" -Level ERROR
+        Write-RddLog "Failed to send alert: $_" -Level ERROR
     }
 }
 
@@ -790,7 +802,7 @@ function Invoke-ApproveDevice {
         if ($Label) { $existing.label = $Label }
         $existing.approvedBy = "$env:USERDOMAIN\$env:USERNAME"
         $existing.approvedAt = $Now
-        Write-Log "Updated existing device $mac in baseline$(if ($Label) { " (label: '$Label')" } else { '' })."
+        Write-RddLog "Updated existing device $mac in baseline$(if ($Label) { " (label: '$Label')" } else { '' })."
     } else {
         $State.knownDevices += [PSCustomObject]@{
             mac        = $mac
@@ -803,7 +815,7 @@ function Invoke-ApproveDevice {
             approvedBy = "$env:USERDOMAIN\$env:USERNAME"
             approvedAt = $Now
         }
-        Write-Log "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
+        Write-RddLog "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
     }
 }
 
@@ -824,17 +836,16 @@ function Invoke-RemoveDevice {
     $mac = $mac.ToUpper()
 
     $before  = @($State.knownDevices).Count
-    $filtered = $State.knownDevices | Where-Object { $_.mac -ne $mac }
-    # Where-Object returns $null (not @()) when nothing passes the filter;
-    # @($null).Count equals 1, so we must normalise explicitly to avoid a
-    # false "not removed" result when the last device is deleted.
-    $State.knownDevices = if ($null -ne $filtered) { @($filtered) } else { @() }
-    $removed = $State.knownDevices.Count -lt $before
+    # Determine removal before modifying; avoids relying on Count after PSCustomObject
+    # property re-assignment, which can behave unexpectedly with empty arrays in strict mode.
+    $removed = $null -ne (@($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1)
+    # @() around the pipeline ensures an array even when nothing passes the filter.
+    $State.knownDevices = [object[]]@($State.knownDevices | Where-Object { $_.mac -ne $mac })
 
     if ($removed) {
-        Write-Log "Removed device $mac from baseline."
+        Write-RddLog "Removed device $mac from baseline."
     } else {
-        Write-Log "Device $mac not found in baseline." -Level WARN
+        Write-RddLog "Device $mac not found in baseline." -Level WARN
     }
     return $removed
 }
@@ -881,7 +892,7 @@ function Show-Baseline {
 # Guard: skip main body when dot-sourced for unit testing (e.g. Pester)
 if ($MyInvocation.InvocationName -eq '.') { return }
 
-Write-Log "Rogue Device Detector v$SCRIPT_VERSION starting on $env:COMPUTERNAME"
+Write-RddLog "Rogue Device Detector v$SCRIPT_VERSION starting on $env:COMPUTERNAME"
 
 # Load configuration
 $configPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot 'config.json' }
@@ -900,7 +911,7 @@ if ($Approve) {
     $now   = (Get-Date).ToUniversalTime().ToString('o')
     Invoke-ApproveDevice -Mac $Approve -Label $Label -State $state -Now $now
     Save-State -State $state -StatePath $cfg.statePath
-    Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_APPROVED' `
+    Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_APPROVED' `
         -Details "mac=$Approve label=$Label approvedBy=$env:USERDOMAIN\$env:USERNAME"
     exit 0
 }
@@ -910,15 +921,15 @@ if ($Remove) {
     $removed = Invoke-RemoveDevice -Mac $Remove -State $state
     if ($removed) {
         Save-State -State $state -StatePath $cfg.statePath
-        Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_REMOVED' -Details "mac=$Remove removedBy=$env:USERDOMAIN\$env:USERNAME"
+        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_REMOVED' -Details "mac=$Remove removedBy=$env:USERDOMAIN\$env:USERNAME"
     }
     exit 0
 }
 
 # Resolve target subnet
 $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
-Write-AuditLog -LogPath $cfg.logPath -Event 'SCAN_START' -Details "subnet=$targetSubnet mode=$(if ($LearningMode) { 'learning' } else { 'normal' })"
-Write-Log "Target subnet: $targetSubnet"
+Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$(if ($LearningMode) { 'learning' } else { 'normal' })"
+Write-RddLog "Target subnet: $targetSubnet"
 $subnetInfo = Get-SubnetInfo -Cidr $targetSubnet
 
 # Load OUI vendor database
@@ -927,10 +938,10 @@ $ouiDb = Get-OuiDatabase -CachePath $cfg.ouiPath
 # Populate ARP cache via ping sweep, then read ARP table
 Invoke-PingSweep -SubnetInfo $subnetInfo
 $arpEntries = Get-ArpEntry -SubnetInfo $subnetInfo
-Write-Log "$($arpEntries.Count) device(s) found in ARP table."
+Write-RddLog "$($arpEntries.Count) device(s) found in ARP table."
 
 if ($arpEntries.Count -eq 0) {
-    Write-Log 'ARP table empty after ping sweep. Exiting.' -Level WARN
+    Write-RddLog 'ARP table empty after ping sweep. Exiting.' -Level WARN
     exit 0
 }
 
@@ -967,9 +978,9 @@ $now             = (Get-Date).ToUniversalTime().ToString('o')
 # Learning mode: merge found devices into baseline without alerts
 if ($LearningMode -or -not $stateFileExists) {
     if (-not $stateFileExists) {
-        Write-Log 'No state file found - creating baseline (learning mode).'
+        Write-RddLog 'No state file found - creating baseline (learning mode).'
     } else {
-        Write-Log 'Learning mode - merging found devices into baseline.'
+        Write-RddLog 'Learning mode - merging found devices into baseline.'
     }
 
     $newDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -998,24 +1009,24 @@ if ($LearningMode -or -not $stateFileExists) {
 
     $state.lastScan = $now
     Save-State -State $state -StatePath $cfg.statePath
-    Write-Log "Baseline saved: $($state.knownDevices.Count) device(s) -> $($cfg.statePath)"
+    Write-RddLog "Baseline saved: $($state.knownDevices.Count) device(s) -> $($cfg.statePath)"
 
     if ($newDevices.Count -gt 0) {
-        Write-Log "--- SIMULATED ALERT: $($newDevices.Count) new device(s) added to baseline ---"
+        Write-RddLog "--- SIMULATED ALERT: $($newDevices.Count) new device(s) added to baseline ---"
         foreach ($d in $newDevices) {
             $riskTag = if ($d.riskLevel -ne 'NONE') { " [$($d.riskLevel)]" } else { '' }
-            Write-Log "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $($d.hostname)  Vendor: $($d.vendor)$riskTag"
+            Write-RddLog "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $($d.hostname)  Vendor: $($d.vendor)$riskTag"
             if ($d.riskReasons -and $d.riskReasons.Count -gt 0) {
-                Write-Log "       RISK: $($d.riskReasons -join '; ')" -Level WARN
+                Write-RddLog "       RISK: $($d.riskReasons -join '; ')" -Level WARN
             }
-            Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_NEW' -Device $d -Details 'Added to baseline'
+            Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_NEW' -Device $d -Details 'Added to baseline'
         }
-        Write-Log '--- In normal scan mode these would trigger an alert email. ---'
+        Write-RddLog '--- In normal scan mode these would trigger an alert email. ---'
     } else {
-        Write-Log 'No new devices found - baseline unchanged.'
+        Write-RddLog 'No new devices found - baseline unchanged.'
     }
 
-    Write-AuditLog -LogPath $cfg.logPath -Event 'SCAN_DONE' `
+    Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_DONE' `
         -Details "found=$($foundDevices.Count) new=$($newDevices.Count) mode=learning"
     exit 0
 }
@@ -1031,9 +1042,9 @@ foreach ($device in $foundDevices) {
         $known.hostname = $device.hostname
     } else {
         $riskTag = if ($device.riskLevel -ne 'NONE') { " [$($device.riskLevel)]" } else { '' }
-        Write-Log "ROGUE: $($device.mac)  $($device.ip)  $($device.hostname)  [$($device.vendor)]$riskTag" -Level WARN
+        Write-RddLog "ROGUE: $($device.mac)  $($device.ip)  $($device.hostname)  [$($device.vendor)]$riskTag" -Level WARN
         $rogueDevices.Add($device)
-        Write-AuditLog -LogPath $cfg.logPath -Event 'DEVICE_ROGUE' -Device $device `
+        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ROGUE' -Device $device `
             -Details ($device.riskReasons -join '; ')
     }
 }
@@ -1043,8 +1054,8 @@ foreach ($device in $foundDevices) {
     if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
         $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
         if (-not $isRogue) {
-            Write-Log "RISK [$($device.riskLevel)]: $($device.ip) $($device.hostname) - $($device.riskReasons -join '; ')" -Level WARN
-            Write-AuditLog -LogPath $cfg.logPath -Event 'RISK_FOUND' -Device $device `
+            Write-RddLog "RISK [$($device.riskLevel)]: $($device.ip) $($device.hostname) - $($device.riskReasons -join '; ')" -Level WARN
+            Write-AuditLog -LogPath $cfg.logPath -EventName 'RISK_FOUND' -Device $device `
                 -Details ($device.riskReasons -join '; ')
         }
     }
@@ -1054,12 +1065,12 @@ $state.lastScan = $now
 Save-State -State $state -StatePath $cfg.statePath
 
 $riskCount = @($foundDevices | Where-Object { $_.riskLevel -ne 'NONE' }).Count
-Write-AuditLog -LogPath $cfg.logPath -Event 'SCAN_DONE' `
+Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_DONE' `
     -Details "found=$($foundDevices.Count) rogue=$($rogueDevices.Count) risks=$riskCount mode=normal"
 
 if ($rogueDevices.Count -gt 0) {
-    Write-Log "$($rogueDevices.Count) rogue device(s) detected."
+    Write-RddLog "$($rogueDevices.Count) rogue device(s) detected."
     Send-RogueAlert -Devices $rogueDevices.ToArray() -SmtpConfig $cfg.smtp
 } else {
-    Write-Log 'Scan complete - all devices are known.'
+    Write-RddLog 'Scan complete - all devices are known.'
 }
