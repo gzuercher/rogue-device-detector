@@ -12,6 +12,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  checks: read
 
 jobs:
   # Automated review on every PR open/update
@@ -23,24 +24,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Wait for CI lint
-        uses: fountainhead/action-wait-for-check@v1.2.0
-        id: ci-lint
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          checkName: lint
-          ref: ${{ github.event.pull_request.head.sha }}
-          timeoutSeconds: 600
-
-      - name: Wait for CI tests
-        uses: fountainhead/action-wait-for-check@v1.2.0
-        id: ci-tests
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          checkName: test
-          ref: ${{ github.event.pull_request.head.sha }}
-          timeoutSeconds: 600
-
       - name: Claude Review
         uses: anthropics/claude-code-action@v1
         with:
@@ -50,7 +33,10 @@ jobs:
             You are reviewing a pull request for a PowerShell network security tool (rogue-device-detector).
             Read the CLAUDE.md and ARCHITECTURE.md for project context.
 
-            CI status: lint=${{ steps.ci-lint.outputs.conclusion }}, tests=${{ steps.ci-tests.outputs.conclusion }}
+            First, check CI status by running:
+              gh pr checks ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+
+            If CI is still running, note that in your review. If CI failed, that is a blocker.
 
             Review the diff and evaluate:
             1. **Correctness**: Does the code do what the PR claims? Are edge cases handled?
@@ -60,9 +46,10 @@ jobs:
             5. **Breaking changes**: Does it break existing config.json or state.json compatibility?
 
             Decision rules:
-            - If CI (lint + tests) passed AND no issues found -> approve with `gh pr review --approve --body "..."`
+            - If CI passed AND no issues found -> approve with `gh pr review --approve --body "..."`
             - If CI passed but minor nits only -> approve with comments
             - If CI failed OR significant issues found -> request changes with `gh pr review --request-changes --body "..."`
+            - If CI is still running -> post a comment with your review findings but do not approve yet
 
             Always explain your reasoning briefly.
 
