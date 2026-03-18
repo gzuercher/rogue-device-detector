@@ -15,8 +15,8 @@
       - Invoke-RemoveDevice  (baseline management)
       - Write-AuditLog       (CSV audit log writing)
 
-    Network-dependent functions (Invoke-PingSweep, Get-ArpEntries,
-    Resolve-Hostnames, Invoke-PortScan, Invoke-UpnpDiscovery) are not
+    Network-dependent functions (Invoke-PingSweep, Get-ArpEntry,
+    Resolve-Hostname, Invoke-PortScan, Invoke-UpnpDiscovery) are not
     covered here as they require a live network environment.
 #>
 

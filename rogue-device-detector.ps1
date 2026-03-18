@@ -265,14 +265,14 @@ function Invoke-PingSweep {
         try {
             $reply = $t.Task.GetAwaiter().GetResult()
             if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { $count++ }
-        } catch { }
+        } catch { $null = $_ }
         finally { $t.Ping.Dispose() }
     }
 
     Write-Log "Ping sweep complete: $count host(s) responded."
 }
 
-function Get-ArpEntries {
+function Get-ArpEntry {
     <#
     .SYNOPSIS
         Reads the ARP cache and returns MAC/IP pairs within the target subnet.
@@ -311,7 +311,7 @@ function Get-ArpEntries {
     return $entries.ToArray()
 }
 
-function Resolve-Hostnames {
+function Resolve-Hostname {
     <#
     .SYNOPSIS
         Resolves hostnames for an array of devices concurrently via async DNS.
@@ -351,7 +351,7 @@ function Resolve-Hostnames {
                     $resolved++
                 }
             }
-        } catch { }
+        } catch { $null = $_ }
     }
 
     Write-Progress -Activity 'Resolving hostnames' -Completed
@@ -391,8 +391,8 @@ function Invoke-PortScan {
             if ($winner -eq $t.Task -and $t.Task.Status -eq 'RanToCompletion') {
                 $open.Add($t.Port)
             }
-        } catch { }
-        finally { try { $t.Client.Dispose() } catch { } }
+        } catch { $null = $_ }
+        finally { try { $t.Client.Dispose() } catch { $null = $_ } }
     }
 
     return $open.ToArray()
@@ -428,7 +428,7 @@ function Get-HttpBanner {
             $server = $response.Headers['Server']
             if ($server) { $parts.Add("Server: $server") }
             if ($parts.Count -gt 0) { return $parts -join ' | ' }
-        } catch { }
+        } catch { $null = $_ }
     }
     return ''
 }
@@ -463,10 +463,10 @@ function Invoke-UpnpDiscovery {
                 } elseif (-not $results.ContainsKey($ip)) {
                     $results[$ip] = 'UPnP device'
                 }
-            } catch { }
+            } catch { $null = $_ }
         }
         $client.Dispose()
-    } catch { }
+    } catch { $null = $_ }
 
     return $results
 }
@@ -926,7 +926,7 @@ $ouiDb = Get-OuiDatabase -CachePath $cfg.ouiPath
 
 # Populate ARP cache via ping sweep, then read ARP table
 Invoke-PingSweep -SubnetInfo $subnetInfo
-$arpEntries = Get-ArpEntries -SubnetInfo $subnetInfo
+$arpEntries = Get-ArpEntry -SubnetInfo $subnetInfo
 Write-Log "$($arpEntries.Count) device(s) found in ARP table."
 
 if ($arpEntries.Count -eq 0) {
@@ -939,7 +939,7 @@ $foundDevices = $arpEntries | ForEach-Object {
     [PSCustomObject]@{
         mac        = $_.MAC
         ip         = $_.IP
-        hostname   = $_.IP   # placeholder, overwritten by Resolve-Hostnames
+        hostname   = $_.IP   # placeholder, overwritten by Resolve-Hostname
         vendor     = ''
         openPorts  = @()
         httpBanner = ''
@@ -949,7 +949,7 @@ $foundDevices = $arpEntries | ForEach-Object {
     }
 }
 
-Resolve-Hostnames -Devices $foundDevices
+Resolve-Hostname -Devices $foundDevices
 
 foreach ($d in $foundDevices) {
     $d.vendor = Get-MacVendor -Mac $d.mac -OuiDb $ouiDb
