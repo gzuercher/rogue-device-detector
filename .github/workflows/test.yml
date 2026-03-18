@@ -8,7 +8,6 @@ on:
 
 jobs:
   lint:
-    name: PSScriptAnalyzer
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -52,7 +51,6 @@ jobs:
           Write-Host "Security check passed."
 
   test:
-    name: Run Pester unit tests
     runs-on: windows-latest
 
     steps:
