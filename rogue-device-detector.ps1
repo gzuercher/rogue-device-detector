@@ -835,7 +835,6 @@ function Invoke-RemoveDevice {
     $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
     $mac = $mac.ToUpper()
 
-    $before  = @($State.knownDevices).Count
     # Determine removal before modifying; avoids relying on Count after PSCustomObject
     # property re-assignment, which can behave unexpectedly with empty arrays in strict mode.
     $removed = $null -ne (@($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1)
