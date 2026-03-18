@@ -74,7 +74,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION   = '1.1.0'
+$SCRIPT_VERSION       = '1.2.0'
 $OUI_URL          = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS = 30
 
@@ -92,6 +92,8 @@ $SECURITY_PORTS = @(
 )
 
 $RISK_ORDER = @{ 'NONE' = 0; 'LOW' = 1; 'MEDIUM' = 2; 'HIGH' = 3; 'CRITICAL' = 4 }
+
+$ABSENT_DAYS_DEFAULT = 21
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -131,12 +133,14 @@ function Get-Configuration {
     )
 
     $cfg = @{
-        subnet     = ''
-        statePath  = Join-Path $PSScriptRoot 'state.json'
-        ouiPath    = Join-Path $PSScriptRoot 'oui.csv'
-        logPath    = Join-Path $PSScriptRoot 'rdd-audit.csv'
-        enrichment = $true
-        smtp       = @{
+        subnet        = ''
+        statePath     = Join-Path $PSScriptRoot 'state.json'
+        ouiPath       = Join-Path $PSScriptRoot 'oui.csv'
+        logPath       = Join-Path $PSScriptRoot 'rdd-audit.csv'
+        enrichment    = $true
+        absentDays    = $ABSENT_DAYS_DEFAULT
+        summaryReport = $false
+        smtp          = @{
             host     = ''
             port     = 587
             user     = ''
@@ -155,6 +159,8 @@ function Get-Configuration {
             if ($p['ouiPath']    -and $file.ouiPath)   { $cfg.ouiPath    = $file.ouiPath }
             if ($p['logPath']    -and $file.logPath)   { $cfg.logPath    = $file.logPath }
             if ($p['enrichment'] -and $null -ne $file.enrichment) { $cfg.enrichment = [bool]$file.enrichment }
+            if ($p['absentDays'] -and $null -ne $file.absentDays) { $cfg.absentDays = [int]$file.absentDays }
+            if ($p['summaryReport'] -and $null -ne $file.summaryReport) { $cfg.summaryReport = [bool]$file.summaryReport }
             if ($p['smtp'] -and $null -ne $file.smtp) {
                 $sp = $file.smtp.PSObject.Properties
                 if ($sp['host']     -and $file.smtp.host)     { $cfg.smtp.host     = $file.smtp.host }
@@ -242,6 +248,7 @@ function Invoke-PingSweep {
     .SYNOPSIS
         Sends concurrent ICMP pings to all hosts in a subnet to populate the ARP cache.
     .PARAMETER SubnetInfo Hashtable from Get-SubnetInfo.
+    .RETURNS Hashtable mapping IP address to TTL value for hosts that responded.
     #>
     param([Parameter(Mandatory)][hashtable]$SubnetInfo)
 
@@ -262,16 +269,40 @@ function Invoke-PingSweep {
         $tasks.Add(@{ IP = $ip; Ping = $ping; Task = $ping.SendPingAsync($ip, 500) })
     }
 
-    $count = 0
+    $ttlMap = @{}
+    $count  = 0
     foreach ($t in $tasks) {
         try {
             $reply = $t.Task.GetAwaiter().GetResult()
-            if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { $count++ }
-        } catch { $null = $_ }
+            if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                $count++
+                if ($reply.Options -and $reply.Options.Ttl -gt 0) {
+                    $ttlMap[$t.IP] = [int]$reply.Options.Ttl
+                }
+            }
+        } catch {
+            Write-RddLog "Ping failed for $($t.IP): $_" -Level WARN
+        }
         finally { $t.Ping.Dispose() }
     }
 
     Write-RddLog "Ping sweep complete: $count host(s) responded."
+    return $ttlMap
+}
+
+function Get-OsGuess {
+    <#
+    .SYNOPSIS
+        Guesses the operating system family from a ping reply TTL value.
+    .PARAMETER Ttl TTL value from the ICMP reply.
+    .RETURNS String: 'Windows', 'Linux/macOS', 'Network device', or ''.
+    #>
+    param([int]$Ttl)
+
+    if ($Ttl -le 0)   { return '' }
+    if ($Ttl -le 64)  { return 'Linux/macOS' }
+    if ($Ttl -le 128) { return 'Windows' }
+    return 'Network device'
 }
 
 function Get-ArpEntry {
@@ -353,7 +384,9 @@ function Resolve-Hostname {
                     $resolved++
                 }
             }
-        } catch { $null = $_ }
+        } catch {
+            Write-RddLog "DNS lookup failed for $($t.Device.ip): $_" -Level WARN
+        }
     }
 
     Write-Progress -Activity 'Resolving hostnames' -Completed
@@ -393,7 +426,9 @@ function Invoke-PortScan {
             if ($winner -eq $t.Task -and $t.Task.Status -eq 'RanToCompletion') {
                 $open.Add($t.Port)
             }
-        } catch { $null = $_ }
+        } catch {
+            Write-RddLog "Port scan error on ${IP}:$($t.Port): $_" -Level WARN
+        }
         finally { try { $t.Client.Dispose() } catch { $null = $_ } }
     }
 
@@ -430,7 +465,9 @@ function Get-HttpBanner {
             $server = $response.Headers['Server']
             if ($server) { $parts.Add("Server: $server") }
             if ($parts.Count -gt 0) { return $parts -join ' | ' }
-        } catch { $null = $_ }
+        } catch {
+            Write-RddLog "HTTP banner grab failed for ${url}: $_" -Level WARN
+        }
     }
     return ''
 }
@@ -468,7 +505,9 @@ function Invoke-UpnpDiscovery {
             } catch { $null = $_ }
         }
         $client.Dispose()
-    } catch { $null = $_ }
+    } catch {
+        Write-RddLog "UPnP discovery failed: $_" -Level WARN
+    }
 
     return $results
 }
@@ -657,6 +696,12 @@ function Get-State {
             Add-Member -InputObject $raw -NotePropertyName 'knownDevices' `
                 -NotePropertyValue ([object[]]@()) -Force
         }
+        # Ensure devices from older state files have the osGuess field.
+        foreach ($d in @($raw.knownDevices)) {
+            if (-not ($d.PSObject.Properties['osGuess'])) {
+                $d | Add-Member -MemberType NoteProperty -Name 'osGuess' -Value ''
+            }
+        }
         return $raw
     }
 
@@ -725,6 +770,7 @@ function Send-RogueAlert {
         if ($d.riskLevel -and $d.riskLevel -ne 'NONE') {
             $lines.Add("  RISK:     [$($d.riskLevel)] $($d.riskReasons -join '; ')")
         }
+        if ($d.osGuess)    { $lines.Add("  OS:       $($d.osGuess)") }
         if ($d.httpBanner) { $lines.Add("  Banner:   $($d.httpBanner)") }
         if ($d.upnpInfo)   { $lines.Add("  UPnP:     $($d.upnpInfo)") }
         $lines.Add('')
@@ -874,17 +920,185 @@ function Show-Baseline {
         Write-Host '  (no devices in baseline)'
     } else {
         foreach ($d in ($devices | Sort-Object mac)) {
-            $label      = if ($d.label)      { " | Label: $($d.label)" }          else { '' }
+            $label      = if ($d.label)      { " | Label: $($d.label)" }            else { '' }
             $approvedBy = if ($d.approvedBy) { " | Approved by: $($d.approvedBy)" } else { '' }
-            $approvedAt = if ($d.approvedAt) { " | Approved: $($d.approvedAt)" }   else { '' }
+            $approvedAt = if ($d.approvedAt) { " | Approved: $($d.approvedAt)" }    else { '' }
             $hostname   = if ($d.hostname -and $d.hostname -ne $d.ip) { " | Host: $($d.hostname)" } else { '' }
-            $vendor     = if ($d.vendor)     { " | Vendor: $($d.vendor)" }         else { '' }
-            Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$label$approvedBy$approvedAt"
+            $vendor     = if ($d.vendor)     { " | Vendor: $($d.vendor)" }          else { '' }
+            $osGuess    = if ($d.osGuess)    { " | OS: $($d.osGuess)" }             else { '' }
+            $lastSeen   = if ($d.lastSeen)   { " | Last seen: $($d.lastSeen)" }     else { '' }
+            Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$osGuess$label$lastSeen$approvedBy$approvedAt"
         }
     }
 
     Write-Host ("-" * 80)
     Write-Host ''
+}
+
+function Test-IdentityChange {
+    <#
+    .SYNOPSIS
+        Checks whether a known device's hostname has changed to a new real hostname.
+        Ignores changes where either hostname is just an IP address (DNS resolution flapping).
+    .PARAMETER KnownDevice  Device from the baseline (state.json).
+    .PARAMETER FoundDevice  Device from the current scan.
+    .RETURNS Previous hostname string if a real change occurred, $null otherwise.
+    #>
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$KnownDevice,
+        [Parameter(Mandatory)][PSCustomObject]$FoundDevice
+    )
+
+    $oldHost = $KnownDevice.hostname
+    $newHost = $FoundDevice.hostname
+    if ($oldHost -and $newHost -ne $oldHost -and $oldHost -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+        return $oldHost
+    }
+    return $null
+}
+
+function Get-AbsentDevices {
+    <#
+    .SYNOPSIS
+        Returns baseline devices that have not been seen for more than the given number of days.
+    .PARAMETER KnownDevices Array of baseline device objects.
+    .PARAMETER AbsentDays   Number of days after which a device is considered absent.
+    .PARAMETER Now          Current UTC timestamp (ISO-8601 string).
+    .RETURNS Array of absent device objects.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
+        Justification = 'Function returns a collection of devices; plural is intentional.')]
+    param(
+        [Parameter(Mandatory)][array]$KnownDevices,
+        [Parameter(Mandatory)][int]$AbsentDays,
+        [Parameter(Mandatory)][string]$Now
+    )
+
+    $threshold = [DateTime]::Parse($Now).AddDays(-$AbsentDays)
+    $absent = @($KnownDevices | Where-Object {
+        $_.lastSeen -and [DateTime]::Parse($_.lastSeen) -lt $threshold
+    })
+    return $absent
+}
+
+function Send-SummaryReport {
+    <#
+    .SYNOPSIS
+        Sends a comprehensive network health summary email.
+    .PARAMETER Report  Hashtable with scan results (foundCount, baselineCount, rogueDevices, etc.).
+    .PARAMETER SmtpConfig  Hashtable with SMTP connection settings from config.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'Password sourced from config file; plain-text conversion is unavoidable at this integration point.'
+    )]
+    param(
+        [Parameter(Mandatory)][hashtable]$Report,
+        [Parameter(Mandatory)][hashtable]$SmtpConfig
+    )
+
+    if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
+        Write-RddLog 'SMTP not configured - skipping summary report.' -Level WARN
+        return
+    }
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('Rogue Device Detector - Network Health Report')
+    $lines.Add('')
+    $lines.Add("Scanner   : $env:COMPUTERNAME")
+    $lines.Add("Subnet    : $($Report.subnet)")
+    $lines.Add("Scan time : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $lines.Add('')
+    $lines.Add('--- Overview ---')
+    $lines.Add("  Devices scanned    : $($Report.foundCount)")
+    $lines.Add("  Baseline devices   : $($Report.baselineCount)")
+    $lines.Add("  Rogue devices      : $($Report.rogueDevices.Count)")
+    $lines.Add("  Absent devices     : $($Report.absentDevices.Count)  (not seen for $($Report.absentDays)+ days)")
+    $lines.Add("  Risk findings      : $($Report.riskDevices.Count)")
+    $lines.Add("  Identity changes   : $($Report.identityChanges.Count)")
+
+    if ($Report.rogueDevices.Count -gt 0) {
+        $lines.Add('')
+        $lines.Add('--- Rogue Devices ---')
+        $scriptPath = $PSCommandPath
+        foreach ($d in $Report.rogueDevices) {
+            $os = if ($d.osGuess) { "  OS: $($d.osGuess)" } else { '' }
+            $lines.Add("  $($d.mac)  $($d.ip)  $($d.hostname)  [$($d.vendor)]$os")
+            if ($d.riskLevel -and $d.riskLevel -ne 'NONE') {
+                $lines.Add("    RISK: [$($d.riskLevel)] $($d.riskReasons -join '; ')")
+            }
+            $lines.Add("    -> Approve: & `"$scriptPath`" -Approve `"$($d.mac)`" -Label `"<description>`"")
+        }
+    }
+
+    if ($Report.absentDevices.Count -gt 0) {
+        $lines.Add('')
+        $lines.Add("--- Absent Devices (not seen for $($Report.absentDays)+ days) ---")
+        foreach ($d in $Report.absentDevices) {
+            $label = if ($d.label) { "  Label: $($d.label)" } else { '' }
+            $os    = if ($d.osGuess) { "  OS: $($d.osGuess)" } else { '' }
+            $lines.Add("  $($d.mac)  Last IP: $($d.ip)  Last seen: $($d.lastSeen)$label$os")
+        }
+    }
+
+    if ($Report.riskDevices.Count -gt 0) {
+        $lines.Add('')
+        $lines.Add('--- Risk Findings (known devices) ---')
+        foreach ($d in $Report.riskDevices) {
+            $lines.Add("  [$($d.riskLevel)] $($d.ip) ($($d.hostname)) - $($d.riskReasons -join '; ')")
+        }
+    }
+
+    if ($Report.identityChanges.Count -gt 0) {
+        $lines.Add('')
+        $lines.Add('--- Identity Changes ---')
+        foreach ($c in $Report.identityChanges) {
+            $lines.Add("  $($c.mac)  $($c.ip)  hostname changed: '$($c.oldHostname)' -> '$($c.newHostname)'")
+        }
+    }
+
+    # OS breakdown
+    $osGroups = @($Report.foundDevices | Where-Object { $_.osGuess } | Group-Object osGuess | Sort-Object Count -Descending)
+    if ($osGroups.Count -gt 0) {
+        $lines.Add('')
+        $lines.Add('--- OS Breakdown ---')
+        foreach ($g in $osGroups) {
+            $lines.Add("  $($g.Name.PadRight(20)): $($g.Count)")
+        }
+        $noOs = @($Report.foundDevices | Where-Object { -not $_.osGuess }).Count
+        if ($noOs -gt 0) { $lines.Add("  $('Unknown'.PadRight(20)): $noOs") }
+    }
+
+    $status = if ($Report.rogueDevices.Count -gt 0) {
+        "$($Report.rogueDevices.Count) ROGUE"
+    } elseif ($Report.absentDevices.Count -gt 0 -or $Report.riskDevices.Count -gt 0) {
+        'WARNINGS'
+    } else {
+        'OK'
+    }
+    $subject = "[$env:COMPUTERNAME] Network Health Report [$status] - $(Get-Date -Format 'yyyy-MM-dd')"
+
+    $mailParams = @{
+        From       = $SmtpConfig.from
+        To         = $SmtpConfig.to
+        Subject    = $subject
+        Body       = $lines -join "`n"
+        SmtpServer = $SmtpConfig.host
+        Port       = [int]$SmtpConfig.port
+        UseSsl     = $true
+    }
+
+    if ($SmtpConfig.user) {
+        $securePass = ConvertTo-SecureString -String $SmtpConfig.password -AsPlainText -Force
+        $mailParams.Credential = New-Object System.Management.Automation.PSCredential($SmtpConfig.user, $securePass)
+    }
+
+    try {
+        Send-MailMessage @mailParams
+        Write-RddLog "Summary report sent to $($SmtpConfig.to)."
+    } catch {
+        Write-RddLog "Failed to send summary report: $_" -Level ERROR
+    }
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -934,8 +1148,8 @@ $subnetInfo = Get-SubnetInfo -Cidr $targetSubnet
 # Load OUI vendor database
 $ouiDb = Get-OuiDatabase -CachePath $cfg.ouiPath
 
-# Populate ARP cache via ping sweep, then read ARP table
-Invoke-PingSweep -SubnetInfo $subnetInfo
+# Populate ARP cache via ping sweep (returns TTL map for OS fingerprinting)
+$ttlMap = Invoke-PingSweep -SubnetInfo $subnetInfo
 $arpEntries = Get-ArpEntry -SubnetInfo $subnetInfo
 Write-RddLog "$($arpEntries.Count) device(s) found in ARP table."
 
@@ -946,15 +1160,17 @@ if ($arpEntries.Count -eq 0) {
 
 # Build device list, resolve hostnames concurrently, then look up vendors
 $foundDevices = $arpEntries | ForEach-Object {
+    $osGuess = if ($ttlMap.ContainsKey($_.IP)) { Get-OsGuess -Ttl $ttlMap[$_.IP] } else { '' }
     [PSCustomObject]@{
-        mac        = $_.MAC
-        ip         = $_.IP
-        hostname   = $_.IP   # placeholder, overwritten by Resolve-Hostname
-        vendor     = ''
-        openPorts  = @()
-        httpBanner = ''
-        upnpInfo   = ''
-        riskLevel  = 'NONE'
+        mac         = $_.MAC
+        ip          = $_.IP
+        hostname    = $_.IP   # placeholder, overwritten by Resolve-Hostname
+        vendor      = ''
+        osGuess     = $osGuess
+        openPorts   = @()
+        httpBanner  = ''
+        upnpInfo    = ''
+        riskLevel   = 'NONE'
         riskReasons = @()
     }
 }
@@ -987,9 +1203,16 @@ if ($LearningMode -or -not $stateFileExists) {
     foreach ($device in $foundDevices) {
         $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
         if ($known) {
+            $previousHost = Test-IdentityChange -KnownDevice $known -FoundDevice $device
+            if ($previousHost) {
+                Write-RddLog "IDENTITY CHANGE: $($device.mac) hostname changed from '$previousHost' to '$($device.hostname)'" -Level WARN
+                Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_CHANGED' -Device $device `
+                    -Details "previousHostname=$previousHost"
+            }
             $known.lastSeen = $now
             $known.ip       = $device.ip
             $known.hostname = $device.hostname
+            $known.osGuess  = $device.osGuess
         } else {
             $newDevices.Add($device)
             $state.knownDevices += [PSCustomObject]@{
@@ -997,6 +1220,7 @@ if ($LearningMode -or -not $stateFileExists) {
                 ip         = $device.ip
                 hostname   = $device.hostname
                 vendor     = $device.vendor
+                osGuess    = $device.osGuess
                 label      = ''
                 firstSeen  = $now
                 lastSeen   = $now
@@ -1031,14 +1255,28 @@ if ($LearningMode -or -not $stateFileExists) {
 }
 
 # Normal scan: compare found devices against baseline
-$rogueDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
+$rogueDevices    = [System.Collections.Generic.List[PSCustomObject]]::new()
+$identityChanges = [System.Collections.Generic.List[hashtable]]::new()
 
 foreach ($device in $foundDevices) {
     $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
     if ($known) {
+        $previousHost = Test-IdentityChange -KnownDevice $known -FoundDevice $device
+        if ($previousHost) {
+            Write-RddLog "IDENTITY CHANGE: $($device.mac) hostname changed from '$previousHost' to '$($device.hostname)'" -Level WARN
+            Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_CHANGED' -Device $device `
+                -Details "previousHostname=$previousHost"
+            $identityChanges.Add(@{
+                mac         = $device.mac
+                ip          = $device.ip
+                oldHostname = $previousHost
+                newHostname = $device.hostname
+            })
+        }
         $known.lastSeen = $now
         $known.ip       = $device.ip
         $known.hostname = $device.hostname
+        $known.osGuess  = $device.osGuess
     } else {
         $riskTag = if ($device.riskLevel -ne 'NONE') { " [$($device.riskLevel)]" } else { '' }
         Write-RddLog "ROGUE: $($device.mac)  $($device.ip)  $($device.hostname)  [$($device.vendor)]$riskTag" -Level WARN
@@ -1049,6 +1287,7 @@ foreach ($device in $foundDevices) {
 }
 
 # Log risk findings for known devices with HIGH or CRITICAL risk
+$riskDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
 foreach ($device in $foundDevices) {
     if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
         $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
@@ -1056,7 +1295,21 @@ foreach ($device in $foundDevices) {
             Write-RddLog "RISK [$($device.riskLevel)]: $($device.ip) $($device.hostname) - $($device.riskReasons -join '; ')" -Level WARN
             Write-AuditLog -LogPath $cfg.logPath -EventName 'RISK_FOUND' -Device $device `
                 -Details ($device.riskReasons -join '; ')
+            $riskDevices.Add($device)
         }
+    }
+}
+
+# Detect devices that have not been seen for too long
+$absentDevices = Get-AbsentDevices -KnownDevices @($state.knownDevices) `
+    -AbsentDays $cfg.absentDays -Now $now
+if ($absentDevices.Count -gt 0) {
+    Write-RddLog "$($absentDevices.Count) device(s) not seen for $($cfg.absentDays)+ days." -Level WARN
+    foreach ($d in $absentDevices) {
+        $label = if ($d.label) { " ($($d.label))" } else { '' }
+        Write-RddLog "  ABSENT: $($d.mac)$label  Last seen: $($d.lastSeen)" -Level WARN
+        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ABSENT' -Device $d `
+            -Details "lastSeen=$($d.lastSeen) absentDays=$($cfg.absentDays)"
     }
 }
 
@@ -1065,11 +1318,33 @@ Save-State -State $state -StatePath $cfg.statePath
 
 $riskCount = @($foundDevices | Where-Object { $_.riskLevel -ne 'NONE' }).Count
 Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_DONE' `
-    -Details "found=$($foundDevices.Count) rogue=$($rogueDevices.Count) risks=$riskCount mode=normal"
+    -Details "found=$($foundDevices.Count) rogue=$($rogueDevices.Count) absent=$($absentDevices.Count) risks=$riskCount mode=normal"
 
-if ($rogueDevices.Count -gt 0) {
+# Send alerts / summary report
+if ($cfg.summaryReport) {
+    $report = @{
+        subnet          = $targetSubnet
+        foundCount      = $foundDevices.Count
+        foundDevices    = $foundDevices
+        baselineCount   = @($state.knownDevices).Count
+        rogueDevices    = $rogueDevices.ToArray()
+        absentDevices   = $absentDevices
+        absentDays      = $cfg.absentDays
+        riskDevices     = $riskDevices.ToArray()
+        identityChanges = $identityChanges.ToArray()
+    }
+    Send-SummaryReport -Report $report -SmtpConfig $cfg.smtp
+} elseif ($rogueDevices.Count -gt 0) {
     Write-RddLog "$($rogueDevices.Count) rogue device(s) detected."
     Send-RogueAlert -Devices $rogueDevices.ToArray() -SmtpConfig $cfg.smtp
 } else {
     Write-RddLog 'Scan complete - all devices are known.'
 }
+
+# Exit code bitmask for RMM integration (e.g. NinjaRMM conditions)
+#   0 = clean, 1 = rogue devices, 2 = high/critical risk, 4 = absent devices
+$exitCode = 0
+if ($rogueDevices.Count -gt 0) { $exitCode = $exitCode -bor 1 }
+if ($riskDevices.Count -gt 0)  { $exitCode = $exitCode -bor 2 }
+if ($absentDevices.Count -gt 0) { $exitCode = $exitCode -bor 4 }
+exit $exitCode

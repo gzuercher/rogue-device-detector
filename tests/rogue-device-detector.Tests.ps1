@@ -5,15 +5,18 @@
 
 .DESCRIPTION
     Covers pure-logic functions that require no network access:
-      - Get-SubnetInfo       (CIDR parsing)
-      - Get-DeviceRisk       (risk evaluation)
-      - Get-MacVendor        (OUI lookup)
-      - Get-State            (state file loading)
-      - Save-State           (state file writing)
-      - Get-Configuration    (config loading and overrides)
-      - Invoke-ApproveDevice (baseline management)
-      - Invoke-RemoveDevice  (baseline management)
-      - Write-AuditLog       (CSV audit log writing)
+      - Get-SubnetInfo         (CIDR parsing)
+      - Get-DeviceRisk         (risk evaluation)
+      - Get-MacVendor          (OUI lookup)
+      - Get-OsGuess            (TTL-based OS fingerprinting)
+      - Get-State              (state file loading)
+      - Save-State             (state file writing)
+      - Get-Configuration      (config loading and overrides)
+      - Invoke-ApproveDevice   (baseline management)
+      - Invoke-RemoveDevice    (baseline management)
+      - Test-IdentityChange    (hostname change detection)
+      - Get-AbsentDevices      (absent device detection)
+      - Write-AuditLog         (CSV audit log writing)
 
     Network-dependent functions (Invoke-PingSweep, Get-ArpEntry,
     Resolve-Hostname, Invoke-PortScan, Invoke-UpnpDiscovery) are not
@@ -206,6 +209,136 @@ Describe 'Get-MacVendor' {
     }
 }
 
+# ── Get-OsGuess ───────────────────────────────────────────────────────────────
+
+Describe 'Get-OsGuess' {
+
+    It 'returns empty string for TTL 0 or negative' {
+        Get-OsGuess -Ttl 0  | Should -Be ''
+        Get-OsGuess -Ttl -1 | Should -Be ''
+    }
+
+    It 'returns Linux/macOS for TTL 64' {
+        Get-OsGuess -Ttl 64 | Should -Be 'Linux/macOS'
+    }
+
+    It 'returns Linux/macOS for TTL below 64 (hops reduce TTL)' {
+        Get-OsGuess -Ttl 58 | Should -Be 'Linux/macOS'
+    }
+
+    It 'returns Windows for TTL 128' {
+        Get-OsGuess -Ttl 128 | Should -Be 'Windows'
+    }
+
+    It 'returns Windows for TTL between 65 and 128 (e.g. 120)' {
+        Get-OsGuess -Ttl 120 | Should -Be 'Windows'
+    }
+
+    It 'returns Network device for TTL 255' {
+        Get-OsGuess -Ttl 255 | Should -Be 'Network device'
+    }
+
+    It 'returns Network device for TTL above 128 (e.g. 250)' {
+        Get-OsGuess -Ttl 250 | Should -Be 'Network device'
+    }
+}
+
+# ── Test-IdentityChange ──────────────────────────────────────────────────────
+
+Describe 'Test-IdentityChange' {
+
+    It 'returns previous hostname when hostname changed' {
+        $known = [PSCustomObject]@{ hostname = 'LAPTOP-JOHN'; ip = '192.168.1.10' }
+        $found = [PSCustomObject]@{ hostname = 'DESKTOP-ADMIN'; ip = '192.168.1.10' }
+        $result = Test-IdentityChange -KnownDevice $known -FoundDevice $found
+        $result | Should -Be 'LAPTOP-JOHN'
+    }
+
+    It 'returns $null when hostname has not changed' {
+        $known = [PSCustomObject]@{ hostname = 'LAPTOP-JOHN'; ip = '192.168.1.10' }
+        $found = [PSCustomObject]@{ hostname = 'LAPTOP-JOHN'; ip = '192.168.1.10' }
+        $result = Test-IdentityChange -KnownDevice $known -FoundDevice $found
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'ignores changes where old hostname was an IP address (DNS flapping)' {
+        $known = [PSCustomObject]@{ hostname = '192.168.1.10'; ip = '192.168.1.10' }
+        $found = [PSCustomObject]@{ hostname = 'LAPTOP-NEW'; ip = '192.168.1.10' }
+        $result = Test-IdentityChange -KnownDevice $known -FoundDevice $found
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'returns $null when known hostname is empty' {
+        $known = [PSCustomObject]@{ hostname = ''; ip = '192.168.1.10' }
+        $found = [PSCustomObject]@{ hostname = 'LAPTOP-NEW'; ip = '192.168.1.10' }
+        $result = Test-IdentityChange -KnownDevice $known -FoundDevice $found
+        $result | Should -BeNullOrEmpty
+    }
+
+    It 'detects change when hostname changes to an IP (DNS stopped resolving)' {
+        $known = [PSCustomObject]@{ hostname = 'LAPTOP-JOHN'; ip = '192.168.1.10' }
+        $found = [PSCustomObject]@{ hostname = '192.168.1.10'; ip = '192.168.1.10' }
+        $result = Test-IdentityChange -KnownDevice $known -FoundDevice $found
+        $result | Should -Be 'LAPTOP-JOHN'
+    }
+}
+
+# ── Get-AbsentDevices ─────────────────────────────────────────────────────────
+
+Describe 'Get-AbsentDevices' {
+
+    It 'returns devices not seen for more than the threshold' {
+        $now = '2024-06-01T00:00:00Z'
+        $devices = @(
+            [PSCustomObject]@{ mac = 'AA:BB:CC:DD:EE:FF'; lastSeen = '2024-05-01T00:00:00Z' },
+            [PSCustomObject]@{ mac = '11:22:33:44:55:66'; lastSeen = '2024-05-30T00:00:00Z' }
+        )
+        $result = Get-AbsentDevices -KnownDevices $devices -AbsentDays 21 -Now $now
+        $result | Should -HaveCount 1
+        $result[0].mac | Should -Be 'AA:BB:CC:DD:EE:FF'
+    }
+
+    It 'returns empty array when all devices were seen recently' {
+        $now = '2024-06-01T00:00:00Z'
+        $devices = @(
+            [PSCustomObject]@{ mac = 'AA:BB:CC:DD:EE:FF'; lastSeen = '2024-05-30T00:00:00Z' }
+        )
+        $result = Get-AbsentDevices -KnownDevices $devices -AbsentDays 21 -Now $now
+        $result | Should -HaveCount 0
+    }
+
+    It 'skips devices with no lastSeen value' {
+        $now = '2024-06-01T00:00:00Z'
+        $devices = @(
+            [PSCustomObject]@{ mac = 'AA:BB:CC:DD:EE:FF'; lastSeen = '' },
+            [PSCustomObject]@{ mac = '11:22:33:44:55:66'; lastSeen = $null }
+        )
+        $result = Get-AbsentDevices -KnownDevices $devices -AbsentDays 21 -Now $now
+        $result | Should -HaveCount 0
+    }
+
+    It 'uses the absentDays threshold correctly at the boundary' {
+        $now = '2024-06-01T00:00:00Z'
+        # Exactly 21 days ago = not absent yet (needs to be MORE than 21 days)
+        $devices = @(
+            [PSCustomObject]@{ mac = 'AA:BB:CC:DD:EE:FF'; lastSeen = '2024-05-11T00:00:00Z' }
+        )
+        $result = Get-AbsentDevices -KnownDevices $devices -AbsentDays 21 -Now $now
+        $result | Should -HaveCount 0
+    }
+
+    It 'returns all absent devices when multiple are past threshold' {
+        $now = '2024-06-01T00:00:00Z'
+        $devices = @(
+            [PSCustomObject]@{ mac = 'AA:BB:CC:DD:EE:FF'; lastSeen = '2024-04-01T00:00:00Z' },
+            [PSCustomObject]@{ mac = '11:22:33:44:55:66'; lastSeen = '2024-03-15T00:00:00Z' },
+            [PSCustomObject]@{ mac = 'CC:DD:EE:FF:00:11'; lastSeen = '2024-05-30T00:00:00Z' }
+        )
+        $result = Get-AbsentDevices -KnownDevices $devices -AbsentDays 21 -Now $now
+        $result | Should -HaveCount 2
+    }
+}
+
 # ── Get-State ──────────────────────────────────────────────────────────────────
 
 Describe 'Get-State' {
@@ -235,6 +368,19 @@ Describe 'Get-State' {
         $result.lastScan            | Should -Be '2024-01-01T00:00:00.0000000Z'
         @($result.knownDevices)     | Should -HaveCount 1
         $result.knownDevices[0].mac | Should -Be 'AA:BB:CC:DD:EE:FF'
+    }
+
+    It 'adds osGuess field to devices from older state files' {
+        $path = Join-Path $TestDrive 'old-state.json'
+        [PSCustomObject]@{
+            lastScan     = '2024-01-01T00:00:00.0000000Z'
+            knownDevices = @(
+                [PSCustomObject]@{ mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.1' }
+            )
+        } | ConvertTo-Json -Depth 5 | Set-Content $path
+
+        $result = Get-State -StatePath $path
+        $result.knownDevices[0].osGuess | Should -Be ''
     }
 
     It 'replaces null knownDevices with an empty array' {
@@ -436,10 +582,22 @@ Describe 'Get-Configuration' {
     It 'returns defaults when config file does not exist' {
         $result = Get-Configuration -ConfigPath (Join-Path $TestDrive 'nonexistent.json')
 
-        $result.subnet     | Should -BeNullOrEmpty
-        $result.enrichment | Should -Be $true
-        $result.smtp.port  | Should -Be 587
-        $result.smtp.host  | Should -BeNullOrEmpty
+        $result.subnet        | Should -BeNullOrEmpty
+        $result.enrichment    | Should -Be $true
+        $result.absentDays    | Should -Be 21
+        $result.summaryReport | Should -Be $false
+        $result.smtp.port     | Should -Be 587
+        $result.smtp.host     | Should -BeNullOrEmpty
+    }
+
+    It 'loads absentDays and summaryReport from config file' {
+        $configPath = Join-Path $TestDrive 'absent-config.json'
+        @{ absentDays = 7; summaryReport = $true } |
+            ConvertTo-Json | Set-Content $configPath
+
+        $result = Get-Configuration -ConfigPath $configPath
+        $result.absentDays    | Should -Be 7
+        $result.summaryReport | Should -Be $true
     }
 
     It 'loads subnet and enrichment from a valid config file' {
@@ -505,7 +663,7 @@ Describe 'Write-AuditLog' {
     It 'creates the log file with a header row on first use' {
         $logPath = Join-Path $TestDrive 'audit-new.csv'
 
-        Write-AuditLog -LogPath $logPath -EventName 'SCAN_START' -Details 'subnet=192.168.1.0/24'
+        Write-AuditLog -LogPath $logPath -Event 'SCAN_START' -Details 'subnet=192.168.1.0/24'
 
         Test-Path $logPath | Should -Be $true
         $lines = Get-Content $logPath
@@ -517,8 +675,8 @@ Describe 'Write-AuditLog' {
     It 'appends event rows without overwriting the header' {
         $logPath = Join-Path $TestDrive 'audit-append.csv'
 
-        Write-AuditLog -LogPath $logPath -EventName 'SCAN_START'
-        Write-AuditLog -LogPath $logPath -EventName 'SCAN_DONE' -Details 'found=3'
+        Write-AuditLog -LogPath $logPath -Event 'SCAN_START'
+        Write-AuditLog -LogPath $logPath -Event 'SCAN_DONE' -Details 'found=3'
 
         $lines = Get-Content $logPath
         $lines.Count | Should -Be 3   # header + 2 events
@@ -537,7 +695,7 @@ Describe 'Write-AuditLog' {
             riskLevel  = 'CRITICAL'
         }
 
-        Write-AuditLog -LogPath $logPath -EventName 'DEVICE_ROGUE' -Device $device
+        Write-AuditLog -LogPath $logPath -Event 'DEVICE_ROGUE' -Device $device
 
         $content = Get-Content $logPath -Raw
         $content | Should -Match 'AA:BB:CC:DD:EE:FF'
@@ -548,7 +706,7 @@ Describe 'Write-AuditLog' {
     It 'escapes double-quotes in the Details field per CSV spec' {
         $logPath = Join-Path $TestDrive 'audit-escape.csv'
 
-        Write-AuditLog -LogPath $logPath -EventName 'SCAN_START' -Details 'label="test"'
+        Write-AuditLog -LogPath $logPath -Event 'SCAN_START' -Details 'label="test"'
 
         $content = Get-Content $logPath -Raw
         # CSV escaping: " becomes ""
@@ -557,6 +715,6 @@ Describe 'Write-AuditLog' {
 
     It 'does not throw when called without a device object' {
         $logPath = Join-Path $TestDrive 'audit-nodevice.csv'
-        { Write-AuditLog -LogPath $logPath -EventName 'SCAN_START' } | Should -Not -Throw
+        { Write-AuditLog -LogPath $logPath -Event 'SCAN_START' } | Should -Not -Throw
     }
 }

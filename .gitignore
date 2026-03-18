@@ -6,3 +6,6 @@ state.json
 
 # Downloaded OUI vendor database – regenerated automatically
 oui.csv
+
+# macOS
+.DS_Store
