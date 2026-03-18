@@ -17,19 +17,24 @@ Scheduled execution (any scheduler, recommended: weekly)
        ├─ 4. Read ARP table → list of MACs + IPs (broadcast/network addr filtered)
        ├─ 5. Resolve hostnames (async reverse DNS, 2s timeout, concurrent)
        ├─ 6. Lookup MAC vendor (OUI database, offline)
-       ├─ 7. Enrichment (if enabled):
+       ├─ 7. OS fingerprint via TTL (Windows / Linux/macOS / Network device)
+       ├─ 8. Enrichment (if enabled):
        │       ├─ UPnP/SSDP broadcast → IoT device identification
        │       ├─ TCP port scan (10 security ports, async, per device)
        │       ├─ HTTP/HTTPS banner grab (title + Server header)
        │       └─ Risk evaluation → NONE / LOW / MEDIUM / HIGH / CRITICAL
-       ├─ 8. Load state file → known MACs
-       ├─ 9. Compare: found vs known
-       ├─ 10a. Learning Mode ON  → merge new devices into state, no alerts
+       ├─ 9. Load state file → known MACs
+       ├─ 10. Compare: found vs known
+       │        ├─ Detect identity changes (hostname changed since last scan)
+       │        └─ Detect absent devices (not seen for N days)
+       ├─ 11a. Learning Mode ON  → merge new devices into state, no alerts
        │         └─ Print simulated alert to console for new devices
-       └─ 10b. Learning Mode OFF → delta (new MACs only):
-                 ├─ Send alert email via SMTP (with enrichment data)
+       └─ 11b. Learning Mode OFF → delta (new MACs only):
+                 ├─ Send alert email or summary report via SMTP
                  ├─ Log RISK_FOUND for known devices with HIGH/CRITICAL risk
-                 └─ Write audit log entries
+                 ├─ Log DEVICE_ABSENT / DEVICE_CHANGED events
+                 ├─ Write audit log entries
+                 └─ Exit with bitmask code for RMM integration
 ```
 
 ## State File
@@ -45,6 +50,7 @@ Local JSON file. Path configurable. Can be moved to another device to migrate st
       "ip": "192.168.1.42",
       "hostname": "LAPTOP-XYZ",
       "vendor": "Apple Inc.",
+      "osGuess": "Windows",
       "firstSeen": "2025-03-01T10:00:00Z",
       "lastSeen": "2025-03-14T08:00:00Z"
     }
@@ -52,7 +58,7 @@ Local JSON file. Path configurable. Can be moved to another device to migrate st
 }
 ```
 
-Note: enrichment data (ports, banner, risk) is not persisted in the state file – it is re-evaluated on every scan.
+Note: enrichment data (ports, banner, risk) is not persisted in the state file – it is re-evaluated on every scan. The `osGuess` field is persisted so that absent device reports can show the OS.
 
 ## Audit Log
 
@@ -69,6 +75,10 @@ Events logged (minimal noise principle):
 | `DEVICE_NEW` | Learning mode: new device added to baseline |
 | `DEVICE_ROGUE` | Normal scan: unknown device detected |
 | `RISK_FOUND` | Normal scan: known device with HIGH or CRITICAL risk |
+| `DEVICE_CHANGED` | Hostname changed since last scan (identity change) |
+| `DEVICE_ABSENT` | Device not seen for longer than `absentDays` |
+| `DEVICE_APPROVED` | Device manually approved via `-Approve` |
+| `DEVICE_REMOVED` | Device manually removed via `-Remove` |
 
 A quiet network produces exactly 2 log lines per week.
 
@@ -84,6 +94,8 @@ All path values must include the full filename. Backslashes must be escaped as `
   "ouiPath": "C:\\temp\\oui.csv",
   "logPath": "C:\\temp\\rdd-audit.csv",
   "enrichment": true,
+  "absentDays": 21,
+  "summaryReport": false,
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
@@ -102,6 +114,8 @@ All path values must include the full filename. Backslashes must be escaped as `
 | `ouiPath` | `oui.csv` in script dir | Full path to OUI vendor cache file. |
 | `logPath` | `rdd-audit.csv` in script dir | Full path to audit log CSV file. |
 | `enrichment` | `true` | Set to `false` to skip port scan / banner / UPnP (faster). |
+| `absentDays` | `21` | Days without a sighting before a device is flagged as absent. |
+| `summaryReport` | `false` | Send a full network health report after every scan. |
 | `smtp.host` | – | SMTP server hostname |
 | `smtp.port` | `587` | SMTP port (STARTTLS) |
 | `smtp.user` | – | SMTP username |
@@ -121,8 +135,13 @@ All path values must include the full filename. Backslashes must be escaped as `
 - **HTTP/HTTPS banner grab** – Page title + Server header for device identification
 - **UPnP discovery** – Single SSDP broadcast, identifies IoT/smart devices
 - **Risk evaluation** – NONE / LOW / MEDIUM / HIGH / CRITICAL based on open ports
+- **OS fingerprinting** – TTL-based guess: Windows, Linux/macOS, Network device
+- **Identity change detection** – Alerts when a known device's hostname changes (e.g. reinstall)
+- **Absent device detection** – Flags devices not seen for configurable number of days
 - **Learning mode** – Baseline creation: merges found devices into state, no alerts; simulates alert output on console for new devices
-- **SMTP alert** – Enriched with ports, risk, banner, UPnP info; Azure ACS compatible
+- **SMTP alert** – Enriched with ports, risk, banner, UPnP, OS info; Azure ACS compatible
+- **Summary report** – Optional comprehensive network health email with OS breakdown
+- **RMM exit codes** – Bitmask exit code (0=clean, 1=rogue, 2=risk, 4=absent) for NinjaOne/Intune
 - **Portable state file** – JSON, path configurable, easy to migrate between hosts
 - **Audit log** – Append-only CSV, minimal noise, suitable for compliance/forensics
 
@@ -144,7 +163,6 @@ All path values must include the full filename. Backslashes must be escaped as `
 ### Explicitly Out of Scope
 
 - Real-time / continuous monitoring
-- Disappeared / offline device detection
 - Vulnerability scanning
 - Web UI or dashboard
 - Cloud backend or external API dependencies

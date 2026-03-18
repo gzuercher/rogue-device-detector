@@ -4,6 +4,8 @@
   "ouiPath": "C:\\temp\\oui.csv",
   "logPath": "C:\\temp\\rdd-audit.csv",
   "enrichment": true,
+  "absentDays": 21,
+  "summaryReport": false,
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
