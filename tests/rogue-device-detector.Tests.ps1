@@ -242,8 +242,10 @@ Describe 'Get-State' {
         '{ "lastScan": "2024-01-01T00:00:00Z", "knownDevices": null }' | Set-Content $path
 
         $result = Get-State -StatePath $path
-        $result.knownDevices        | Should -Not -BeNull
-        @($result.knownDevices)     | Should -HaveCount 0
+        # Pester 5 enumerates empty arrays in the pipeline, so Should receives $null
+        # rather than the array object itself. Test the null-ness as a scalar boolean.
+        ($null -eq $result.knownDevices) | Should -BeFalse
+        $result.knownDevices.Count       | Should -Be 0
     }
 }
 
