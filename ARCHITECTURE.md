@@ -12,10 +12,12 @@ Detect unknown (rogue) devices on a network. Standalone PowerShell script, no ex
 Scheduled execution (any scheduler, recommended: weekly)
   └─ PowerShell Script
        ├─ 1. Load config (config.json + parameter overrides)
+       ├─ 1b. Validate output paths (statePath, logPath, ouiPath) for writability
        ├─ 2. Determine subnet (auto-detect from NIC or config override)
+       ├─ 2b. Acquire scan lock (exclusive lock file prevents concurrent scans)
        ├─ 3. Ping sweep → populate ARP cache (async, ~500ms for /24)
        ├─ 4. Read ARP table → list of MACs + IPs (broadcast/network addr filtered)
-       ├─ 5. Resolve hostnames (async reverse DNS, 2s timeout, concurrent)
+       ├─ 5. Resolve hostnames (concurrent DNS via Task.WaitAll + NetBIOS fallback)
        ├─ 6. Lookup MAC vendor (OUI database, offline)
        ├─ 7. OS fingerprint via TTL (Windows / Linux/macOS / Network device)
        ├─ 8. Enrichment (if enabled):
@@ -39,10 +41,11 @@ Scheduled execution (any scheduler, recommended: weekly)
 
 ## State File
 
-Local JSON file. Path configurable. Can be moved to another device to migrate state.
+Local JSON file. Path configurable. Can be moved to another device to migrate state. Includes a `schemaVersion` field (added in v1.3.0) for automatic migration of older state files.
 
 ```json
 {
+  "schemaVersion": 2,
   "lastScan": "2025-03-14T08:00:00Z",
   "knownDevices": [
     {
@@ -58,7 +61,7 @@ Local JSON file. Path configurable. Can be moved to another device to migrate st
 }
 ```
 
-Note: enrichment data (ports, banner, risk) is not persisted in the state file – it is re-evaluated on every scan. The `osGuess` field is persisted so that absent device reports can show the OS.
+Note: enrichment data (ports, banner, risk) is not persisted in the state file – it is re-evaluated on every scan. The `osGuess` field is persisted so that absent device reports can show the OS. When loading a state file without `schemaVersion`, the field is added automatically and missing device fields are migrated.
 
 ## Audit Log
 
@@ -129,7 +132,7 @@ All path values must include the full filename. Backslashes must be escaped as `
 
 - **Ping sweep + ARP scan** – Pure PowerShell, no external tools, async concurrent
 - **Auto-subnet detection** – Reads own NIC config; overridable via config or parameter
-- **Hostname resolution** – Async concurrent reverse DNS (2s timeout per host)
+- **Hostname resolution** – Async concurrent reverse DNS with `Task.WaitAll` (2s timeout per host), NetBIOS (UDP 137) fallback for unresolved hosts
 - **MAC vendor lookup** – IEEE OUI database, downloaded on first run, cached 30 days
 - **Port scan** – 10 security-relevant TCP ports per device, async, ~500ms per host
 - **HTTP/HTTPS banner grab** – Page title + Server header for device identification
@@ -142,7 +145,10 @@ All path values must include the full filename. Backslashes must be escaped as `
 - **SMTP alert** – Enriched with ports, risk, banner, UPnP, OS info; Azure ACS compatible
 - **Summary report** – Optional comprehensive network health email with OS breakdown
 - **RMM exit codes** – Bitmask exit code (0=clean, 1=rogue, 2=risk, 4=absent) for NinjaOne/Intune
-- **Portable state file** – JSON, path configurable, easy to migrate between hosts
+- **Portable state file** – JSON, path configurable, easy to migrate between hosts, versioned schema with auto-migration
+- **Path validation** – All output paths (state, log, OUI) validated for writability before scan starts
+- **Concurrent scan guard** – Exclusive lock file prevents two scans from corrupting `state.json`
+- **Subnet validation** – /31 and /32 subnets are rejected (no scannable host addresses)
 - **Audit log** – Append-only CSV, minimal noise, suitable for compliance/forensics
 
 ### Security Ports Monitored

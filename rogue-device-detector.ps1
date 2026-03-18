@@ -74,9 +74,10 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.2.0'
-$OUI_URL          = 'https://standards-oui.ieee.org/oui/oui.csv'
-$OUI_MAX_AGE_DAYS = 30
+$SCRIPT_VERSION       = '1.3.0'
+$OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
+$OUI_MAX_AGE_DAYS     = 30
+$STATE_SCHEMA_VERSION = 2
 
 $SECURITY_PORTS = @(
     [PSCustomObject]@{ Port = 21;   Label = 'FTP';        Risk = 'HIGH';     Reason = 'Unencrypted file transfer' },
@@ -227,6 +228,11 @@ function Get-SubnetInfo {
     if ($parts.Count -ne 2) { throw "Invalid CIDR format: '$Cidr'" }
 
     $prefix   = [int]$parts[1]
+    if ($prefix -lt 0 -or $prefix -gt 32) { throw "Invalid prefix length: $prefix (must be 0-32)" }
+    if ($prefix -ge 31) {
+        throw "Prefix /$prefix is not scannable (no usable host addresses)."
+    }
+
     $ipBytes  = [System.Net.IPAddress]::Parse($parts[0]).GetAddressBytes()
     [Array]::Reverse($ipBytes)
     $ipInt    = [System.BitConverter]::ToUInt32($ipBytes, 0)
@@ -344,17 +350,84 @@ function Get-ArpEntry {
     return $entries.ToArray()
 }
 
+function Resolve-HostnameNetBios {
+    <#
+    .SYNOPSIS
+        Attempts NetBIOS name resolution for a single IP address via UDP port 137.
+    .PARAMETER IP Target IP address.
+    .PARAMETER TimeoutMs Timeout in milliseconds.
+    .RETURNS Hostname string or empty string if resolution failed.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'NetBios is a proper name (NetBIOS), not a plural noun.'
+    )]
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$TimeoutMs = 1500
+    )
+
+    try {
+        $client = [System.Net.Sockets.UdpClient]::new()
+        $client.Client.ReceiveTimeout = $TimeoutMs
+
+        # NetBIOS Name Query: transaction ID 0x0001, standard query, 1 question, wildcard name *
+        $query = [byte[]](
+            0x00, 0x01,  # Transaction ID
+            0x00, 0x00,  # Flags: standard query
+            0x00, 0x01,  # Questions: 1
+            0x00, 0x00,  # Answer RRs: 0
+            0x00, 0x00,  # Authority RRs: 0
+            0x00, 0x00,  # Additional RRs: 0
+            0x20,        # Name length: 32
+            # Encoded wildcard name "*" (0x2A padded to 16 bytes, half-ASCII encoded)
+            0x43, 0x4B, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+            0x00,        # Name terminator
+            0x00, 0x21,  # Type: NBSTAT
+            0x00, 0x01   # Class: IN
+        )
+
+        $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($IP), 137)
+        $client.Send($query, $query.Length, $ep) | Out-Null
+
+        $remote   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $response = $client.Receive([ref]$remote)
+        $client.Dispose()
+
+        if ($response.Length -gt 57) {
+            $nameCount = $response[56]
+            if ($nameCount -gt 0) {
+                $nameBytes = $response[57..72]
+                $name = [System.Text.Encoding]::ASCII.GetString($nameBytes).Trim()
+                if ($name -and $name -notmatch '^\s*$') {
+                    return $name
+                }
+            }
+        }
+    } catch {
+        $null = $_
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { $null = $_ } }
+    }
+    return ''
+}
+
 function Resolve-Hostname {
     <#
     .SYNOPSIS
         Resolves hostnames for an array of devices concurrently via async DNS.
-        All requests are fired simultaneously, each with a 2-second timeout.
+        All requests are fired simultaneously with a 2-second timeout.
+        Falls back to NetBIOS name resolution for unresolved devices.
         Updates the hostname property of each device object in place.
     .PARAMETER Devices Array of PSCustomObjects with an 'ip' property.
     #>
     param([Parameter(Mandatory)][array]$Devices)
 
     $timeoutMs = 2000
+    $total     = @($Devices).Count
 
     # Fire all DNS requests concurrently before waiting for any
     $tasks = $Devices | ForEach-Object {
@@ -365,31 +438,44 @@ function Resolve-Hostname {
         }
     }
 
+    # Create a combined task that completes when ALL WhenAny pairs are done
+    $whenAnyTasks = $tasks | ForEach-Object {
+        [System.Threading.Tasks.Task]::WhenAny(
+            [System.Threading.Tasks.Task[]]@($_.DnsTask, $_.TimeoutTask)
+        )
+    }
+    # Wait for all WhenAny tasks to complete (truly concurrent)
+    [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($whenAnyTasks))
+
     $resolved = 0
-    $total    = $tasks.Count
-    $i        = 0
+    $unresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($t in $tasks) {
-        $i++
-        Write-Progress -Activity 'Resolving hostnames' `
-                       -Status "$i/$total - $($t.Device.ip)" `
-                       -PercentComplete ([int]($i / $total * 100))
         try {
-            $taskArray = [System.Threading.Tasks.Task[]]@($t.DnsTask, $t.TimeoutTask)
-            $winner    = [System.Threading.Tasks.Task]::WhenAny($taskArray).GetAwaiter().GetResult()
-            if ($winner -eq $t.DnsTask -and $t.DnsTask.Status -eq 'RanToCompletion') {
+            if ($t.DnsTask.Status -eq 'RanToCompletion') {
                 $h = $t.DnsTask.Result.HostName
                 if ($h -and $h -ne $t.Device.ip) {
                     $t.Device.hostname = $h
                     $resolved++
+                    continue
                 }
             }
-        } catch {
-            Write-RddLog "DNS lookup failed for $($t.Device.ip): $_" -Level WARN
+        } catch { $null = $_ }
+        $unresolved.Add($t.Device)
+    }
+
+    # NetBIOS fallback for unresolved devices
+    if ($unresolved.Count -gt 0) {
+        Write-RddLog "Trying NetBIOS fallback for $($unresolved.Count) unresolved device(s)..."
+        foreach ($d in $unresolved) {
+            $nbName = Resolve-HostnameNetBios -IP $d.ip
+            if ($nbName) {
+                $d.hostname = $nbName
+                $resolved++
+            }
         }
     }
 
-    Write-Progress -Activity 'Resolving hostnames' -Completed
     Write-RddLog "Hostname resolution complete: $resolved/$total resolved."
 }
 
@@ -678,8 +764,9 @@ function Get-State {
     <#
     .SYNOPSIS
         Loads the state file, returning an empty state object if none exists.
+        Handles schema migration from older versions automatically.
     .PARAMETER StatePath Path to state.json.
-    .RETURNS PSCustomObject with lastScan and knownDevices properties.
+    .RETURNS PSCustomObject with schemaVersion, lastScan, and knownDevices properties.
     #>
     param([Parameter(Mandatory)][string]$StatePath)
 
@@ -696,18 +783,29 @@ function Get-State {
             Add-Member -InputObject $raw -NotePropertyName 'knownDevices' `
                 -NotePropertyValue ([object[]]@()) -Force
         }
-        # Ensure devices from older state files have the osGuess field.
+
+        # Schema migration: add missing fields from older versions
+        $requiredDeviceFields = @{ osGuess = '' }
         foreach ($d in @($raw.knownDevices)) {
-            if (-not ($d.PSObject.Properties['osGuess'])) {
-                $d | Add-Member -MemberType NoteProperty -Name 'osGuess' -Value ''
+            foreach ($field in $requiredDeviceFields.Keys) {
+                if (-not ($d.PSObject.Properties[$field])) {
+                    $d | Add-Member -MemberType NoteProperty -Name $field -Value $requiredDeviceFields[$field]
+                }
             }
+        }
+
+        # Ensure schemaVersion exists
+        if (-not ($raw.PSObject.Properties['schemaVersion'])) {
+            Add-Member -InputObject $raw -NotePropertyName 'schemaVersion' `
+                -NotePropertyValue $STATE_SCHEMA_VERSION -Force
         }
         return $raw
     }
 
     return [PSCustomObject]@{
-        lastScan     = $null
-        knownDevices = @()
+        schemaVersion = $STATE_SCHEMA_VERSION
+        lastScan      = $null
+        knownDevices  = @()
     }
 }
 
@@ -1101,6 +1199,79 @@ function Send-SummaryReport {
     }
 }
 
+function Test-PathWritable {
+    <#
+    .SYNOPSIS
+        Tests whether a file path is writable by attempting to open it for append.
+    .PARAMETER FilePath Path to test.
+    .RETURNS $true if writable, $false otherwise.
+    #>
+    param([Parameter(Mandatory)][string]$FilePath)
+
+    $dir = Split-Path $FilePath -Parent
+    if ($dir -and -not (Test-Path $dir)) {
+        try { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        catch { return $false }
+    }
+
+    try {
+        $stream = [System.IO.File]::Open($FilePath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::ReadWrite)
+        $stream.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Enter-ScanLock {
+    <#
+    .SYNOPSIS
+        Acquires an exclusive lock file to prevent concurrent scans.
+        Returns the lock file stream that must be disposed when done.
+    .PARAMETER StatePath Path to state.json (lock file is derived from it).
+    .RETURNS FileStream holding the lock, or $null if another scan is running.
+    #>
+    param([Parameter(Mandatory)][string]$StatePath)
+
+    $lockPath = "$StatePath.lock"
+    try {
+        $stream = [System.IO.File]::Open($lockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None)
+        $writer = [System.IO.StreamWriter]::new($stream)
+        $writer.Write("locked by $env:COMPUTERNAME PID $PID at $(Get-Date -Format 'o')")
+        $writer.Flush()
+        return $stream
+    } catch {
+        return $null
+    }
+}
+
+function Exit-ScanLock {
+    <#
+    .SYNOPSIS
+        Releases the scan lock and removes the lock file.
+    .PARAMETER LockStream FileStream returned by Enter-ScanLock.
+    .PARAMETER StatePath  Path to state.json (lock file is derived from it).
+    #>
+    param(
+        [System.IO.FileStream]$LockStream,
+        [Parameter(Mandatory)][string]$StatePath
+    )
+
+    $lockPath = "$StatePath.lock"
+    if ($LockStream) {
+        try { $LockStream.Dispose() } catch { $null = $_ }
+    }
+    if (Test-Path $lockPath) {
+        try { Remove-Item $lockPath -Force } catch { $null = $_ }
+    }
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 # Guard: skip main body when dot-sourced for unit testing (e.g. Pester)
 if ($MyInvocation.InvocationName -eq '.') { return }
@@ -1110,6 +1281,23 @@ Write-RddLog "Rogue Device Detector v$SCRIPT_VERSION starting on $env:COMPUTERNA
 # Load configuration
 $configPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot 'config.json' }
 $cfg        = Get-Configuration -ConfigPath $configPath -SubnetOverride $Subnet
+
+# ── Path validation ───────────────────────────────────────────────────────────
+
+$pathErrors = @()
+foreach ($entry in @(
+    @{ Name = 'statePath'; Path = $cfg.statePath },
+    @{ Name = 'logPath';   Path = $cfg.logPath },
+    @{ Name = 'ouiPath';   Path = $cfg.ouiPath }
+)) {
+    if (-not (Test-PathWritable -FilePath $entry.Path)) {
+        $pathErrors += "$($entry.Name) '$($entry.Path)'"
+    }
+}
+if ($pathErrors.Count -gt 0) {
+    Write-RddLog "Cannot write to: $($pathErrors -join ', '). Check paths and permissions." -Level ERROR
+    exit 1
+}
 
 # ── Management commands (no scan required) ─────────────────────────────────────
 
@@ -1139,6 +1327,14 @@ if ($Remove) {
     exit 0
 }
 
+# ── Acquire scan lock ─────────────────────────────────────────────────────────
+
+$scanLock = Enter-ScanLock -StatePath $cfg.statePath
+if (-not $scanLock) {
+    Write-RddLog 'Another scan is already running (lock file held). Exiting.' -Level ERROR
+    exit 1
+}
+
 # Resolve target subnet
 $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
 Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$(if ($LearningMode) { 'learning' } else { 'normal' })"
@@ -1155,6 +1351,7 @@ Write-RddLog "$($arpEntries.Count) device(s) found in ARP table."
 
 if ($arpEntries.Count -eq 0) {
     Write-RddLog 'ARP table empty after ping sweep. Exiting.' -Level WARN
+    Exit-ScanLock -LockStream $scanLock -StatePath $cfg.statePath
     exit 0
 }
 
@@ -1251,6 +1448,7 @@ if ($LearningMode -or -not $stateFileExists) {
 
     Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_DONE' `
         -Details "found=$($foundDevices.Count) new=$($newDevices.Count) mode=learning"
+    Exit-ScanLock -LockStream $scanLock -StatePath $cfg.statePath
     exit 0
 }
 
@@ -1347,4 +1545,5 @@ $exitCode = 0
 if ($rogueDevices.Count -gt 0) { $exitCode = $exitCode -bor 1 }
 if ($riskDevices.Count -gt 0)  { $exitCode = $exitCode -bor 2 }
 if ($absentDevices.Count -gt 0) { $exitCode = $exitCode -bor 4 }
+Exit-ScanLock -LockStream $scanLock -StatePath $cfg.statePath
 exit $exitCode
