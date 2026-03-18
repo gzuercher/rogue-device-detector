@@ -68,17 +68,16 @@ Describe 'Get-SubnetInfo' {
         { Get-SubnetInfo -Cidr 'not-a-cidr' } | Should -Throw
     }
 
-    It 'documents /32 edge case: HostCount becomes -1 (formula limitation)' {
-        # [int](2^0 - 2) = -1  – the function does not guard against this.
-        # This test documents the current behaviour; a future fix should
-        # return 0 or throw for /32.
-        $result = Get-SubnetInfo -Cidr '192.168.1.1/32'
-        $result.HostCount | Should -Be -1
+    It 'throws for /32 (no usable host addresses)' {
+        { Get-SubnetInfo -Cidr '192.168.1.1/32' } | Should -Throw '*not scannable*'
     }
 
-    It 'documents /31 edge case: HostCount is 0' {
-        $result = Get-SubnetInfo -Cidr '192.168.1.0/31'
-        $result.HostCount | Should -Be 0
+    It 'throws for /31 (no usable host addresses)' {
+        { Get-SubnetInfo -Cidr '192.168.1.0/31' } | Should -Throw '*not scannable*'
+    }
+
+    It 'throws for invalid prefix length (e.g. /33)' {
+        { Get-SubnetInfo -Cidr '192.168.1.0/33' } | Should -Throw '*Invalid prefix*'
     }
 }
 
@@ -716,5 +715,101 @@ Describe 'Write-AuditLog' {
     It 'does not throw when called without a device object' {
         $logPath = Join-Path $TestDrive 'audit-nodevice.csv'
         { Write-AuditLog -LogPath $logPath -Event 'SCAN_START' } | Should -Not -Throw
+    }
+}
+
+# ── Test-PathWritable ──────────────────────────────────────────────────────────
+
+Describe 'Test-PathWritable' {
+
+    It 'returns $true for a writable path' {
+        $path = Join-Path $TestDrive 'writable-test.txt'
+        Test-PathWritable -FilePath $path | Should -Be $true
+    }
+
+    It 'returns $true for an existing writable file' {
+        $path = Join-Path $TestDrive 'existing-file.txt'
+        'content' | Set-Content $path
+        Test-PathWritable -FilePath $path | Should -Be $true
+    }
+
+    It 'creates parent directories if they do not exist' {
+        $path = Join-Path $TestDrive 'subdir/deep/writable-test.txt'
+        Test-PathWritable -FilePath $path | Should -Be $true
+        Test-Path (Split-Path $path -Parent) | Should -Be $true
+    }
+}
+
+# ── Get-State (v1.3.0 schema version) ────────────────────────────────────────
+
+Describe 'Get-State schema version' {
+
+    It 'returns schemaVersion in empty state' {
+        $path   = Join-Path $TestDrive 'new-state.json'
+        $result = Get-State -StatePath $path
+        $result.schemaVersion | Should -Be $STATE_SCHEMA_VERSION
+    }
+
+    It 'adds schemaVersion to legacy state files' {
+        $path = Join-Path $TestDrive 'legacy-state.json'
+        [PSCustomObject]@{
+            lastScan     = '2024-01-01T00:00:00Z'
+            knownDevices = @()
+        } | ConvertTo-Json -Depth 5 | Set-Content $path
+
+        $result = Get-State -StatePath $path
+        $result.schemaVersion | Should -Be $STATE_SCHEMA_VERSION
+    }
+
+    It 'preserves existing schemaVersion from state file' {
+        $path = Join-Path $TestDrive 'versioned-state.json'
+        [PSCustomObject]@{
+            schemaVersion = 99
+            lastScan      = '2024-01-01T00:00:00Z'
+            knownDevices  = @()
+        } | ConvertTo-Json -Depth 5 | Set-Content $path
+
+        $result = Get-State -StatePath $path
+        $result.schemaVersion | Should -Be 99
+    }
+}
+
+# ── Enter-ScanLock / Exit-ScanLock ────────────────────────────────────────────
+
+Describe 'Enter-ScanLock / Exit-ScanLock' {
+
+    It 'acquires a lock and returns a FileStream' {
+        $statePath = Join-Path $TestDrive 'lock-test-state.json'
+        $lock = Enter-ScanLock -StatePath $statePath
+        try {
+            $lock | Should -Not -BeNullOrEmpty
+            $lock | Should -BeOfType [System.IO.FileStream]
+            Test-Path "$statePath.lock" | Should -Be $true
+        } finally {
+            Exit-ScanLock -LockStream $lock -StatePath $statePath
+        }
+    }
+
+    It 'Exit-ScanLock removes the lock file' {
+        $statePath = Join-Path $TestDrive 'lock-cleanup-state.json'
+        $lock = Enter-ScanLock -StatePath $statePath
+        Exit-ScanLock -LockStream $lock -StatePath $statePath
+        Test-Path "$statePath.lock" | Should -Be $false
+    }
+
+    It 'returns $null when lock is already held' {
+        $statePath = Join-Path $TestDrive 'lock-contention-state.json'
+        $lock1 = Enter-ScanLock -StatePath $statePath
+        try {
+            $lock2 = Enter-ScanLock -StatePath $statePath
+            $lock2 | Should -BeNullOrEmpty
+        } finally {
+            Exit-ScanLock -LockStream $lock1 -StatePath $statePath
+        }
+    }
+
+    It 'Exit-ScanLock handles $null stream gracefully' {
+        $statePath = Join-Path $TestDrive 'lock-null-state.json'
+        { Exit-ScanLock -LockStream $null -StatePath $statePath } | Should -Not -Throw
     }
 }
