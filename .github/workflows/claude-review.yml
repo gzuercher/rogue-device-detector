@@ -1,0 +1,71 @@
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+  id-token: write
+
+jobs:
+  # Automated review on every PR open/update
+  review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model claude-sonnet-4-6"
+          prompt: |
+            You are reviewing a pull request for a PowerShell network security tool (rogue-device-detector).
+            Read the CLAUDE.md and ARCHITECTURE.md for project context.
+
+            First, check CI status by running:
+              gh pr checks ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+
+            If CI is still running, note that in your review. If CI failed, that is a blocker.
+
+            Review the diff and evaluate:
+            1. **Correctness**: Does the code do what the PR claims? Are edge cases handled?
+            2. **Security**: No credential leaks, no command injection, proper input validation
+            3. **PowerShell conventions**: Strict mode compatible, proper error handling (no silent catch blocks), comment-based help on new functions
+            4. **Tests**: Are new functions covered by Pester tests?
+            5. **Breaking changes**: Does it break existing config.json or state.json compatibility?
+
+            Decision rules:
+            - If CI passed AND no issues found -> approve with `gh pr review --approve --body "..."`
+            - If CI passed but minor nits only -> approve with comments
+            - If CI failed OR significant issues found -> request changes with `gh pr review --request-changes --body "..."`
+            - If CI is still running -> post a comment with your review findings but do not approve yet
+
+            Always explain your reasoning briefly.
+
+  # Respond to @claude mentions in PR/issue comments
+  assist:
+    if: |
+      (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+      contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model claude-sonnet-4-6"
