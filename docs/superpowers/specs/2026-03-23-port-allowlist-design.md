@@ -14,6 +14,8 @@ Additionally, the current parameter names (`-Approve`, `-Remove`, `-List`) are n
 
 ## Parameter Changes (Breaking)
 
+No backward-compatible aliases. Old parameter names are removed entirely.
+
 | Old | New | Type | Description |
 |-----|-----|------|-------------|
 | `-Approve "MAC"` | `-ApproveDevice "MAC"` | `[string]` | Add device to baseline |
@@ -23,6 +25,21 @@ Additionally, the current parameter names (`-Approve`, `-Remove`, `-List`) are n
 | — | `-AllowPort 3389,22` | `[int[]]` | Allow port(s) on a device |
 | — | `-BlockPort 3389` | `[int[]]` | Revoke port allowance |
 | — | `-On "MAC"` | `[string]` | Target device for `-AllowPort` / `-BlockPort` |
+
+### Parameter Sets
+
+Mutually exclusive parameter sets enforce valid combinations:
+
+| Set Name | Parameters | Description |
+|----------|-----------|-------------|
+| `Scan` (default) | `-Config`, `-Subnet`, `-LearningMode` | Normal scan operation |
+| `ApproveDevice` | `-ApproveDevice`, `-Label` | Add device to baseline |
+| `RemoveDevice` | `-RemoveDevice` | Remove device from baseline |
+| `AllowPort` | `-AllowPort`, `-On` (mandatory) | Allow port(s) on a device |
+| `BlockPort` | `-BlockPort`, `-On` (mandatory) | Revoke port allowance |
+| `ListDevices` | `-ListDevices` | Show approved devices |
+
+`-On` is mandatory when `-AllowPort` or `-BlockPort` is used, enforced via parameter set.
 
 ### Usage Examples
 
@@ -45,7 +62,11 @@ Additionally, the current parameter names (`-Approve`, `-Remove`, `-List`) are n
 
 ## State File Changes
 
-### Current device object
+### Schema version
+
+Bump `$STATE_SCHEMA_VERSION` from `2` to `3`. Older script versions loading a v3 state file will ignore the `allowedPorts` field (no crash, just no port filtering). Newer script versions loading a v2 state file will treat missing `allowedPorts` as empty list.
+
+### Current device object (v2)
 
 ```json
 {
@@ -61,7 +82,7 @@ Additionally, the current parameter names (`-Approve`, `-Remove`, `-List`) are n
 }
 ```
 
-### New device object (added field)
+### New device object (v3, added field)
 
 ```json
 {
@@ -85,6 +106,22 @@ Backward compatible: devices without `allowedPorts` are treated as having an emp
 
 ## Scan Logic Changes
 
+### Data flow: when allowedPorts are applied
+
+The port allowlist is applied **after** enrichment and **after** baseline matching — not during `Invoke-DeviceEnrichment`. The flow:
+
+1. `Invoke-DeviceEnrichment` runs as before (port scan, risk calculation on ALL open ports)
+2. Normal scan loop matches found devices to baseline (`$state.knownDevices`)
+3. For known devices: retrieve `allowedPorts` from baseline entry
+4. **New step**: filter risk — remove allowed ports from `riskReasons`, recalculate `riskLevel`
+5. Risk check loop (currently ~line 1527) only sees non-allowed risks
+
+This means `Get-DeviceRisk` stays unchanged. Instead, a new function `Get-FilteredRisk` (or inline logic) strips allowed ports from the risk result after baseline matching.
+
+### Risk level scope
+
+The port allowlist applies to **all risk levels** (LOW, MEDIUM, HIGH, CRITICAL). Although only HIGH+ currently triggers log/email alerts, the summary report shows all risk levels. Allowed ports are filtered consistently across all levels.
+
 ### Risk check (currently ~line 1527)
 
 For each known device with open ports:
@@ -94,17 +131,19 @@ For each known device with open ports:
 3. Port is NOT in `allowedPorts` → **warn** as before
 4. New unexpected port appears → **warn** (this is the key value: allowed ports are explicit, anything new gets flagged)
 
-### Risk level calculation
+### Risk level recalculation
 
-Risk level is recalculated based on **non-allowed ports only**. A device with all risky ports allowed has effective risk level `NONE`.
+After filtering allowed ports, recalculate effective risk level from remaining non-allowed ports only. A device with all risky ports allowed has effective risk level `NONE`.
 
 ## Alert Output
+
+Alert commands use `$PSCommandPath` for the full script path (consistent with existing behavior).
 
 ### Risk warnings (log + email)
 
 ```
 RISK [HIGH]: 192.168.8.21 fileserver.local - Remote Desktop exposed (port 3389)
-  -> If expected: & "rogue-device-detector.ps1" -AllowPort 3389 -On "AA:BB:CC:DD:EE:FF"
+  -> If expected: & "C:\path\to\rogue-device-detector.ps1" -AllowPort 3389 -On "AA:BB:CC:DD:EE:FF"
 ```
 
 Multiple ports on the same device get individual lines with individual commands for selective approval.
@@ -113,10 +152,12 @@ Multiple ports on the same device get individual lines with individual commands 
 
 ```
 ROGUE: AA:BB:CC:DD:EE:FF  192.168.8.215  [Unknown]
-  -> Approve: & "rogue-device-detector.ps1" -ApproveDevice "AA:BB:CC:DD:EE:FF" -Label "<description>"
+  -> Approve: & "C:\path\to\rogue-device-detector.ps1" -ApproveDevice "AA:BB:CC:DD:EE:FF" -Label "<description>"
 ```
 
 ## `-ListDevices` Output
+
+Terse format — shows port numbers only. Per-port audit details (`allowedBy`, `allowedAt`) are in the audit log.
 
 ```
 Approved devices baseline - C:\path\to\state.json
@@ -151,9 +192,9 @@ Devices   : 12
 | `Invoke-ApproveDevice` | Rename references from `-Approve` to `-ApproveDevice` |
 | `Invoke-RemoveDevice` | Rename references from `-Remove` to `-RemoveDevice` |
 | `Show-Baseline` | Rename to align with `-ListDevices`, show allowed ports |
-| `Get-DeviceRisk` | Accept `allowedPorts` parameter, exclude allowed ports from risk calculation |
-| `Send-RogueAlert` | Update copy-paste command to use `-ApproveDevice` |
+| `Send-RogueAlert` | Update copy-paste command to use `-ApproveDevice`, add port allow commands for risky rogues |
 | `Send-SummaryReport` | Add copy-paste commands for port allowance, update `-ApproveDevice` |
+| Main scan loop | After baseline matching, filter allowed ports from risk data before risk check loop |
 
 ## Edge Cases
 
@@ -161,4 +202,5 @@ Devices   : 12
 - `-AllowPort` for a port already allowed → idempotent, update `allowedAt` timestamp
 - `-BlockPort` for a port not in the list → warning, no-op
 - `-RemoveDevice` for a device with allowed ports → removes everything (device + ports)
-- State file from older version without `allowedPorts` → treated as empty list, no migration needed
+- `-AllowPort` without `-On` → PowerShell parameter set error (enforced by parameter sets)
+- State file from older version (v2) without `allowedPorts` → treated as empty list, no migration needed
