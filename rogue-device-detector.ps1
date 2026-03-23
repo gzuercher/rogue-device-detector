@@ -87,13 +87,15 @@ param(
     [switch]$LearningMode,
 
     [Parameter(Mandatory, ParameterSetName = 'ApproveDevice')]
-    [string]$ApproveDevice = '',
+    [ValidateNotNullOrEmpty()]
+    [string]$ApproveDevice,
 
     [Parameter(ParameterSetName = 'ApproveDevice')]
     [string]$Label = '',
 
     [Parameter(Mandatory, ParameterSetName = 'RemoveDevice')]
-    [string]$RemoveDevice = '',
+    [ValidateNotNullOrEmpty()]
+    [string]$RemoveDevice,
 
     [Parameter(ParameterSetName = 'ListDevices')]
     [switch]$ListDevices,
