@@ -974,7 +974,7 @@ function Send-RogueAlert {
         if ($d.upnpInfo)   { $lines.Add("  UPnP:     $($d.upnpInfo)") }
         $lines.Add('')
         $lines.Add("  -> If AUTHORIZED, run on $($env:COMPUTERNAME):")
-        $lines.Add("     & `"$scriptPath`" -Approve `"$($d.mac)`" -Label `"<device description>`"")
+        $lines.Add("     & `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<device description>`"")
         $lines.Add('  -> If UNAUTHORIZED: isolate/remove from network immediately.')
         $lines -join "`n"
     }) -join "`n`n---`n`n"
@@ -1212,7 +1212,10 @@ function Show-Baseline {
             $vendor     = if ($d.vendor)     { " | Vendor: $($d.vendor)" }          else { '' }
             $osGuess    = if ($d.osGuess)    { " | OS: $($d.osGuess)" }             else { '' }
             $lastSeen   = if ($d.lastSeen)   { " | Last seen: $($d.lastSeen)" }     else { '' }
-            Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$osGuess$label$lastSeen$approvedBy$approvedAt"
+            $allowedPortsStr = if ($d.PSObject.Properties['allowedPorts'] -and @($d.allowedPorts).Count -gt 0) {
+                " | Allowed ports: $((@($d.allowedPorts) | ForEach-Object { $_.port }) -join ', ')"
+            } else { '' }
+            Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$osGuess$label$lastSeen$approvedBy$approvedAt$allowedPortsStr"
         }
     }
 
@@ -1312,7 +1315,7 @@ function Send-SummaryReport {
             if ($d.riskLevel -and $d.riskLevel -ne 'NONE') {
                 $lines.Add("    RISK: [$($d.riskLevel)] $($d.riskReasons -join '; ')")
             }
-            $lines.Add("    -> Approve: & `"$scriptPath`" -Approve `"$($d.mac)`" -Label `"<description>`"")
+            $lines.Add("    -> Approve: & `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<description>`"")
         }
     }
 
@@ -1329,8 +1332,15 @@ function Send-SummaryReport {
     if ($Report.riskDevices.Count -gt 0) {
         $lines.Add('')
         $lines.Add('--- Risk Findings (known devices) ---')
+        $scriptPath = $PSCommandPath
         foreach ($d in $Report.riskDevices) {
             $lines.Add("  [$($d.riskLevel)] $($d.ip) ($($d.hostname)) - $($d.riskReasons -join '; ')")
+            foreach ($reason in $d.riskReasons) {
+                if ($reason -match '\(port (\d+)\)') {
+                    $port = $Matches[1]
+                    $lines.Add("    -> If expected: & `"$scriptPath`" -AllowPort $port -On `"$($d.mac)`"")
+                }
+            }
         }
     }
 
