@@ -39,7 +39,19 @@ pwsh -NoProfile -NonInteractive -Command '
   }
 
   # Quality check
-  $quality = Invoke-ScriptAnalyzer -Path $file -Severity Error,Warning -ExcludeRule PSAvoidUsingWriteHost
+  $repoRoot = & git -C (Split-Path -Parent $file) rev-parse --show-toplevel 2>$null
+  $rulesPath = if ($repoRoot) { Join-Path $repoRoot "rules" } else { $null }
+  $qualityParams = @{
+    Path        = $file
+    Severity    = @("Error", "Warning")
+    ExcludeRule = "PSAvoidUsingWriteHost"
+  }
+  if ($rulesPath -and (Test-Path $rulesPath)) {
+    $qualityParams["CustomRulePath"] = $rulesPath
+    $qualityParams["RecurseCustomRulePath"] = $true
+    $qualityParams["IncludeDefaultRules"] = $true
+  }
+  $quality = Invoke-ScriptAnalyzer @qualityParams
 
   # Security check (always run, regardless of severity)
   $securityRules = @(

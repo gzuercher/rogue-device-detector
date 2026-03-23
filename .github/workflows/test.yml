@@ -23,7 +23,8 @@ jobs:
         shell: pwsh
         run: |
           $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning `
-            -ExcludeRule PSAvoidUsingWriteHost
+            -ExcludeRule PSAvoidUsingWriteHost `
+            -CustomRulePath ./rules/ -RecurseCustomRulePath -IncludeDefaultRules
           if ($results) {
             $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize
             Write-Error "$($results.Count) issue(s) found."
