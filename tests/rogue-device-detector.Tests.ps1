@@ -971,3 +971,45 @@ Describe 'State Schema v3' {
         @($device.allowedPorts) | Should -HaveCount 0
     }
 }
+
+# ── Get-FilteredRisk ─────────────────────────────────────────────────────────
+
+Describe 'Get-FilteredRisk' {
+
+    It 'excludes allowed ports from riskReasons' {
+        $device = [PSCustomObject]@{
+            mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'; hostname = 'server'
+            openPorts = @(3389, 445); riskLevel = 'HIGH'
+            riskReasons = @('Remote Desktop exposed (port 3389)', 'File sharing exposed (ransomware vector) (port 445)')
+        }
+        $allowedPorts = @([PSCustomObject]@{ port = 3389; allowedBy = 'admin'; allowedAt = '2026-03-23T00:00:00Z' })
+
+        $filtered = Get-FilteredRisk -Device $device -AllowedPorts $allowedPorts
+        @($filtered.Reasons) | Should -HaveCount 1
+        $filtered.Reasons[0] | Should -BeLike '*445*'
+    }
+
+    It 'returns NONE risk level when all risky ports are allowed' {
+        $device = [PSCustomObject]@{
+            mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'; hostname = 'server'
+            openPorts = @(3389); riskLevel = 'HIGH'
+            riskReasons = @('Remote Desktop exposed (port 3389)')
+        }
+        $allowedPorts = @([PSCustomObject]@{ port = 3389; allowedBy = 'admin'; allowedAt = '2026-03-23T00:00:00Z' })
+
+        $filtered = Get-FilteredRisk -Device $device -AllowedPorts $allowedPorts
+        $filtered.Level | Should -Be 'NONE'
+        @($filtered.Reasons) | Should -HaveCount 0
+    }
+
+    It 'passes through all risks when no ports are allowed' {
+        $device = [PSCustomObject]@{
+            mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'; hostname = 'server'
+            openPorts = @(3389, 22); riskLevel = 'HIGH'
+            riskReasons = @('Remote Desktop exposed (port 3389)', 'Remote access (SSH) (port 22)')
+        }
+
+        $filtered = Get-FilteredRisk -Device $device -AllowedPorts @()
+        @($filtered.Reasons) | Should -HaveCount 2
+    }
+}

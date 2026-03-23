@@ -685,6 +685,29 @@ function Get-DeviceRisk {
     return [PSCustomObject]@{ Level = $level; Reasons = $reasons.ToArray() }
 }
 
+function Get-FilteredRisk {
+    <#
+    .SYNOPSIS
+        Recalculates risk after removing allowed ports from the device's risk data.
+    .PARAMETER Device       Device object with openPorts, riskLevel, riskReasons.
+    .PARAMETER AllowedPorts Array of allowedPort objects (with .port property).
+    .RETURNS PSCustomObject with Level (string) and Reasons (string array).
+    #>
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$Device,
+        [array]$AllowedPorts = @()
+    )
+
+    if (@($AllowedPorts).Count -eq 0) {
+        return [PSCustomObject]@{ Level = $Device.riskLevel; Reasons = $Device.riskReasons }
+    }
+
+    $allowedPortNumbers = @($AllowedPorts | ForEach-Object { $_.port })
+    $remainingPorts = @($Device.openPorts | Where-Object { $_ -notin $allowedPortNumbers })
+
+    return Get-DeviceRisk -OpenPorts $remainingPorts
+}
+
 function Invoke-DeviceEnrichment {
     <#
     .SYNOPSIS
@@ -1668,9 +1691,20 @@ foreach ($device in $foundDevices) {
     }
 }
 
-# Log risk findings for known devices with HIGH or CRITICAL risk
+# Filter allowed ports and log risk findings for known devices
 $riskDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
 foreach ($device in $foundDevices) {
+    # Look up baseline entry for allowed ports
+    $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
+    $allowedPorts = if ($known -and $known.PSObject.Properties['allowedPorts']) {
+        @($known.allowedPorts)
+    } else { @() }
+
+    # Filter allowed ports from risk
+    $filtered = Get-FilteredRisk -Device $device -AllowedPorts $allowedPorts
+    $device.riskLevel   = $filtered.Level
+    $device.riskReasons = $filtered.Reasons
+
     if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
         $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
         if (-not $isRogue) {
