@@ -1,4 +1,4 @@
-# rules/Measure-UnsafeCountAccess.psm1
+﻿# rules/Measure-UnsafeCountAccess.psm1
 #
 # PSScriptAnalyzer custom rule: detects .Count access on variables not provably
 # backed by an array or typed collection. Under Set-StrictMode -Version Latest,
@@ -6,7 +6,7 @@
 
 # Ensure PSScriptAnalyzer types are available (needed in test contexts)
 if (-not ('Microsoft.Windows.PowerShell.ScriptAnalyzer.Generic.DiagnosticRecord' -as [type])) {
-    try { Import-Module PSScriptAnalyzer -ErrorAction SilentlyContinue } catch { }
+    try { Import-Module PSScriptAnalyzer -ErrorAction SilentlyContinue } catch { $null = $_ }
 }
 
 function Measure-UnsafeCountAccess {
@@ -127,6 +127,8 @@ function Test-VariableSafe {
         Checks if a variable is provably safe for .Count access by examining
         type constraints in parameters and assignments in the enclosing scope.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'VariableName',
+        Justification = 'VariableName is used inside ScriptBlock closures passed to FindAll, which PSScriptAnalyzer cannot trace.')]
     param(
         [string]$VariableName,
         [System.Management.Automation.Language.ScriptBlockAst]$ScopeAst,
