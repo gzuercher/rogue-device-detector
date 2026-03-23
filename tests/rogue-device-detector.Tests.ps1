@@ -858,3 +858,99 @@ Describe 'Enter-ScanLock / Exit-ScanLock' {
         { Exit-ScanLock -LockStream $null -StatePath $statePath } | Should -Not -Throw
     }
 }
+
+# ── Invoke-AllowPort ──────────────────────────────────────────────────────────
+
+Describe 'Invoke-AllowPort' {
+
+    BeforeEach {
+        $script:state = [PSCustomObject]@{
+            schemaVersion = 3
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'
+                    hostname = 'server'; vendor = 'Dell'; label = 'File server'
+                    firstSeen = '2026-01-01T00:00:00Z'; lastSeen = '2026-03-23T00:00:00Z'
+                    approvedBy = 'DOMAIN\admin'; approvedAt = '2026-01-01T00:00:00Z'
+                    allowedPorts = @()
+                }
+            )
+            lastScan = '2026-03-23T00:00:00Z'
+        }
+    }
+
+    It 'adds a single port to allowedPorts' {
+        Invoke-AllowPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 1
+        @($device.allowedPorts)[0].port | Should -Be 3389
+    }
+
+    It 'adds multiple ports at once' {
+        Invoke-AllowPort -Ports @(3389, 22) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 2
+    }
+
+    It 'is idempotent — re-allowing updates timestamp' {
+        Invoke-AllowPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        Invoke-AllowPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T12:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 1
+        @($device.allowedPorts)[0].allowedAt | Should -Be '2026-03-23T12:00:00Z'
+    }
+
+    It 'throws if device not in baseline' {
+        { Invoke-AllowPort -Ports @(3389) -Mac '11:22:33:44:55:66' -State $script:state -Now '2026-03-23T10:00:00Z' } |
+            Should -Throw '*not found in baseline*'
+    }
+
+    It 'records allowedBy with current user' {
+        Invoke-AllowPort -Ports @(22) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts)[0].allowedBy | Should -Not -BeNullOrEmpty
+    }
+}
+
+# ── Invoke-BlockPort ──────────────────────────────────────────────────────────
+
+Describe 'Invoke-BlockPort' {
+
+    BeforeEach {
+        $script:state = [PSCustomObject]@{
+            schemaVersion = 3
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'
+                    hostname = 'server'; vendor = 'Dell'; label = ''
+                    firstSeen = '2026-01-01T00:00:00Z'; lastSeen = '2026-03-23T00:00:00Z'
+                    approvedBy = ''; approvedAt = ''
+                    allowedPorts = @(
+                        [PSCustomObject]@{ port = 3389; allowedBy = 'DOMAIN\admin'; allowedAt = '2026-03-23T00:00:00Z' },
+                        [PSCustomObject]@{ port = 22;   allowedBy = 'DOMAIN\admin'; allowedAt = '2026-03-23T00:00:00Z' }
+                    )
+                }
+            )
+            lastScan = '2026-03-23T00:00:00Z'
+        }
+    }
+
+    It 'removes an allowed port' {
+        Invoke-BlockPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 1
+        @($device.allowedPorts)[0].port | Should -Be 22
+    }
+
+    It 'removes multiple ports at once' {
+        Invoke-BlockPort -Ports @(3389, 22) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 0
+    }
+
+    It 'is a no-op for ports not in the list (no error)' {
+        Invoke-BlockPort -Ports @(80) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 2
+    }
+}

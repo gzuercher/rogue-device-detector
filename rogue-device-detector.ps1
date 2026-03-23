@@ -1071,6 +1071,91 @@ function Invoke-RemoveDevice {
     return $removed
 }
 
+function Invoke-AllowPort {
+    <#
+    .SYNOPSIS
+        Adds port(s) to a device's allowedPorts list in the baseline.
+    .PARAMETER Ports  Port numbers to allow.
+    .PARAMETER Mac    MAC address of the target device.
+    .PARAMETER State  State object loaded from state.json.
+    .PARAMETER Now    ISO timestamp string.
+    #>
+    param(
+        [Parameter(Mandatory)][int[]]$Ports,
+        [Parameter(Mandatory)][string]$Mac,
+        [Parameter(Mandatory)][PSCustomObject]$State,
+        [Parameter(Mandatory)][string]$Now
+    )
+
+    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
+    $mac = $mac.ToUpper()
+
+    $device = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
+    if (-not $device) {
+        throw "Device $mac not found in baseline. Use -ApproveDevice first."
+    }
+
+    if (-not $device.PSObject.Properties['allowedPorts'] -or $null -eq $device.allowedPorts) {
+        $device | Add-Member -NotePropertyName 'allowedPorts' -NotePropertyValue @() -Force
+    }
+
+    foreach ($port in $Ports) {
+        $existing = @($device.allowedPorts) | Where-Object { $_.port -eq $port } | Select-Object -First 1
+        if ($existing) {
+            $existing.allowedAt = $Now
+            $existing.allowedBy = "$env:USERDOMAIN\$env:USERNAME"
+            Write-RddLog "Updated port $port allowance on $mac."
+        } else {
+            $device.allowedPorts = @($device.allowedPorts) + @([PSCustomObject]@{
+                port      = $port
+                allowedBy = "$env:USERDOMAIN\$env:USERNAME"
+                allowedAt = $Now
+            })
+            Write-RddLog "Allowed port $port on $mac."
+        }
+    }
+}
+
+function Invoke-BlockPort {
+    <#
+    .SYNOPSIS
+        Removes port(s) from a device's allowedPorts list in the baseline.
+    .PARAMETER Ports  Port numbers to revoke.
+    .PARAMETER Mac    MAC address of the target device.
+    .PARAMETER State  State object loaded from state.json.
+    #>
+    param(
+        [Parameter(Mandatory)][int[]]$Ports,
+        [Parameter(Mandatory)][string]$Mac,
+        [Parameter(Mandatory)][PSCustomObject]$State
+    )
+
+    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
+    $mac = $mac.ToUpper()
+
+    $device = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
+    if (-not $device) {
+        Write-RddLog "Device $mac not found in baseline." -Level WARN
+        return
+    }
+
+    if (-not $device.PSObject.Properties['allowedPorts'] -or $null -eq $device.allowedPorts) {
+        Write-RddLog "Device $mac has no allowed ports." -Level WARN
+        return
+    }
+
+    $before = @($device.allowedPorts).Count
+    $device.allowedPorts = @($device.allowedPorts | Where-Object { $_.port -notin $Ports })
+    $after = @($device.allowedPorts).Count
+    $removed = $before - $after
+
+    if ($removed -gt 0) {
+        Write-RddLog "Blocked $removed port(s) on ${mac}: $($Ports -join ', ')"
+    } else {
+        Write-RddLog "Port(s) $($Ports -join ', ') not in allowed list for $mac." -Level WARN
+    }
+}
+
 function Show-Baseline {
     <#
     .SYNOPSIS
@@ -1402,6 +1487,25 @@ if ($RemoveDevice) {
         Save-State -State $state -StatePath $cfg.statePath
         Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_REMOVED' -Details "mac=$RemoveDevice removedBy=$env:USERDOMAIN\$env:USERNAME"
     }
+    exit 0
+}
+
+if ($AllowPort) {
+    $state = Get-State -StatePath $cfg.statePath
+    $now   = (Get-Date).ToUniversalTime().ToString('o')
+    Invoke-AllowPort -Ports $AllowPort -Mac $On -State $state -Now $now
+    Save-State -State $state -StatePath $cfg.statePath
+    Write-AuditLog -LogPath $cfg.logPath -EventName 'PORT_ALLOWED' `
+        -Details "mac=$On ports=$($AllowPort -join ',') allowedBy=$env:USERDOMAIN\$env:USERNAME"
+    exit 0
+}
+
+if ($BlockPort) {
+    $state = Get-State -StatePath $cfg.statePath
+    Invoke-BlockPort -Ports $BlockPort -Mac $On -State $state
+    Save-State -State $state -StatePath $cfg.statePath
+    Write-AuditLog -LogPath $cfg.logPath -EventName 'PORT_BLOCKED' `
+        -Details "mac=$On ports=$($BlockPort -join ',') blockedBy=$env:USERDOMAIN\$env:USERNAME"
     exit 0
 }
 
