@@ -117,7 +117,7 @@ $ErrorActionPreference = 'Stop'
 $SCRIPT_VERSION       = '1.3.0'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
-$STATE_SCHEMA_VERSION = 2
+$STATE_SCHEMA_VERSION = 3
 
 $SECURITY_PORTS = @(
     [PSCustomObject]@{ Port = 21;   Label = 'FTP';        Risk = 'HIGH';     Reason = 'Unencrypted file transfer' },
@@ -1036,6 +1036,7 @@ function Invoke-ApproveDevice {
             lastSeen   = $Now
             approvedBy = "$env:USERDOMAIN\$env:USERNAME"
             approvedAt = $Now
+            allowedPorts = @()
         }
         Write-RddLog "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
     }
@@ -1605,6 +1606,7 @@ if ($LearningMode -or -not $stateFileExists) {
                 lastSeen   = $now
                 approvedBy = "$env:USERDOMAIN\$env:USERNAME"
                 approvedAt = $now
+                allowedPorts = @()
             }
         }
     }

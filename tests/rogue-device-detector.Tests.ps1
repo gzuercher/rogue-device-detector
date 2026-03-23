@@ -954,3 +954,20 @@ Describe 'Invoke-BlockPort' {
         @($device.allowedPorts) | Should -HaveCount 2
     }
 }
+
+# ── State Schema v3 ────────────────────────────────────────────────────────────
+
+Describe 'State Schema v3' {
+
+    It 'uses schema version 3' {
+        $STATE_SCHEMA_VERSION | Should -Be 3
+    }
+
+    It 'new devices from Invoke-ApproveDevice include allowedPorts field' {
+        $state = [PSCustomObject]@{ schemaVersion = 3; knownDevices = @(); lastScan = '' }
+        Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:FF' -State $state -Now '2026-03-23T00:00:00Z'
+        $device = $state.knownDevices[0]
+        $device.PSObject.Properties.Name | Should -Contain 'allowedPorts'
+        @($device.allowedPorts) | Should -HaveCount 0
+    }
+}
