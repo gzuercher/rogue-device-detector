@@ -31,6 +31,51 @@ BeforeAll {
     . $script:ScriptPath
 }
 
+# ── Parameter Rename ──────────────────────────────────────────────────────────
+
+Describe 'Parameter Rename' {
+
+    BeforeAll {
+        $script:ScriptCmd = Get-Command $script:ScriptPath
+    }
+
+    It 'has -ApproveDevice parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('ApproveDevice') | Should -Be $true
+    }
+
+    It 'has -RemoveDevice parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('RemoveDevice') | Should -Be $true
+    }
+
+    It 'has -ListDevices parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('ListDevices') | Should -Be $true
+    }
+
+    It 'has -AllowPort parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('AllowPort') | Should -Be $true
+    }
+
+    It 'has -BlockPort parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('BlockPort') | Should -Be $true
+    }
+
+    It 'has -On parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('On') | Should -Be $true
+    }
+
+    It 'does NOT have old -Approve parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('Approve') | Should -Be $false
+    }
+
+    It 'does NOT have old -Remove parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('Remove') | Should -Be $false
+    }
+
+    It 'does NOT have old -List parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('List') | Should -Be $false
+    }
+}
+
 # ── Get-SubnetInfo ─────────────────────────────────────────────────────────────
 
 Describe 'Get-SubnetInfo' {
@@ -811,5 +856,160 @@ Describe 'Enter-ScanLock / Exit-ScanLock' {
     It 'Exit-ScanLock handles $null stream gracefully' {
         $statePath = Join-Path $TestDrive 'lock-null-state.json'
         { Exit-ScanLock -LockStream $null -StatePath $statePath } | Should -Not -Throw
+    }
+}
+
+# ── Invoke-AllowPort ──────────────────────────────────────────────────────────
+
+Describe 'Invoke-AllowPort' {
+
+    BeforeEach {
+        $script:state = [PSCustomObject]@{
+            schemaVersion = 3
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'
+                    hostname = 'server'; vendor = 'Dell'; label = 'File server'
+                    firstSeen = '2026-01-01T00:00:00Z'; lastSeen = '2026-03-23T00:00:00Z'
+                    approvedBy = 'DOMAIN\admin'; approvedAt = '2026-01-01T00:00:00Z'
+                    allowedPorts = @()
+                }
+            )
+            lastScan = '2026-03-23T00:00:00Z'
+        }
+    }
+
+    It 'adds a single port to allowedPorts' {
+        Invoke-AllowPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 1
+        @($device.allowedPorts)[0].port | Should -Be 3389
+    }
+
+    It 'adds multiple ports at once' {
+        Invoke-AllowPort -Ports @(3389, 22) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 2
+    }
+
+    It 'is idempotent — re-allowing updates timestamp' {
+        Invoke-AllowPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        Invoke-AllowPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T12:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 1
+        @($device.allowedPorts)[0].allowedAt | Should -Be '2026-03-23T12:00:00Z'
+    }
+
+    It 'throws if device not in baseline' {
+        { Invoke-AllowPort -Ports @(3389) -Mac '11:22:33:44:55:66' -State $script:state -Now '2026-03-23T10:00:00Z' } |
+            Should -Throw '*not found in baseline*'
+    }
+
+    It 'records allowedBy with current user' {
+        Invoke-AllowPort -Ports @(22) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state -Now '2026-03-23T10:00:00Z'
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts)[0].allowedBy | Should -Not -BeNullOrEmpty
+    }
+}
+
+# ── Invoke-BlockPort ──────────────────────────────────────────────────────────
+
+Describe 'Invoke-BlockPort' {
+
+    BeforeEach {
+        $script:state = [PSCustomObject]@{
+            schemaVersion = 3
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'
+                    hostname = 'server'; vendor = 'Dell'; label = ''
+                    firstSeen = '2026-01-01T00:00:00Z'; lastSeen = '2026-03-23T00:00:00Z'
+                    approvedBy = ''; approvedAt = ''
+                    allowedPorts = @(
+                        [PSCustomObject]@{ port = 3389; allowedBy = 'DOMAIN\admin'; allowedAt = '2026-03-23T00:00:00Z' },
+                        [PSCustomObject]@{ port = 22;   allowedBy = 'DOMAIN\admin'; allowedAt = '2026-03-23T00:00:00Z' }
+                    )
+                }
+            )
+            lastScan = '2026-03-23T00:00:00Z'
+        }
+    }
+
+    It 'removes an allowed port' {
+        Invoke-BlockPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 1
+        @($device.allowedPorts)[0].port | Should -Be 22
+    }
+
+    It 'removes multiple ports at once' {
+        Invoke-BlockPort -Ports @(3389, 22) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 0
+    }
+
+    It 'is a no-op for ports not in the list (no error)' {
+        Invoke-BlockPort -Ports @(80) -Mac 'AA:BB:CC:DD:EE:FF' -State $script:state
+        $device = $script:state.knownDevices[0]
+        @($device.allowedPorts) | Should -HaveCount 2
+    }
+}
+
+# ── State Schema v3 ────────────────────────────────────────────────────────────
+
+Describe 'State Schema v3' {
+
+    It 'uses schema version 3' {
+        $STATE_SCHEMA_VERSION | Should -Be 3
+    }
+
+    It 'new devices from Invoke-ApproveDevice include allowedPorts field' {
+        $state = [PSCustomObject]@{ schemaVersion = 3; knownDevices = @(); lastScan = '' }
+        Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:FF' -State $state -Now '2026-03-23T00:00:00Z'
+        $device = $state.knownDevices[0]
+        $device.PSObject.Properties.Name | Should -Contain 'allowedPorts'
+        @($device.allowedPorts) | Should -HaveCount 0
+    }
+}
+
+# ── Get-FilteredRisk ─────────────────────────────────────────────────────────
+
+Describe 'Get-FilteredRisk' {
+
+    It 'excludes allowed ports from riskReasons' {
+        $device = [PSCustomObject]@{
+            mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'; hostname = 'server'
+            openPorts = @(3389, 445); riskLevel = 'HIGH'
+            riskReasons = @('Remote Desktop exposed (port 3389)', 'File sharing exposed (ransomware vector) (port 445)')
+        }
+        $allowedPorts = @([PSCustomObject]@{ port = 3389; allowedBy = 'admin'; allowedAt = '2026-03-23T00:00:00Z' })
+
+        $filtered = Get-FilteredRisk -Device $device -AllowedPorts $allowedPorts
+        @($filtered.Reasons) | Should -HaveCount 1
+        $filtered.Reasons[0] | Should -BeLike '*445*'
+    }
+
+    It 'returns NONE risk level when all risky ports are allowed' {
+        $device = [PSCustomObject]@{
+            mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'; hostname = 'server'
+            openPorts = @(3389); riskLevel = 'HIGH'
+            riskReasons = @('Remote Desktop exposed (port 3389)')
+        }
+        $allowedPorts = @([PSCustomObject]@{ port = 3389; allowedBy = 'admin'; allowedAt = '2026-03-23T00:00:00Z' })
+
+        $filtered = Get-FilteredRisk -Device $device -AllowedPorts $allowedPorts
+        $filtered.Level | Should -Be 'NONE'
+        @($filtered.Reasons) | Should -HaveCount 0
+    }
+
+    It 'passes through all risks when no ports are allowed' {
+        $device = [PSCustomObject]@{
+            mac = 'AA:BB:CC:DD:EE:FF'; ip = '192.168.1.10'; hostname = 'server'
+            openPorts = @(3389, 22); riskLevel = 'HIGH'
+            riskReasons = @('Remote Desktop exposed (port 3389)', 'Remote access (SSH) (port 22)')
+        }
+
+        $filtered = Get-FilteredRisk -Device $device -AllowedPorts @()
+        @($filtered.Reasons) | Should -HaveCount 2
     }
 }

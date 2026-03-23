@@ -22,22 +22,33 @@
     Merges all currently found devices into the baseline without alerts.
     Use for initial setup or after deliberately adding new devices.
 
-.PARAMETER Approve
+.PARAMETER ApproveDevice
     MAC address to approve and add to the baseline (e.g. "AA:BB:CC:DD:EE:FF").
     Optionally combine with -Label to store a human-readable device name.
     Use this to approve a specific device shown in an alert without a full scan.
 
 .PARAMETER Label
     Human-readable name for the device being approved (e.g. "John's laptop").
-    Only used together with -Approve.
+    Only used together with -ApproveDevice.
 
-.PARAMETER Remove
+.PARAMETER RemoveDevice
     MAC address to remove from the baseline (e.g. "AA:BB:CC:DD:EE:FF").
     Use this to un-approve a device that was added by mistake or left the network.
 
-.PARAMETER List
+.PARAMETER ListDevices
     Displays all approved devices in the baseline and exits.
     No scan is performed.
+
+.PARAMETER AllowPort
+    One or more port numbers to add to the allowed-ports list for a device.
+    Must be used together with -On to specify the target MAC address.
+
+.PARAMETER BlockPort
+    One or more port numbers to remove from the allowed-ports list for a device.
+    Must be used together with -On to specify the target MAC address.
+
+.PARAMETER On
+    MAC address of the device to modify when using -AllowPort or -BlockPort.
 
 .EXAMPLE
     # First-time setup - establish baseline
@@ -50,23 +61,54 @@
     .\rogue-device-detector.ps1 -Subnet "10.0.1.0/24"
 
     # Approve a specific device from an alert (copy-paste the command from the email)
-    .\rogue-device-detector.ps1 -Approve "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
+    .\rogue-device-detector.ps1 -ApproveDevice "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
 
     # Remove a device that left the network
-    .\rogue-device-detector.ps1 -Remove "AA:BB:CC:DD:EE:FF"
+    .\rogue-device-detector.ps1 -RemoveDevice "AA:BB:CC:DD:EE:FF"
 
     # Show all approved devices
-    .\rogue-device-detector.ps1 -List
+    .\rogue-device-detector.ps1 -ListDevices
+
+    # Allow ports 80 and 443 on a device
+    .\rogue-device-detector.ps1 -AllowPort 80,443 -On "AA:BB:CC:DD:EE:FF"
+
+    # Block port 23 on a device
+    .\rogue-device-detector.ps1 -BlockPort 23 -On "AA:BB:CC:DD:EE:FF"
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
+    [Parameter(ParameterSetName = 'Scan')]
     [string]$Config = '',
+
+    [Parameter(ParameterSetName = 'Scan')]
     [string]$Subnet = '',
+
+    [Parameter(ParameterSetName = 'Scan')]
     [switch]$LearningMode,
-    [string]$Approve = '',
-    [string]$Label   = '',
-    [string]$Remove  = '',
-    [switch]$List
+
+    [Parameter(Mandatory, ParameterSetName = 'ApproveDevice')]
+    [ValidateNotNullOrEmpty()]
+    [string]$ApproveDevice,
+
+    [Parameter(ParameterSetName = 'ApproveDevice')]
+    [string]$Label = '',
+
+    [Parameter(Mandatory, ParameterSetName = 'RemoveDevice')]
+    [ValidateNotNullOrEmpty()]
+    [string]$RemoveDevice,
+
+    [Parameter(ParameterSetName = 'ListDevices')]
+    [switch]$ListDevices,
+
+    [Parameter(Mandatory, ParameterSetName = 'AllowPort')]
+    [int[]]$AllowPort,
+
+    [Parameter(Mandatory, ParameterSetName = 'BlockPort')]
+    [int[]]$BlockPort,
+
+    [Parameter(Mandatory, ParameterSetName = 'AllowPort')]
+    [Parameter(Mandatory, ParameterSetName = 'BlockPort')]
+    [string]$On
 )
 
 Set-StrictMode -Version Latest
@@ -77,7 +119,7 @@ $ErrorActionPreference = 'Stop'
 $SCRIPT_VERSION       = '1.3.0'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
-$STATE_SCHEMA_VERSION = 2
+$STATE_SCHEMA_VERSION = 3
 
 $SECURITY_PORTS = @(
     [PSCustomObject]@{ Port = 21;   Label = 'FTP';        Risk = 'HIGH';     Reason = 'Unencrypted file transfer' },
@@ -645,6 +687,29 @@ function Get-DeviceRisk {
     return [PSCustomObject]@{ Level = $level; Reasons = $reasons.ToArray() }
 }
 
+function Get-FilteredRisk {
+    <#
+    .SYNOPSIS
+        Recalculates risk after removing allowed ports from the device's risk data.
+    .PARAMETER Device       Device object with openPorts, riskLevel, riskReasons.
+    .PARAMETER AllowedPorts Array of allowedPort objects (with .port property).
+    .RETURNS PSCustomObject with Level (string) and Reasons (string array).
+    #>
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$Device,
+        [array]$AllowedPorts = @()
+    )
+
+    if (@($AllowedPorts).Count -eq 0) {
+        return [PSCustomObject]@{ Level = $Device.riskLevel; Reasons = $Device.riskReasons }
+    }
+
+    $allowedPortNumbers = @($AllowedPorts | ForEach-Object { $_.port })
+    $remainingPorts = @($Device.openPorts | Where-Object { $_ -notin $allowedPortNumbers })
+
+    return Get-DeviceRisk -OpenPorts $remainingPorts
+}
+
 function Invoke-DeviceEnrichment {
     <#
     .SYNOPSIS
@@ -665,7 +730,7 @@ function Invoke-DeviceEnrichment {
                        -Status "$i/$($Devices.Count) - $($d.ip)" `
                        -PercentComplete ([int]($i / $Devices.Count * 100))
 
-        $d.openPorts   = Invoke-PortScan -IP $d.ip
+        $d.openPorts   = @(Invoke-PortScan -IP $d.ip)
         $d.httpBanner  = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
         $d.upnpInfo    = if ($upnpMap.ContainsKey($d.ip)) { $upnpMap[$d.ip] } else { '' }
         $risk          = Get-DeviceRisk  -OpenPorts $d.openPorts
@@ -911,7 +976,7 @@ function Send-RogueAlert {
         if ($d.upnpInfo)   { $lines.Add("  UPnP:     $($d.upnpInfo)") }
         $lines.Add('')
         $lines.Add("  -> If AUTHORIZED, run on $($env:COMPUTERNAME):")
-        $lines.Add("     & `"$scriptPath`" -Approve `"$($d.mac)`" -Label `"<device description>`"")
+        $lines.Add("     & `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<device description>`"")
         $lines.Add('  -> If UNAUTHORIZED: isolate/remove from network immediately.')
         $lines -join "`n"
     }) -join "`n`n---`n`n"
@@ -996,6 +1061,7 @@ function Invoke-ApproveDevice {
             lastSeen   = $Now
             approvedBy = "$env:USERDOMAIN\$env:USERNAME"
             approvedAt = $Now
+            allowedPorts = @()
         }
         Write-RddLog "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
     }
@@ -1031,6 +1097,91 @@ function Invoke-RemoveDevice {
     return $removed
 }
 
+function Invoke-AllowPort {
+    <#
+    .SYNOPSIS
+        Adds port(s) to a device's allowedPorts list in the baseline.
+    .PARAMETER Ports  Port numbers to allow.
+    .PARAMETER Mac    MAC address of the target device.
+    .PARAMETER State  State object loaded from state.json.
+    .PARAMETER Now    ISO timestamp string.
+    #>
+    param(
+        [Parameter(Mandatory)][int[]]$Ports,
+        [Parameter(Mandatory)][string]$Mac,
+        [Parameter(Mandatory)][PSCustomObject]$State,
+        [Parameter(Mandatory)][string]$Now
+    )
+
+    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
+    $mac = $mac.ToUpper()
+
+    $device = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
+    if (-not $device) {
+        throw "Device $mac not found in baseline. Use -ApproveDevice first."
+    }
+
+    if (-not $device.PSObject.Properties['allowedPorts'] -or $null -eq $device.allowedPorts) {
+        $device | Add-Member -NotePropertyName 'allowedPorts' -NotePropertyValue @() -Force
+    }
+
+    foreach ($port in $Ports) {
+        $existing = @($device.allowedPorts) | Where-Object { $_.port -eq $port } | Select-Object -First 1
+        if ($existing) {
+            $existing.allowedAt = $Now
+            $existing.allowedBy = "$env:USERDOMAIN\$env:USERNAME"
+            Write-RddLog "Updated port $port allowance on $mac."
+        } else {
+            $device.allowedPorts = @($device.allowedPorts) + @([PSCustomObject]@{
+                port      = $port
+                allowedBy = "$env:USERDOMAIN\$env:USERNAME"
+                allowedAt = $Now
+            })
+            Write-RddLog "Allowed port $port on $mac."
+        }
+    }
+}
+
+function Invoke-BlockPort {
+    <#
+    .SYNOPSIS
+        Removes port(s) from a device's allowedPorts list in the baseline.
+    .PARAMETER Ports  Port numbers to revoke.
+    .PARAMETER Mac    MAC address of the target device.
+    .PARAMETER State  State object loaded from state.json.
+    #>
+    param(
+        [Parameter(Mandatory)][int[]]$Ports,
+        [Parameter(Mandatory)][string]$Mac,
+        [Parameter(Mandatory)][PSCustomObject]$State
+    )
+
+    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
+    $mac = $mac.ToUpper()
+
+    $device = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
+    if (-not $device) {
+        Write-RddLog "Device $mac not found in baseline." -Level WARN
+        return
+    }
+
+    if (-not $device.PSObject.Properties['allowedPorts'] -or $null -eq $device.allowedPorts) {
+        Write-RddLog "Device $mac has no allowed ports." -Level WARN
+        return
+    }
+
+    $before = @($device.allowedPorts).Count
+    $device.allowedPorts = @($device.allowedPorts | Where-Object { $_.port -notin $Ports })
+    $after = @($device.allowedPorts).Count
+    $removed = $before - $after
+
+    if ($removed -gt 0) {
+        Write-RddLog "Blocked $removed port(s) on ${mac}: $($Ports -join ', ')"
+    } else {
+        Write-RddLog "Port(s) $($Ports -join ', ') not in allowed list for $mac." -Level WARN
+    }
+}
+
 function Show-Baseline {
     <#
     .SYNOPSIS
@@ -1063,7 +1214,10 @@ function Show-Baseline {
             $vendor     = if ($d.vendor)     { " | Vendor: $($d.vendor)" }          else { '' }
             $osGuess    = if ($d.osGuess)    { " | OS: $($d.osGuess)" }             else { '' }
             $lastSeen   = if ($d.lastSeen)   { " | Last seen: $($d.lastSeen)" }     else { '' }
-            Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$osGuess$label$lastSeen$approvedBy$approvedAt"
+            $allowedPortsStr = if ($d.PSObject.Properties['allowedPorts'] -and @($d.allowedPorts).Count -gt 0) {
+                " | Allowed ports: $((@($d.allowedPorts) | ForEach-Object { $_.port }) -join ', ')"
+            } else { '' }
+            Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$osGuess$label$lastSeen$approvedBy$approvedAt$allowedPortsStr"
         }
     }
 
@@ -1163,7 +1317,7 @@ function Send-SummaryReport {
             if ($d.riskLevel -and $d.riskLevel -ne 'NONE') {
                 $lines.Add("    RISK: [$($d.riskLevel)] $($d.riskReasons -join '; ')")
             }
-            $lines.Add("    -> Approve: & `"$scriptPath`" -Approve `"$($d.mac)`" -Label `"<description>`"")
+            $lines.Add("    -> Approve: & `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<description>`"")
         }
     }
 
@@ -1180,8 +1334,15 @@ function Send-SummaryReport {
     if ($Report.riskDevices.Count -gt 0) {
         $lines.Add('')
         $lines.Add('--- Risk Findings (known devices) ---')
+        $scriptPath = $PSCommandPath
         foreach ($d in $Report.riskDevices) {
             $lines.Add("  [$($d.riskLevel)] $($d.ip) ($($d.hostname)) - $($d.riskReasons -join '; ')")
+            foreach ($reason in $d.riskReasons) {
+                if ($reason -match '\(port (\d+)\)') {
+                    $port = $Matches[1]
+                    $lines.Add("    -> If expected: & `"$scriptPath`" -AllowPort $port -On `"$($d.mac)`"")
+                }
+            }
         }
     }
 
@@ -1339,29 +1500,48 @@ if ($pathErrors.Count -gt 0) {
 
 # ── Management commands (no scan required) ─────────────────────────────────────
 
-if ($List) {
+if ($ListDevices) {
     $state = Get-State -StatePath $cfg.statePath
     Show-Baseline -State $state -StatePath $cfg.statePath
     exit 0
 }
 
-if ($Approve) {
+if ($ApproveDevice) {
     $state = Get-State -StatePath $cfg.statePath
     $now   = (Get-Date).ToUniversalTime().ToString('o')
-    Invoke-ApproveDevice -Mac $Approve -Label $Label -State $state -Now $now
+    Invoke-ApproveDevice -Mac $ApproveDevice -Label $Label -State $state -Now $now
     Save-State -State $state -StatePath $cfg.statePath
     Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_APPROVED' `
-        -Details "mac=$Approve label=$Label approvedBy=$env:USERDOMAIN\$env:USERNAME"
+        -Details "mac=$ApproveDevice label=$Label approvedBy=$env:USERDOMAIN\$env:USERNAME"
     exit 0
 }
 
-if ($Remove) {
+if ($RemoveDevice) {
     $state   = Get-State -StatePath $cfg.statePath
-    $removed = Invoke-RemoveDevice -Mac $Remove -State $state
+    $removed = Invoke-RemoveDevice -Mac $RemoveDevice -State $state
     if ($removed) {
         Save-State -State $state -StatePath $cfg.statePath
-        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_REMOVED' -Details "mac=$Remove removedBy=$env:USERDOMAIN\$env:USERNAME"
+        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_REMOVED' -Details "mac=$RemoveDevice removedBy=$env:USERDOMAIN\$env:USERNAME"
     }
+    exit 0
+}
+
+if ($AllowPort) {
+    $state = Get-State -StatePath $cfg.statePath
+    $now   = (Get-Date).ToUniversalTime().ToString('o')
+    Invoke-AllowPort -Ports $AllowPort -Mac $On -State $state -Now $now
+    Save-State -State $state -StatePath $cfg.statePath
+    Write-AuditLog -LogPath $cfg.logPath -EventName 'PORT_ALLOWED' `
+        -Details "mac=$On ports=$($AllowPort -join ',') allowedBy=$env:USERDOMAIN\$env:USERNAME"
+    exit 0
+}
+
+if ($BlockPort) {
+    $state = Get-State -StatePath $cfg.statePath
+    Invoke-BlockPort -Ports $BlockPort -Mac $On -State $state
+    Save-State -State $state -StatePath $cfg.statePath
+    Write-AuditLog -LogPath $cfg.logPath -EventName 'PORT_BLOCKED' `
+        -Details "mac=$On ports=$($BlockPort -join ',') blockedBy=$env:USERDOMAIN\$env:USERNAME"
     exit 0
 }
 
@@ -1384,7 +1564,7 @@ $ouiDb = Get-OuiDatabase -CachePath $cfg.ouiPath
 
 # Populate ARP cache via ping sweep (returns TTL map for OS fingerprinting)
 $ttlMap = Invoke-PingSweep -SubnetInfo $subnetInfo
-$arpEntries = Get-ArpEntry -SubnetInfo $subnetInfo
+$arpEntries = @(Get-ArpEntry -SubnetInfo $subnetInfo)
 Write-RddLog "$($arpEntries.Count) device(s) found in ARP table."
 
 if ($arpEntries.Count -eq 0) {
@@ -1394,7 +1574,7 @@ if ($arpEntries.Count -eq 0) {
 }
 
 # Build device list, resolve hostnames concurrently, then look up vendors
-$foundDevices = $arpEntries | ForEach-Object {
+$foundDevices = @($arpEntries | ForEach-Object {
     $osGuess = if ($ttlMap.ContainsKey($_.IP)) { Get-OsGuess -Ttl $ttlMap[$_.IP] } else { '' }
     [PSCustomObject]@{
         mac         = $_.MAC
@@ -1408,7 +1588,7 @@ $foundDevices = $arpEntries | ForEach-Object {
         riskLevel   = 'NONE'
         riskReasons = @()
     }
-}
+})
 
 Resolve-Hostname -Devices $foundDevices
 
@@ -1461,6 +1641,7 @@ if ($LearningMode -or -not $stateFileExists) {
                 lastSeen   = $now
                 approvedBy = "$env:USERDOMAIN\$env:USERNAME"
                 approvedAt = $now
+                allowedPorts = @()
             }
         }
     }
@@ -1522,9 +1703,20 @@ foreach ($device in $foundDevices) {
     }
 }
 
-# Log risk findings for known devices with HIGH or CRITICAL risk
+# Filter allowed ports and log risk findings for known devices
 $riskDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
 foreach ($device in $foundDevices) {
+    # Look up baseline entry for allowed ports
+    $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
+    $allowedPorts = if ($known -and $known.PSObject.Properties['allowedPorts']) {
+        @($known.allowedPorts)
+    } else { @() }
+
+    # Filter allowed ports from risk
+    $filtered = Get-FilteredRisk -Device $device -AllowedPorts $allowedPorts
+    $device.riskLevel   = $filtered.Level
+    $device.riskReasons = $filtered.Reasons
+
     if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
         $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
         if (-not $isRogue) {
@@ -1537,8 +1729,8 @@ foreach ($device in $foundDevices) {
 }
 
 # Detect devices that have not been seen for too long
-$absentDevices = Get-AbsentDevices -KnownDevices @($state.knownDevices) `
-    -AbsentDays $cfg.absentDays -Now $now
+$absentDevices = @(Get-AbsentDevices -KnownDevices @($state.knownDevices) `
+    -AbsentDays $cfg.absentDays -Now $now)
 if ($absentDevices.Count -gt 0) {
     Write-RddLog "$($absentDevices.Count) device(s) not seen for $($cfg.absentDays)+ days." -Level WARN
     foreach ($d in $absentDevices) {
