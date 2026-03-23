@@ -112,6 +112,15 @@ function Get-EnclosingScope {
     return $RootAst
 }
 
+$script:safeTypePatterns = @(
+    '^\[?array\]?$',
+    '\[\]$',                                          # any typed array like [PSCustomObject[]]
+    'System\.Collections\.Generic\.List\[',           # List<T>
+    'System\.Collections\.Generic\.Dictionary\[',     # Dictionary<K,V>
+    '^\[?hashtable\]?$',
+    'System\.Collections\.ArrayList'
+)
+
 function Test-VariableSafe {
     <#
     .SYNOPSIS
@@ -124,15 +133,6 @@ function Test-VariableSafe {
         [System.Management.Automation.Language.Ast]$AccessAst
     )
 
-    $safeTypePatterns = @(
-        '^\[?array\]?$',
-        '\[\]$',                                          # any typed array like [PSCustomObject[]]
-        'System\.Collections\.Generic\.List\[',           # List<T>
-        'System\.Collections\.Generic\.Dictionary\[',     # Dictionary<K,V>
-        '^\[?hashtable\]?$',
-        'System\.Collections\.ArrayList'
-    )
-
     # Check if variable is bound by a foreach statement (loop variable iterating over a collection)
     # We cannot trace the element type, so we treat foreach variables as safe to avoid false positives
     # on property accesses like $g.Count where Count is an object property, not array length.
@@ -143,7 +143,8 @@ function Test-VariableSafe {
     }, $true)
 
     foreach ($fe in $foreachBindings) {
-        if ($fe.Extent.StartOffset -lt $AccessAst.Extent.StartOffset) {
+        if ($fe.Extent.StartOffset -lt $AccessAst.Extent.StartOffset -and
+            $AccessAst.Extent.StartOffset -lt $fe.Extent.EndOffset) {
             return $true
         }
     }
@@ -159,7 +160,7 @@ function Test-VariableSafe {
         foreach ($attr in $param.Attributes) {
             if ($attr -is [System.Management.Automation.Language.TypeConstraintAst]) {
                 $typeName = $attr.TypeName.FullName
-                foreach ($pattern in $safeTypePatterns) {
+                foreach ($pattern in $script:safeTypePatterns) {
                     if ($typeName -match $pattern) { return $true }
                 }
             }
@@ -174,9 +175,17 @@ function Test-VariableSafe {
         $ast.Left.VariablePath.UserPath -eq $VariableName
     }, $true)
 
+    # Track the safety of the last assignment before the .Count access
+    $lastAssignmentSafe = $null
+
     foreach ($assignment in $assignments) {
         # Only consider assignments before the .Count access
         if ($assignment.Extent.StartOffset -gt $AccessAst.Extent.StartOffset) {
+            continue
+        }
+
+        # Skip compound assignments like += which preserve the collection type
+        if ($assignment.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
             continue
         }
 
@@ -188,20 +197,23 @@ function Test-VariableSafe {
             $innerRhs = $rhs.Expression
         }
 
+        # Assume unsafe unless proven otherwise
+        $thisSafe = $false
+
         # $var = @(...)
         if ($innerRhs -is [System.Management.Automation.Language.ArrayExpressionAst]) {
-            return $true
+            $thisSafe = $true
         }
 
         # $var = @{}
         if ($innerRhs -is [System.Management.Automation.Language.HashtableAst]) {
-            return $true
+            $thisSafe = $true
         }
 
         # $var = $x -split '...' — -split always returns an array
         if ($innerRhs -is [System.Management.Automation.Language.BinaryExpressionAst] -and
             $innerRhs.Operator -eq [System.Management.Automation.Language.TokenKind]::Isplit) {
-            return $true
+            $thisSafe = $true
         }
 
         # $var = [SafeType]::new()
@@ -210,10 +222,16 @@ function Test-VariableSafe {
             $innerRhs.Member.Value -eq 'new' -and
             $innerRhs.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
             $typeName = $innerRhs.Expression.TypeName.FullName
-            foreach ($pattern in $safeTypePatterns) {
-                if ($typeName -match $pattern) { return $true }
+            foreach ($pattern in $script:safeTypePatterns) {
+                if ($typeName -match $pattern) { $thisSafe = $true; break }
             }
         }
+
+        $lastAssignmentSafe = $thisSafe
+    }
+
+    if ($null -ne $lastAssignmentSafe) {
+        return $lastAssignmentSafe
     }
 
     return $false
