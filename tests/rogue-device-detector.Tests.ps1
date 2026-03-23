@@ -31,6 +31,51 @@ BeforeAll {
     . $script:ScriptPath
 }
 
+# ── Parameter Rename ──────────────────────────────────────────────────────────
+
+Describe 'Parameter Rename' {
+
+    BeforeAll {
+        $script:ScriptCmd = Get-Command $script:ScriptPath
+    }
+
+    It 'has -ApproveDevice parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('ApproveDevice') | Should -Be $true
+    }
+
+    It 'has -RemoveDevice parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('RemoveDevice') | Should -Be $true
+    }
+
+    It 'has -ListDevices parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('ListDevices') | Should -Be $true
+    }
+
+    It 'has -AllowPort parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('AllowPort') | Should -Be $true
+    }
+
+    It 'has -BlockPort parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('BlockPort') | Should -Be $true
+    }
+
+    It 'has -On parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('On') | Should -Be $true
+    }
+
+    It 'does NOT have old -Approve parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('Approve') | Should -Be $false
+    }
+
+    It 'does NOT have old -Remove parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('Remove') | Should -Be $false
+    }
+
+    It 'does NOT have old -List parameter' {
+        $script:ScriptCmd.Parameters.ContainsKey('List') | Should -Be $false
+    }
+}
+
 # ── Get-SubnetInfo ─────────────────────────────────────────────────────────────
 
 Describe 'Get-SubnetInfo' {

@@ -22,22 +22,33 @@
     Merges all currently found devices into the baseline without alerts.
     Use for initial setup or after deliberately adding new devices.
 
-.PARAMETER Approve
+.PARAMETER ApproveDevice
     MAC address to approve and add to the baseline (e.g. "AA:BB:CC:DD:EE:FF").
     Optionally combine with -Label to store a human-readable device name.
     Use this to approve a specific device shown in an alert without a full scan.
 
 .PARAMETER Label
     Human-readable name for the device being approved (e.g. "John's laptop").
-    Only used together with -Approve.
+    Only used together with -ApproveDevice.
 
-.PARAMETER Remove
+.PARAMETER RemoveDevice
     MAC address to remove from the baseline (e.g. "AA:BB:CC:DD:EE:FF").
     Use this to un-approve a device that was added by mistake or left the network.
 
-.PARAMETER List
+.PARAMETER ListDevices
     Displays all approved devices in the baseline and exits.
     No scan is performed.
+
+.PARAMETER AllowPort
+    One or more port numbers to add to the allowed-ports list for a device.
+    Must be used together with -On to specify the target MAC address.
+
+.PARAMETER BlockPort
+    One or more port numbers to remove from the allowed-ports list for a device.
+    Must be used together with -On to specify the target MAC address.
+
+.PARAMETER On
+    MAC address of the device to modify when using -AllowPort or -BlockPort.
 
 .EXAMPLE
     # First-time setup - establish baseline
@@ -50,23 +61,52 @@
     .\rogue-device-detector.ps1 -Subnet "10.0.1.0/24"
 
     # Approve a specific device from an alert (copy-paste the command from the email)
-    .\rogue-device-detector.ps1 -Approve "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
+    .\rogue-device-detector.ps1 -ApproveDevice "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
 
     # Remove a device that left the network
-    .\rogue-device-detector.ps1 -Remove "AA:BB:CC:DD:EE:FF"
+    .\rogue-device-detector.ps1 -RemoveDevice "AA:BB:CC:DD:EE:FF"
 
     # Show all approved devices
-    .\rogue-device-detector.ps1 -List
+    .\rogue-device-detector.ps1 -ListDevices
+
+    # Allow ports 80 and 443 on a device
+    .\rogue-device-detector.ps1 -AllowPort 80,443 -On "AA:BB:CC:DD:EE:FF"
+
+    # Block port 23 on a device
+    .\rogue-device-detector.ps1 -BlockPort 23 -On "AA:BB:CC:DD:EE:FF"
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
+    [Parameter(ParameterSetName = 'Scan')]
     [string]$Config = '',
+
+    [Parameter(ParameterSetName = 'Scan')]
     [string]$Subnet = '',
+
+    [Parameter(ParameterSetName = 'Scan')]
     [switch]$LearningMode,
-    [string]$Approve = '',
-    [string]$Label   = '',
-    [string]$Remove  = '',
-    [switch]$List
+
+    [Parameter(Mandatory, ParameterSetName = 'ApproveDevice')]
+    [string]$ApproveDevice = '',
+
+    [Parameter(ParameterSetName = 'ApproveDevice')]
+    [string]$Label = '',
+
+    [Parameter(Mandatory, ParameterSetName = 'RemoveDevice')]
+    [string]$RemoveDevice = '',
+
+    [Parameter(ParameterSetName = 'ListDevices')]
+    [switch]$ListDevices,
+
+    [Parameter(Mandatory, ParameterSetName = 'AllowPort')]
+    [int[]]$AllowPort,
+
+    [Parameter(Mandatory, ParameterSetName = 'BlockPort')]
+    [int[]]$BlockPort,
+
+    [Parameter(Mandatory, ParameterSetName = 'AllowPort')]
+    [Parameter(Mandatory, ParameterSetName = 'BlockPort')]
+    [string]$On
 )
 
 Set-StrictMode -Version Latest
@@ -665,7 +705,7 @@ function Invoke-DeviceEnrichment {
                        -Status "$i/$($Devices.Count) - $($d.ip)" `
                        -PercentComplete ([int]($i / $Devices.Count * 100))
 
-        $d.openPorts   = Invoke-PortScan -IP $d.ip
+        $d.openPorts   = @(Invoke-PortScan -IP $d.ip)
         $d.httpBanner  = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
         $d.upnpInfo    = if ($upnpMap.ContainsKey($d.ip)) { $upnpMap[$d.ip] } else { '' }
         $risk          = Get-DeviceRisk  -OpenPorts $d.openPorts
@@ -1339,28 +1379,28 @@ if ($pathErrors.Count -gt 0) {
 
 # ── Management commands (no scan required) ─────────────────────────────────────
 
-if ($List) {
+if ($ListDevices) {
     $state = Get-State -StatePath $cfg.statePath
     Show-Baseline -State $state -StatePath $cfg.statePath
     exit 0
 }
 
-if ($Approve) {
+if ($ApproveDevice) {
     $state = Get-State -StatePath $cfg.statePath
     $now   = (Get-Date).ToUniversalTime().ToString('o')
-    Invoke-ApproveDevice -Mac $Approve -Label $Label -State $state -Now $now
+    Invoke-ApproveDevice -Mac $ApproveDevice -Label $Label -State $state -Now $now
     Save-State -State $state -StatePath $cfg.statePath
     Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_APPROVED' `
-        -Details "mac=$Approve label=$Label approvedBy=$env:USERDOMAIN\$env:USERNAME"
+        -Details "mac=$ApproveDevice label=$Label approvedBy=$env:USERDOMAIN\$env:USERNAME"
     exit 0
 }
 
-if ($Remove) {
+if ($RemoveDevice) {
     $state   = Get-State -StatePath $cfg.statePath
-    $removed = Invoke-RemoveDevice -Mac $Remove -State $state
+    $removed = Invoke-RemoveDevice -Mac $RemoveDevice -State $state
     if ($removed) {
         Save-State -State $state -StatePath $cfg.statePath
-        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_REMOVED' -Details "mac=$Remove removedBy=$env:USERDOMAIN\$env:USERNAME"
+        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_REMOVED' -Details "mac=$RemoveDevice removedBy=$env:USERDOMAIN\$env:USERNAME"
     }
     exit 0
 }
@@ -1384,7 +1424,7 @@ $ouiDb = Get-OuiDatabase -CachePath $cfg.ouiPath
 
 # Populate ARP cache via ping sweep (returns TTL map for OS fingerprinting)
 $ttlMap = Invoke-PingSweep -SubnetInfo $subnetInfo
-$arpEntries = Get-ArpEntry -SubnetInfo $subnetInfo
+$arpEntries = @(Get-ArpEntry -SubnetInfo $subnetInfo)
 Write-RddLog "$($arpEntries.Count) device(s) found in ARP table."
 
 if ($arpEntries.Count -eq 0) {
@@ -1394,7 +1434,7 @@ if ($arpEntries.Count -eq 0) {
 }
 
 # Build device list, resolve hostnames concurrently, then look up vendors
-$foundDevices = $arpEntries | ForEach-Object {
+$foundDevices = @($arpEntries | ForEach-Object {
     $osGuess = if ($ttlMap.ContainsKey($_.IP)) { Get-OsGuess -Ttl $ttlMap[$_.IP] } else { '' }
     [PSCustomObject]@{
         mac         = $_.MAC
@@ -1408,7 +1448,7 @@ $foundDevices = $arpEntries | ForEach-Object {
         riskLevel   = 'NONE'
         riskReasons = @()
     }
-}
+})
 
 Resolve-Hostname -Devices $foundDevices
 
@@ -1537,8 +1577,8 @@ foreach ($device in $foundDevices) {
 }
 
 # Detect devices that have not been seen for too long
-$absentDevices = Get-AbsentDevices -KnownDevices @($state.knownDevices) `
-    -AbsentDays $cfg.absentDays -Now $now
+$absentDevices = @(Get-AbsentDevices -KnownDevices @($state.knownDevices) `
+    -AbsentDays $cfg.absentDays -Now $now)
 if ($absentDevices.Count -gt 0) {
     Write-RddLog "$($absentDevices.Count) device(s) not seen for $($cfg.absentDays)+ days." -Level WARN
     foreach ($d in $absentDevices) {
