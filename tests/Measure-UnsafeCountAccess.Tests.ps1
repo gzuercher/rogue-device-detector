@@ -1,3 +1,5 @@
+#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
+
 BeforeAll {
     Import-Module "$PSScriptRoot/../rules/Measure-UnsafeCountAccess.psm1" -Force
 }
@@ -126,6 +128,7 @@ function Test-Inner {
         It 'includes variable name and fix suggestion' {
             $code = '$items = Get-Items; $items.Count'
             $results = Invoke-Rule $code
+            $results | Should -HaveCount 1
             $results[0].Message | Should -BeLike '*items*'
             $results[0].Message | Should -BeLike '*@(*'
         }
