@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create releases and upload assets
+
+jobs:
+  release:
+    runs-on: windows-latest   # required for Get-FileHash and PowerShell signing toolchain
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from script
+        id: version
+        shell: pwsh
+        run: |
+          $content = Get-Content rogue-device-detector.ps1 -Raw
+          if ($content -notmatch "\`$SCRIPT_VERSION\s*=\s*'([^']+)'") {
+            throw "Cannot find `$SCRIPT_VERSION in rogue-device-detector.ps1"
+          }
+          $version = $Matches[1]
+          $tag = "v$version"
+          Write-Host "Version: $version  Tag: $tag"
+
+          # Validate that the pushed tag matches the version in the script
+          $pushedTag = "${{ github.ref_name }}"
+          if ($pushedTag -ne $tag) {
+            throw "Tag mismatch: pushed '$pushedTag' but script declares '$tag'. Update `$SCRIPT_VERSION before tagging."
+          }
+
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "tag=$tag"         >> $env:GITHUB_OUTPUT
+
+      - name: Compute SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash rogue-device-detector.ps1 -Algorithm SHA256).Hash.ToLower()
+          Write-Host "SHA-256: $hash"
+          # Write hash file (plain hex string, no filename suffix — updater reads first token)
+          Set-Content -Path 'rogue-device-detector.ps1.sha256' -Value $hash -NoNewline -Encoding ASCII
+          echo "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag     = "${{ steps.version.outputs.tag }}"
+          $version = "${{ steps.version.outputs.version }}"
+          $hash    = "${{ steps.hash.outputs.sha256 }}"
+
+          $installCmd = '.\Update-RogueDeviceDetector.ps1 -ScriptPath "C:\Scripts\rdd\rogue-device-detector.ps1"'
+          $notes = "## Rogue Device Detector $tag`n`n" +
+                   "### Installation / Update`n" +
+                   "Run ``Update-RogueDeviceDetector.ps1`` via NinjaOne Script Library, or manually:`n" +
+                   "``````powershell`n$installCmd`n```````n`n" +
+                   "### SHA-256`n``````$hash  rogue-device-detector.ps1``````"
+
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -Path $notesFile -Value $notes -Encoding UTF8
+
+          gh release create $tag `
+            --title "Rogue Device Detector $tag" `
+            --notes-file $notesFile `
+            rogue-device-detector.ps1 `
+            'rogue-device-detector.ps1.sha256'
