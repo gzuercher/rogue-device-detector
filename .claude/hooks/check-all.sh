@@ -6,7 +6,7 @@
 #   macOS:   brew install --cask powershell
 #   Windows: winget install Microsoft.PowerShell
 
-set -euo pipefail
+set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -18,7 +18,7 @@ fi
 echo "=== Quality gate: PSScriptAnalyzer + Pester ==="
 echo ""
 
-pwsh -NoProfile -NonInteractive -Command "
+output=$(pwsh -NoProfile -NonInteractive -Command "
   Set-Location '$REPO_ROOT'
 
   # ── PSScriptAnalyzer ──────────────────────────────────────────────────────
@@ -68,4 +68,12 @@ pwsh -NoProfile -NonInteractive -Command "
     exit 1
   }
   Write-Host \"Pester: \$(\$result.PassedCount) test(s) passed.\"
-"
+" 2>&1)
+exit_code=$?
+
+if [ $exit_code -ne 0 ]; then
+  echo "$output" >&2
+  exit 1
+fi
+
+echo "$output"
