@@ -762,6 +762,11 @@ function Write-AuditLog {
         [string]$Details         = ''
     )
 
+    $logDir = Split-Path $LogPath -Parent
+    if ($logDir -and -not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+
     if (-not (Test-Path $LogPath)) {
         Set-Content -Path $LogPath -Encoding UTF8 `
             -Value 'Timestamp,Event,Scanner,MAC,IP,Hostname,Vendor,OpenPorts,Risk,Details'
@@ -923,6 +928,11 @@ function Save-State {
         [Parameter(Mandatory)][PSCustomObject]$State,
         [Parameter(Mandatory)][string]$StatePath
     )
+
+    $stateDir = Split-Path $StatePath -Parent
+    if ($stateDir -and -not (Test-Path $stateDir)) {
+        New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+    }
 
     $State | ConvertTo-Json -Depth 10 | Set-Content -Path $StatePath -Encoding UTF8
 }

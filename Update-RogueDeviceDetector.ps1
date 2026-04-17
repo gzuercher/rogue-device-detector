@@ -123,7 +123,20 @@ try {
         -TimeoutSec 15 -ErrorAction Stop
     $release = $response.Content | ConvertFrom-Json
 } catch {
-    Write-Status "Failed to fetch release info: $_" -Level ERROR
+    $statusCode = $null
+    if ($_.Exception.Response) {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+    }
+    if ($statusCode -eq 404) {
+        Write-Status "GitHub API returned 404 for '$GitHubRepo'. Possible causes:" -Level ERROR
+        Write-Status "  - The repository has no published releases yet." -Level ERROR
+        Write-Status "  - The repository is private and -GitHubToken was not supplied or is invalid." -Level ERROR
+        Write-Status "  - The repository name '$GitHubRepo' is incorrect." -Level ERROR
+    } elseif ($statusCode -eq 403) {
+        Write-Status "GitHub API rate limit or permission error (HTTP 403). Supply a -GitHubToken to authenticate." -Level ERROR
+    } else {
+        Write-Status "Failed to fetch release info: $_" -Level ERROR
+    }
     exit 1
 }
 
