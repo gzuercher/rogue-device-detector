@@ -176,7 +176,12 @@ Write-Status "Downloading SHA-256 manifest..."
 try {
     $hashResponse = Invoke-WebRequest -Uri $hashAsset.browser_download_url -Headers $headers `
         -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
-    $expectedHash = ($hashResponse.Content.Trim() -split '\s+')[0].ToUpper()
+    $hashText = if ($hashResponse.Content -is [byte[]]) {
+        [System.Text.Encoding]::UTF8.GetString($hashResponse.Content)
+    } else {
+        $hashResponse.Content
+    }
+    $expectedHash = ($hashText.Trim() -split '\s+')[0].ToUpper()
 } catch {
     Write-Status "Failed to download hash file: $_" -Level ERROR
     exit 1
