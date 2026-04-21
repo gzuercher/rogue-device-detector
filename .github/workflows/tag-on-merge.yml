@@ -1,0 +1,39 @@
+name: Tag on merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version and create tag
+        run: |
+          version=$(grep -oP "\\\$SCRIPT_VERSION\s*=\s*'\K[^']+" rogue-device-detector.ps1)
+          if [ -z "$version" ]; then
+            echo "::error::Cannot find \$SCRIPT_VERSION in rogue-device-detector.ps1"
+            exit 1
+          fi
+          tag="v${version}"
+          echo "Detected version: ${version} -> tag: ${tag}"
+
+          # Skip if tag already exists
+          if git rev-parse "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists — skipping."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${tag}"
+          git push origin "${tag}"

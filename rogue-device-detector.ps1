@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.0'
+$SCRIPT_VERSION       = '1.3.1'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -612,9 +612,8 @@ function Get-HttpBanner {
             if ($server) { $parts.Add("Server: $server") }
             if ($parts.Count -gt 0) { return $parts -join ' | ' }
         } catch {
-            # HTTPS cert errors and connection resets are expected for network devices; only log other failures
-            if ($scheme -eq 'https') { continue }
-            Write-RddLog "HTTP banner grab failed for ${url}: $_" -Level WARN
+            # Connection failures, resets, and HTTP errors are expected for network devices
+            continue
         }
     }
     } finally {
@@ -800,6 +799,7 @@ function Get-OuiDatabase {
     param([Parameter(Mandatory)][string]$CachePath)
 
     $stale = (-not (Test-Path $CachePath)) -or
+             ((Get-Item $CachePath).Length -eq 0) -or
              ((Get-Item $CachePath).LastWriteTime -lt (Get-Date).AddDays(-$OUI_MAX_AGE_DAYS))
 
     if ($stale) {
@@ -813,6 +813,10 @@ function Get-OuiDatabase {
             Write-RddLog 'OUI database updated.'
         } catch {
             Write-RddLog "OUI download failed: $_. Vendor names will show as 'Unknown'." -Level WARN
+            # Remove empty file left behind by failed Invoke-WebRequest -OutFile
+            if ((Test-Path $CachePath) -and (Get-Item $CachePath).Length -eq 0) {
+                Remove-Item $CachePath -Force -ErrorAction SilentlyContinue
+            }
             if (-not (Test-Path $CachePath)) { return @{} }
         }
     }
@@ -899,6 +903,11 @@ function Get-State {
                 if (-not ($d.PSObject.Properties[$field])) {
                     $d | Add-Member -MemberType NoteProperty -Name $field -Value $requiredDeviceFields[$field]
                 }
+            }
+            # ConvertFrom-Json turns "allowedPorts": [] into $null on PS 5.1;
+            # normalise to a real empty array so downstream code can iterate safely.
+            if (-not $d.PSObject.Properties['allowedPorts'] -or $null -eq $d.allowedPorts) {
+                $d | Add-Member -NotePropertyName 'allowedPorts' -NotePropertyValue @() -Force
             }
         }
 
@@ -1563,6 +1572,8 @@ if (-not $scanLock) {
     exit 1
 }
 
+try {
+
 # Resolve target subnet
 $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
 Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$(if ($LearningMode) { 'learning' } else { 'normal' })"
@@ -1579,7 +1590,6 @@ Write-RddLog "$($arpEntries.Count) device(s) found in ARP table."
 
 if ($arpEntries.Count -eq 0) {
     Write-RddLog 'ARP table empty after ping sweep. Exiting.' -Level WARN
-    Exit-ScanLock -LockStream $scanLock -StatePath $cfg.statePath
     exit 0
 }
 
@@ -1677,7 +1687,6 @@ if ($LearningMode -or -not $stateFileExists) {
 
     Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_DONE' `
         -Details "found=$($foundDevices.Count) new=$($newDevices.Count) mode=learning"
-    Exit-ScanLock -LockStream $scanLock -StatePath $cfg.statePath
     exit 0
 }
 
@@ -1785,5 +1794,8 @@ $exitCode = 0
 if ($rogueDevices.Count -gt 0) { $exitCode = $exitCode -bor 1 }
 if ($riskDevices.Count -gt 0)  { $exitCode = $exitCode -bor 2 }
 if ($absentDevices.Count -gt 0) { $exitCode = $exitCode -bor 4 }
-Exit-ScanLock -LockStream $scanLock -StatePath $cfg.statePath
+
+} finally {
+    Exit-ScanLock -LockStream $scanLock -StatePath $cfg.statePath
+}
 exit $exitCode
