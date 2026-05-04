@@ -184,6 +184,10 @@ function Write-RddConfigFile {
                 password = ''
                 from     = $SmtpFrom
                 to       = $SmtpTo
+                # Local relays (port 25, no auth) usually don't speak TLS or
+                # have a self-signed cert. Default off to match the install
+                # profile; flip to $true for SMTP submission (587/465).
+                useSsl   = $false
             }
         }
 

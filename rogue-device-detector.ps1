@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.6'
+$SCRIPT_VERSION       = '1.3.7'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -190,6 +190,7 @@ function Get-Configuration {
             password = ''
             from     = ''
             to       = ''
+            useSsl   = $true
         }
     }
 
@@ -212,6 +213,7 @@ function Get-Configuration {
                 if ($sp['password'] -and $file.smtp.password) { $cfg.smtp.password = $file.smtp.password }
                 if ($sp['from']     -and $file.smtp.from)     { $cfg.smtp.from     = $file.smtp.from }
                 if ($sp['to']       -and $file.smtp.to)       { $cfg.smtp.to       = $file.smtp.to }
+                if ($sp['useSsl']   -and $null -ne $file.smtp.useSsl) { $cfg.smtp.useSsl = [bool]$file.smtp.useSsl }
             }
         } catch {
             Write-RddLog "Could not parse config file '$ConfigPath': $_" -Level WARN
@@ -1068,6 +1070,10 @@ To review the full baseline:
     if ($RiskDevices.Count -gt 0)   { $subjectParts.Add("$($RiskDevices.Count) risk") }
     if ($AbsentDevices.Count -gt 0) { $subjectParts.Add("$($AbsentDevices.Count) absent") }
 
+    $useSsl = if ($SmtpConfig.ContainsKey('useSsl') -and $null -ne $SmtpConfig.useSsl) {
+        [bool]$SmtpConfig.useSsl
+    } else { $true }
+
     $mailParams = @{
         From       = $SmtpConfig.from
         To         = $SmtpConfig.to
@@ -1075,7 +1081,7 @@ To review the full baseline:
         Body       = $body
         SmtpServer = $SmtpConfig.host
         Port       = [int]$SmtpConfig.port
-        UseSsl     = $true
+        UseSsl     = $useSsl
     }
 
     if ($SmtpConfig.user) {
@@ -1447,6 +1453,10 @@ function Send-SummaryReport {
     }
     $subject = "[$env:COMPUTERNAME] Network Health Report [$status] - $(Get-Date -Format 'yyyy-MM-dd')"
 
+    $useSsl = if ($SmtpConfig.ContainsKey('useSsl') -and $null -ne $SmtpConfig.useSsl) {
+        [bool]$SmtpConfig.useSsl
+    } else { $true }
+
     $mailParams = @{
         From       = $SmtpConfig.from
         To         = $SmtpConfig.to
@@ -1454,7 +1464,7 @@ function Send-SummaryReport {
         Body       = $lines -join "`n"
         SmtpServer = $SmtpConfig.host
         Port       = [int]$SmtpConfig.port
-        UseSsl     = $true
+        UseSsl     = $useSsl
     }
 
     if ($SmtpConfig.user) {
@@ -1693,7 +1703,6 @@ if ($LearningMode -or -not $stateFileExists) {
         if ($known) {
             $previousHost = Test-IdentityChange -KnownDevice $known -FoundDevice $device
             if ($previousHost) {
-                Write-RddLog "IDENTITY CHANGE: $($device.mac) hostname changed from '$previousHost' to '$($device.hostname)'" -Level WARN
                 Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_CHANGED' -Device $device `
                     -Details "previousHostname=$previousHost"
             }
@@ -1753,7 +1762,6 @@ foreach ($device in $foundDevices) {
     if ($known) {
         $previousHost = Test-IdentityChange -KnownDevice $known -FoundDevice $device
         if ($previousHost) {
-            Write-RddLog "IDENTITY CHANGE: $($device.mac) hostname changed from '$previousHost' to '$($device.hostname)'" -Level WARN
             Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_CHANGED' -Device $device `
                 -Details "previousHostname=$previousHost"
             $identityChanges.Add(@{
@@ -1833,7 +1841,8 @@ if ($cfg.summaryReport) {
     $riskBreakdown = if ($riskDevices.Count -gt 0) { " ($criticalCount critical, $highCount high)" } else { '' }
     Write-RddLog ("Scan summary: $($rogueDevices.Count) rogue, " +
                   "$($riskDevices.Count) risk$riskBreakdown, " +
-                  "$($absentDevices.Count) absent.")
+                  "$($absentDevices.Count) absent, " +
+                  "$($identityChanges.Count) hostname changes.")
 
     if ($rogueDevices.Count -gt 0 -or $riskDevices.Count -gt 0 -or $absentDevices.Count -gt 0) {
         Send-RogueAlert -Devices $rogueDevices.ToArray() `
