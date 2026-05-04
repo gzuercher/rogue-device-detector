@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.5'
+$SCRIPT_VERSION       = '1.3.6'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -984,7 +984,9 @@ function Send-RogueAlert {
     )]
     param(
         [Parameter(Mandatory)][array]$Devices,
-        [Parameter(Mandatory)][hashtable]$SmtpConfig
+        [Parameter(Mandatory)][hashtable]$SmtpConfig,
+        [array]$RiskDevices = @(),
+        [array]$AbsentDevices = @()
     )
 
     if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
@@ -994,7 +996,7 @@ function Send-RogueAlert {
 
     $scriptPath = $PSCommandPath
 
-    $deviceLines = ($Devices | ForEach-Object {
+    $rogueLines = ($Devices | ForEach-Object {
         $d     = $_
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("  MAC:      $($d.mac)")
@@ -1021,12 +1023,37 @@ function Send-RogueAlert {
         $lines -join "`n"
     }) -join "`n`n---`n`n"
 
+    $riskLines = ($RiskDevices | ForEach-Object {
+        $d = $_
+        @(
+            "  MAC:      $($d.mac)"
+            "  IP:       $($d.ip)"
+            "  Hostname: $($d.hostname)"
+            "  RISK:     [$($d.riskLevel)] $($d.riskReasons -join '; ')"
+        ) -join "`n"
+    }) -join "`n`n---`n`n"
+
+    $absentLines = ($AbsentDevices | ForEach-Object {
+        $d = $_
+        $label = if ($d.label) { " ($($d.label))" } else { '' }
+        "  $($d.mac)$label  Last seen: $($d.lastSeen)"
+    }) -join "`n"
+
+    $sections = [System.Collections.Generic.List[string]]::new()
+    if ($Devices.Count -gt 0) {
+        $sections.Add("== ROGUE DEVICES ($($Devices.Count)) ==`n`n$rogueLines")
+    }
+    if ($RiskDevices.Count -gt 0) {
+        $sections.Add("== RISK FINDINGS ON KNOWN DEVICES ($($RiskDevices.Count)) ==`n`n$riskLines")
+    }
+    if ($AbsentDevices.Count -gt 0) {
+        $sections.Add("== ABSENT DEVICES ($($AbsentDevices.Count)) ==`n`n$absentLines")
+    }
+
     $body = @"
 Rogue Device Detector - Alert
 
-$($Devices.Count) unknown device(s) found on the network:
-
-$deviceLines
+$($sections -join "`n`n")
 
 ---
 Scan time : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
@@ -1036,10 +1063,15 @@ To review the full baseline:
   & "$scriptPath" -List
 "@
 
+    $subjectParts = [System.Collections.Generic.List[string]]::new()
+    if ($Devices.Count -gt 0)       { $subjectParts.Add("$($Devices.Count) rogue") }
+    if ($RiskDevices.Count -gt 0)   { $subjectParts.Add("$($RiskDevices.Count) risk") }
+    if ($AbsentDevices.Count -gt 0) { $subjectParts.Add("$($AbsentDevices.Count) absent") }
+
     $mailParams = @{
         From       = $SmtpConfig.from
         To         = $SmtpConfig.to
-        Subject    = "[$env:COMPUTERNAME] $($Devices.Count) rogue device(s) detected - $(Get-Date -Format 'yyyy-MM-dd')"
+        Subject    = "[$env:COMPUTERNAME] $($subjectParts -join ', ') - $(Get-Date -Format 'yyyy-MM-dd')"
         Body       = $body
         SmtpServer = $SmtpConfig.host
         Port       = [int]$SmtpConfig.port
@@ -1736,9 +1768,6 @@ foreach ($device in $foundDevices) {
         $known.hostname = $device.hostname
         $known.osGuess  = $device.osGuess
     } else {
-        $riskTag = if ($device.riskLevel -ne 'NONE') { " [$($device.riskLevel)]" } else { '' }
-        $hostStr = if ($device.hostname -and $device.hostname -ne $device.ip) { $device.hostname } else { '-' }
-        Write-RddLog "ROGUE: $($device.mac)  $($device.ip)  $hostStr  [$($device.vendor)]$riskTag" -Level WARN
         $rogueDevices.Add($device)
         Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ROGUE' -Device $device `
             -Details ($device.riskReasons -join '; ')
@@ -1762,8 +1791,6 @@ foreach ($device in $foundDevices) {
     if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
         $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
         if (-not $isRogue) {
-            $hostStr = if ($device.hostname -and $device.hostname -ne $device.ip) { $device.hostname } else { '-' }
-            Write-RddLog "RISK [$($device.riskLevel)]: $($device.ip) $hostStr - $($device.riskReasons -join '; ')" -Level WARN
             Write-AuditLog -LogPath $cfg.logPath -EventName 'RISK_FOUND' -Device $device `
                 -Details ($device.riskReasons -join '; ')
             $riskDevices.Add($device)
@@ -1774,14 +1801,9 @@ foreach ($device in $foundDevices) {
 # Detect devices that have not been seen for too long
 $absentDevices = @(Get-AbsentDevices -KnownDevices @($state.knownDevices) `
     -AbsentDays $cfg.absentDays -Now $now)
-if ($absentDevices.Count -gt 0) {
-    Write-RddLog "$($absentDevices.Count) device(s) not seen for $($cfg.absentDays)+ days." -Level WARN
-    foreach ($d in $absentDevices) {
-        $label = if ($d.label) { " ($($d.label))" } else { '' }
-        Write-RddLog "  ABSENT: $($d.mac)$label  Last seen: $($d.lastSeen)" -Level WARN
-        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ABSENT' -Device $d `
-            -Details "lastSeen=$($d.lastSeen) absentDays=$($cfg.absentDays)"
-    }
+foreach ($d in $absentDevices) {
+    Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ABSENT' -Device $d `
+        -Details "lastSeen=$($d.lastSeen) absentDays=$($cfg.absentDays)"
 }
 
 $state.lastScan = $now
@@ -1805,11 +1827,22 @@ if ($cfg.summaryReport) {
         identityChanges = $identityChanges.ToArray()
     }
     Send-SummaryReport -Report $report -SmtpConfig $cfg.smtp
-} elseif ($rogueDevices.Count -gt 0) {
-    Write-RddLog "$($rogueDevices.Count) rogue device(s) detected."
-    Send-RogueAlert -Devices $rogueDevices.ToArray() -SmtpConfig $cfg.smtp
 } else {
-    Write-RddLog 'Scan complete - all devices are known.'
+    $criticalCount = @($riskDevices | Where-Object { $_.riskLevel -eq 'CRITICAL' }).Count
+    $highCount     = @($riskDevices | Where-Object { $_.riskLevel -eq 'HIGH' }).Count
+    $riskBreakdown = if ($riskDevices.Count -gt 0) { " ($criticalCount critical, $highCount high)" } else { '' }
+    Write-RddLog ("Scan summary: $($rogueDevices.Count) rogue, " +
+                  "$($riskDevices.Count) risk$riskBreakdown, " +
+                  "$($absentDevices.Count) absent.")
+
+    if ($rogueDevices.Count -gt 0 -or $riskDevices.Count -gt 0 -or $absentDevices.Count -gt 0) {
+        Send-RogueAlert -Devices $rogueDevices.ToArray() `
+            -RiskDevices $riskDevices.ToArray() `
+            -AbsentDevices $absentDevices `
+            -SmtpConfig $cfg.smtp
+    } else {
+        Write-RddLog 'Scan complete - all devices are known.'
+    }
 }
 
 # Exit code bitmask for RMM integration (e.g. NinjaRMM conditions)
