@@ -12,6 +12,7 @@
     "user": "alerts@example.com",
     "password": "your-smtp-password",
     "from": "rdd@example.com",
-    "to": "helpdesk@example.com"
+    "to": "helpdesk@example.com",
+    "useSsl": true
   }
 }
