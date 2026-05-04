@@ -7,4 +7,4 @@
 - SSH/RDP/SMB Banner Grabs für tiefere Analyse
 - Multi-Subnet Support
 - Teams/Slack Webhook-Alerts
-- NinjaRMM API Integration (Managed vs. Unmanaged Detection)
+- RMM API Integration (Managed vs. Unmanaged Detection)

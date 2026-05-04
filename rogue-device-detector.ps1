@@ -1867,7 +1867,7 @@ if ($cfg.summaryReport) {
     }
 }
 
-# Exit code bitmask for RMM integration (e.g. NinjaRMM conditions)
+# Exit code bitmask for RMM integration
 #   0 = clean, 1 = rogue devices, 2 = high/critical risk, 4 = absent devices
 $exitCode = 0
 if ($rogueDevices.Count -gt 0) { $exitCode = $exitCode -bor 1 }
