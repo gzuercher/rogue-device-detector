@@ -29,17 +29,19 @@ updater from the latest GitHub release, verifies its SHA-256, and runs it.
 Idempotent — safe to schedule. Updater bumps require zero NinjaOne maintenance.
 
 ```powershell
-$base = 'https://github.com/gzuercher/rogue-device-detector/releases/latest/download'
-$tmp  = Join-Path $env:TEMP "rdd-bootstrap-$([guid]::NewGuid()).ps1"
+$base    = 'https://github.com/gzuercher/rogue-device-detector/releases/latest/download'
+$tmp     = Join-Path $env:TEMP "rdd-bootstrap-$([guid]::NewGuid()).ps1"
+$tmpHash = "$tmp.sha256"
 try {
-    Invoke-WebRequest "$base/Update-RogueDeviceDetector.ps1" -OutFile $tmp -UseBasicParsing -ErrorAction Stop
-    $exp = (Invoke-WebRequest "$base/Update-RogueDeviceDetector.ps1.sha256" -UseBasicParsing -ErrorAction Stop).Content.Trim().Split()[0].ToLower()
+    Invoke-WebRequest "$base/Update-RogueDeviceDetector.ps1"        -OutFile $tmp     -UseBasicParsing -ErrorAction Stop
+    Invoke-WebRequest "$base/Update-RogueDeviceDetector.ps1.sha256" -OutFile $tmpHash -UseBasicParsing -ErrorAction Stop
+    $exp = (Get-Content $tmpHash -Raw).Trim().Split()[0].ToLower()
     $act = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
     if ($act -ne $exp) { throw "Updater hash mismatch: expected $exp, got $act" }
     & $tmp
     exit $LASTEXITCODE
 } finally {
-    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    Remove-Item $tmp,$tmpHash -Force -ErrorAction SilentlyContinue
 }
 ```
 
