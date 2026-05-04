@@ -11,12 +11,18 @@
     Designed to run via NinjaOne Script Library on managed endpoints.
     Safe to run repeatedly - exits cleanly if already up to date.
 
-    On first run (ScriptPath does not exist), performs a fresh installation.
-    On subsequent runs, updates if a newer version is available.
+    On first run (ScriptPath does not exist), performs a fresh installation
+    AND generates a default config.json next to the script. SMTP host is
+    auto-discovered from the default gateway (port 25, no auth) unless
+    overridden via -SmtpHost / -SmtpPort. Existing config.json files are
+    never overwritten.
+
+    On subsequent runs, updates if a newer version is available; config
+    generation is a no-op when config.json already exists.
 
 .PARAMETER ScriptPath
     Full path where rogue-device-detector.ps1 is installed (or should be installed).
-    Defaults to C:\Scripts\rdd\rogue-device-detector.ps1.
+    Defaults to C:\Scripts\RDD\rogue-device-detector.ps1.
 
 .PARAMETER GitHubRepo
     GitHub repository in "owner/repo" format.
@@ -30,6 +36,26 @@
     Apply the update even if the installed version matches the latest release.
     Useful for repairing a corrupt installation.
 
+.PARAMETER DataDir
+    Directory for runtime data (state.json, oui.csv, rdd-audit.csv).
+    Defaults to <ScriptDir>\var. Created on install if missing.
+
+.PARAMETER SmtpHost
+    SMTP server for alert emails. Empty = auto-detect from default gateway.
+
+.PARAMETER SmtpPort
+    SMTP port. Defaults to 25 (matches the typical local-relay scenario).
+
+.PARAMETER SmtpFrom
+    Sender address for alert emails. Optional; alerts skip silently when blank.
+
+.PARAMETER SmtpTo
+    Recipient address for alert emails. Optional; alerts skip silently when blank.
+
+.PARAMETER NoConfig
+    Skip default config generation. Use when config.json is managed
+    out-of-band (Group Policy, NinjaOne template, etc.).
+
 .EXAMPLE
     .\Update-RogueDeviceDetector.ps1
 
@@ -38,13 +64,23 @@
 
 .EXAMPLE
     .\Update-RogueDeviceDetector.ps1 -GitHubToken "github_pat_..."
+
+.EXAMPLE
+    # Unattended fresh-host install with explicit SMTP recipients
+    .\Update-RogueDeviceDetector.ps1 -SmtpFrom "rdd@lab.local" -SmtpTo "ops@lab.local"
 #>
 [CmdletBinding()]
 param(
-    [string]$ScriptPath  = 'C:\Scripts\rdd\rogue-device-detector.ps1',
+    [string]$ScriptPath  = 'C:\Scripts\RDD\rogue-device-detector.ps1',
     [string]$GitHubRepo  = 'gzuercher/rogue-device-detector',
     [string]$GitHubToken = '',
-    [switch]$Force
+    [switch]$Force,
+    [string]$DataDir     = '',
+    [string]$SmtpHost    = '',
+    [int]   $SmtpPort    = 25,
+    [string]$SmtpFrom    = '',
+    [string]$SmtpTo      = '',
+    [switch]$NoConfig
 )
 
 Set-StrictMode -Version Latest
@@ -92,9 +128,70 @@ function Compare-SemVer {
 
 function Build-ApiHeader {
     param([string]$Token)
-    $headers = @{ 'User-Agent' = 'RDD-Updater/1.0' }
+    $headers = @{ 'User-Agent' = 'RDD-Updater/1.1' }
     if ($Token) { $headers['Authorization'] = "Bearer $Token" }
     return $headers
+}
+
+function Get-DefaultGateway {
+    # Returns the IPv4 default-gateway address as a string, or '' if none / on error.
+    try {
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+                 Sort-Object RouteMetric, ifMetric |
+                 Select-Object -First 1
+        if ($route -and $route.NextHop) { return [string]$route.NextHop }
+    } catch {}
+    return ''
+}
+
+function New-RddConfigFile {
+    <#
+    .SYNOPSIS
+        Idempotently writes a default config.json. Never overwrites an existing file.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$DataDir,
+        [string]$SmtpHost = '',
+        [int]   $SmtpPort = 25,
+        [string]$SmtpFrom = '',
+        [string]$SmtpTo   = ''
+    )
+
+    if (Test-Path $Path) {
+        Write-Status "config.json already present, leaving untouched: $Path"
+        return
+    }
+
+    try {
+        if (-not (Test-Path $DataDir)) {
+            New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+            Write-Status "Created data directory: $DataDir"
+        }
+
+        $cfg = [ordered]@{
+            subnet        = ''
+            statePath     = (Join-Path $DataDir 'state.json')
+            ouiPath       = (Join-Path $DataDir 'oui.csv')
+            logPath       = (Join-Path $DataDir 'rdd-audit.csv')
+            enrichment    = $true
+            absentDays    = 21
+            summaryReport = $false
+            smtp          = [ordered]@{
+                host     = $SmtpHost
+                port     = $SmtpPort
+                user     = ''
+                password = ''
+                from     = $SmtpFrom
+                to       = $SmtpTo
+            }
+        }
+
+        $cfg | ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding UTF8
+        Write-Status "Wrote default config: $Path" -Level OK
+    } catch {
+        Write-Status "Could not write default config '$Path': $_" -Level WARN
+    }
 }
 
 # -- Main 
@@ -293,7 +390,7 @@ try {
     exit 1
 }
 
-# -- Step 12: Remove Mark of the Web 
+# -- Step 12: Remove Mark of the Web
 
 try {
     Unblock-File -Path $ScriptPath -ErrorAction Stop
@@ -303,7 +400,25 @@ try {
     # Non-fatal: script still works if NinjaOne/Task Scheduler uses -ExecutionPolicy Bypass
 }
 
-# -- Done 
+# -- Step 13: Generate default config on fresh install (idempotent)
+
+if (-not $NoConfig) {
+    if (-not $DataDir) { $DataDir = Join-Path $targetDir 'var' }
+    if (-not $SmtpHost) {
+        $SmtpHost = Get-DefaultGateway
+        if ($SmtpHost) {
+            Write-Status "SMTP host auto-detected (default gateway): $SmtpHost"
+        } else {
+            Write-Status "Could not detect default gateway; SMTP host left blank in config." -Level WARN
+        }
+    }
+    $configPath = Join-Path $targetDir 'config.json'
+    New-RddConfigFile -Path $configPath -DataDir $DataDir `
+        -SmtpHost $SmtpHost -SmtpPort $SmtpPort `
+        -SmtpFrom $SmtpFrom -SmtpTo $SmtpTo
+}
+
+# -- Done
 
 Write-Status "$action completed successfully on $env:COMPUTERNAME" -Level OK
 if (Test-Path "$ScriptPath.backup") {
