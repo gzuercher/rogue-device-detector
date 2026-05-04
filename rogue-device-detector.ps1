@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.2'
+$SCRIPT_VERSION       = '1.3.3'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -703,7 +703,14 @@ function Get-FilteredRisk {
         return [PSCustomObject]@{ Level = $Device.riskLevel; Reasons = $Device.riskReasons }
     }
 
-    $allowedPortNumbers = @($AllowedPorts | ForEach-Object { $_.port })
+    # Defensive: Get-State normalises allowedPorts on load, but if a malformed
+    # entry slips through (e.g. baseline edited mid-scan), don't crash the run.
+    $allowedPortNumbers = @($AllowedPorts | ForEach-Object {
+        if ($null -eq $_) { return }
+        if ($_ -is [int] -or $_ -is [long]) { $_ }
+        elseif ($_ -is [string]) { [int]$_ }
+        elseif ($_.PSObject.Properties['port']) { $_.port }
+    } | Where-Object { $null -ne $_ })
     $remainingPorts = @($Device.openPorts | Where-Object { $_ -notin $allowedPortNumbers })
 
     return Get-DeviceRisk -OpenPorts $remainingPorts
