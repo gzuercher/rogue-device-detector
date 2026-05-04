@@ -140,11 +140,11 @@ function Get-DefaultGateway {
                  Sort-Object RouteMetric, ifMetric |
                  Select-Object -First 1
         if ($route -and $route.NextHop) { return [string]$route.NextHop }
-    } catch {}
+    } catch { $null = $_ }
     return ''
 }
 
-function New-RddConfigFile {
+function Write-RddConfigFile {
     <#
     .SYNOPSIS
         Idempotently writes a default config.json. Never overwrites an existing file.
@@ -413,7 +413,7 @@ if (-not $NoConfig) {
         }
     }
     $configPath = Join-Path $targetDir 'config.json'
-    New-RddConfigFile -Path $configPath -DataDir $DataDir `
+    Write-RddConfigFile -Path $configPath -DataDir $DataDir `
         -SmtpHost $SmtpHost -SmtpPort $SmtpPort `
         -SmtpFrom $SmtpFrom -SmtpTo $SmtpTo
 }
