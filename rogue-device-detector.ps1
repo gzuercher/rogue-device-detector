@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.4'
+$SCRIPT_VERSION       = '1.3.5'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -1695,7 +1695,8 @@ if ($LearningMode -or -not $stateFileExists) {
         Write-RddLog "--- SIMULATED ALERT: $($newDevices.Count) new device(s) added to baseline ---"
         foreach ($d in $newDevices) {
             $riskTag = if ($d.riskLevel -ne 'NONE') { " [$($d.riskLevel)]" } else { '' }
-            Write-RddLog "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $($d.hostname)  Vendor: $($d.vendor)$riskTag"
+            $hostStr = if ($d.hostname -and $d.hostname -ne $d.ip) { $d.hostname } else { '-' }
+            Write-RddLog "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $hostStr  Vendor: $($d.vendor)$riskTag"
             if ($d.riskReasons -and $d.riskReasons.Count -gt 0) {
                 Write-RddLog "       RISK: $($d.riskReasons -join '; ')" -Level WARN
             }
@@ -1736,7 +1737,8 @@ foreach ($device in $foundDevices) {
         $known.osGuess  = $device.osGuess
     } else {
         $riskTag = if ($device.riskLevel -ne 'NONE') { " [$($device.riskLevel)]" } else { '' }
-        Write-RddLog "ROGUE: $($device.mac)  $($device.ip)  $($device.hostname)  [$($device.vendor)]$riskTag" -Level WARN
+        $hostStr = if ($device.hostname -and $device.hostname -ne $device.ip) { $device.hostname } else { '-' }
+        Write-RddLog "ROGUE: $($device.mac)  $($device.ip)  $hostStr  [$($device.vendor)]$riskTag" -Level WARN
         $rogueDevices.Add($device)
         Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ROGUE' -Device $device `
             -Details ($device.riskReasons -join '; ')
@@ -1760,7 +1762,8 @@ foreach ($device in $foundDevices) {
     if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
         $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
         if (-not $isRogue) {
-            Write-RddLog "RISK [$($device.riskLevel)]: $($device.ip) $($device.hostname) - $($device.riskReasons -join '; ')" -Level WARN
+            $hostStr = if ($device.hostname -and $device.hostname -ne $device.ip) { $device.hostname } else { '-' }
+            Write-RddLog "RISK [$($device.riskLevel)]: $($device.ip) $hostStr - $($device.riskReasons -join '; ')" -Level WARN
             Write-AuditLog -LogPath $cfg.logPath -EventName 'RISK_FOUND' -Device $device `
                 -Details ($device.riskReasons -join '; ')
             $riskDevices.Add($device)
