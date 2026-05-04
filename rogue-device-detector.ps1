@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.7'
+$SCRIPT_VERSION       = '1.3.8'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -183,6 +183,7 @@ function Get-Configuration {
         enrichment    = $true
         absentDays    = $ABSENT_DAYS_DEFAULT
         summaryReport = $false
+        configured    = $true
         smtp          = @{
             host     = ''
             port     = 587
@@ -205,6 +206,7 @@ function Get-Configuration {
             if ($p['enrichment'] -and $null -ne $file.enrichment) { $cfg.enrichment = [bool]$file.enrichment }
             if ($p['absentDays'] -and $null -ne $file.absentDays) { $cfg.absentDays = [int]$file.absentDays }
             if ($p['summaryReport'] -and $null -ne $file.summaryReport) { $cfg.summaryReport = [bool]$file.summaryReport }
+            if ($p['configured']    -and $null -ne $file.configured)    { $cfg.configured    = [bool]$file.configured }
             if ($p['smtp'] -and $null -ne $file.smtp) {
                 $sp = $file.smtp.PSObject.Properties
                 if ($sp['host']     -and $file.smtp.host)     { $cfg.smtp.host     = $file.smtp.host }
@@ -1751,6 +1753,17 @@ if ($LearningMode -or -not $stateFileExists) {
     Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_DONE' `
         -Details "found=$($foundDevices.Count) new=$($newDevices.Count) mode=learning"
     exit 0
+}
+
+# Refuse to run a normal scan against an unreviewed default config.
+# Updater-generated configs ship with "configured": false; the operator
+# must review smtp settings (and anything else) and flip the flag.
+# Back-compat: configs without the field default to $true.
+if (-not $cfg.configured) {
+    Write-RddLog "Config has 'configured: false' (unreviewed default config)." -Level ERROR
+    Write-RddLog "Edit '$configPath' - review smtp settings, then set 'configured': true." -Level ERROR
+    Write-RddLog "Use -LearningMode to seed the baseline before flipping the flag." -Level ERROR
+    exit 1
 }
 
 # Normal scan: compare found devices against baseline

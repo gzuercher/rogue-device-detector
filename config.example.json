@@ -6,6 +6,7 @@
   "enrichment": true,
   "absentDays": 21,
   "summaryReport": false,
+  "configured": true,
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
