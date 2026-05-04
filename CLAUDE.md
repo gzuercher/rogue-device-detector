@@ -14,7 +14,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for full technical design and data flow.
 - **Config**: JSON config file + optional parameter overrides
 - **Storage**: JSON state file (local, portable)
 - **Alerts**: SMTP email (configurable, Azure ACS compatible)
-- **Scheduling**: Any scheduler (Windows Task Scheduler, NinjaOne, Intune, cron via WSL, etc.)
+- **Scheduling**: Any scheduler (Windows Task Scheduler, RMM, Intune, cron via WSL, etc.)
 
 ## Key Commands
 

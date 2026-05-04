@@ -5,7 +5,7 @@ Tracked-but-not-scheduled work. Items are removed when shipped or dropped.
 ## Security
 
 - **Code-sign `Update-RogueDeviceDetector.ps1`** so endpoints fetching it via
-  the NinjaOne bootstrap one-liner can verify provenance against a pinned
+  the RMM bootstrap one-liner can verify provenance against a pinned
   publisher cert before execution. Mitigates the residual repo-compromise
   risk the SHA-256 transit check does not cover.
   - Requires: code-signing cert (~$200/yr), CI signing step with secret
@@ -21,7 +21,7 @@ Tracked-but-not-scheduled work. Items are removed when shipped or dropped.
 ## UX
 
 - **True one-liner bootstrap**: publish `bootstrap.ps1` as a release asset so
-  the NinjaOne snippet collapses to `iex (iwr <url>).Content`. Currently the
-  recommended NinjaOne body is a ~10-line script that does its own hash
+  the RMM snippet collapses to `iex (iwr <url>).Content`. Currently the
+  recommended RMM body is a ~10-line script that does its own hash
   verification. Trade-off: an extra HTTP round-trip and an extra layer the
   operator can't audit at install time.

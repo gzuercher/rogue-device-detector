@@ -157,7 +157,7 @@ Mutually exclusive parameter sets enforce valid CLI combinations:
 - **Learning mode** — Baseline creation: merges found devices into state, no alerts
 - **SMTP alert** — Enriched with ports, risk, banner, UPnP, OS info; Azure ACS compatible
 - **Summary report** — Optional comprehensive network health email with OS breakdown
-- **RMM exit codes** — Bitmask exit code (0=clean, 1=rogue, 2=risk, 4=absent) for NinjaOne/Intune
+- **RMM exit codes** — Bitmask exit code (0=clean, 1=rogue, 2=risk, 4=absent) for any RMM/Intune
 - **Portable state file** — JSON, path configurable, versioned schema with auto-migration
 - **Path validation** — All output paths validated for writability before scan starts
 - **Concurrent scan guard** — Exclusive lock file prevents two scans from corrupting `state.json`

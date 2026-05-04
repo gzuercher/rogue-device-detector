@@ -8,7 +8,7 @@
     verifies the SHA-256 hash, sets the PowerShell execution policy if needed,
     removes the Mark of the Web, and replaces the local script file.
 
-    Designed to run via NinjaOne Script Library on managed endpoints.
+    Designed to run via an RMM script library on managed endpoints.
     Safe to run repeatedly - exits cleanly if already up to date.
 
     On first run (ScriptPath does not exist), performs a fresh installation
@@ -30,7 +30,7 @@
 
 .PARAMETER GitHubToken
     Optional GitHub Personal Access Token for private repositories.
-    Store as a NinjaOne Script Variable (Secret) - do not hardcode.
+    Store as an RMM secret variable - do not hardcode.
 
 .PARAMETER Force
     Apply the update even if the installed version matches the latest release.
@@ -54,7 +54,7 @@
 
 .PARAMETER NoConfig
     Skip default config generation. Use when config.json is managed
-    out-of-band (Group Policy, NinjaOne template, etc.).
+    out-of-band (Group Policy, RMM template, etc.).
 
 .EXAMPLE
     .\Update-RogueDeviceDetector.ps1
@@ -365,7 +365,7 @@ try {
     }
 } catch {
     Write-Status "Could not read/set ExecutionPolicy (may lack admin rights): $_" -Level WARN
-    # Non-fatal: NinjaOne runs as SYSTEM; if this fails there is a bigger issue
+    # Non-fatal: RMM agents typically run as SYSTEM; if this fails there is a bigger issue
 }
 
 # -- Step 10: Backup existing script 
@@ -404,7 +404,7 @@ try {
     Write-Status "Mark of the Web removed (Zone.Identifier cleared)." -Level OK
 } catch {
     Write-Status "Could not remove Mark of the Web: $_" -Level WARN
-    # Non-fatal: script still works if NinjaOne/Task Scheduler uses -ExecutionPolicy Bypass
+    # Non-fatal: script still works if the RMM agent or Task Scheduler uses -ExecutionPolicy Bypass
 }
 
 # -- Step 13: Generate default config on fresh install (idempotent)

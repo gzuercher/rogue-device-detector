@@ -22,11 +22,11 @@ notepad config.json
 # 4. Schedule regular scans (see Scheduling section below)
 ```
 
-## Unattended Install (NinjaOne / RMM)
+## Unattended Install (RMM)
 
-Store the snippet below once as a NinjaOne PowerShell script. It downloads the
-updater from the latest GitHub release, verifies its SHA-256, and runs it.
-Idempotent — safe to schedule. Updater bumps require zero NinjaOne maintenance.
+Store the snippet below once as a PowerShell script in your RMM. It downloads
+the updater from the latest GitHub release, verifies its SHA-256, and runs it.
+Idempotent — safe to schedule. Updater bumps require zero RMM maintenance.
 
 ```powershell
 $base    = 'https://github.com/gzuercher/rogue-device-detector/releases/latest/download'
@@ -216,7 +216,7 @@ When `summaryReport` is `false` (default), only rogue device alerts are sent.
 
 ## Exit Codes (RMM Integration)
 
-The script returns a bitmask exit code for use with NinjaOne, Intune, or other RMM tools:
+The script returns a bitmask exit code for use with any RMM or Intune:
 
 | Code | Meaning |
 |------|---------|
@@ -227,7 +227,7 @@ The script returns a bitmask exit code for use with NinjaOne, Intune, or other R
 
 Codes combine: e.g. `3` = rogue devices **and** risk findings, `5` = rogue **and** absent.
 
-In NinjaOne, create a condition on the script's exit code to auto-create tickets.
+In your RMM, create a condition on the script's exit code to auto-create tickets.
 
 ## Scheduling
 
@@ -239,7 +239,7 @@ Action:    powershell.exe
 Arguments: -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\rdd\rogue-device-detector.ps1"
 ```
 
-**NinjaOne / ConnectWise / any RMM:** Deploy as a scheduled script task with the same arguments.
+**Any RMM:** Deploy as a scheduled script task with the same arguments.
 
 **Intune:** Deploy as a PowerShell script via Endpoint Manager.
 
