@@ -22,6 +22,34 @@ notepad config.json
 # 4. Schedule regular scans (see Scheduling section below)
 ```
 
+## Unattended Install (NinjaOne / RMM)
+
+Store the snippet below once as a NinjaOne PowerShell script. It downloads the
+updater from the latest GitHub release, verifies its SHA-256, and runs it.
+Idempotent — safe to schedule. Updater bumps require zero NinjaOne maintenance.
+
+```powershell
+$base = 'https://github.com/gzuercher/rogue-device-detector/releases/latest/download'
+$tmp  = Join-Path $env:TEMP "rdd-bootstrap-$([guid]::NewGuid()).ps1"
+try {
+    Invoke-WebRequest "$base/Update-RogueDeviceDetector.ps1" -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+    $exp = (Invoke-WebRequest "$base/Update-RogueDeviceDetector.ps1.sha256" -UseBasicParsing -ErrorAction Stop).Content.Trim().Split()[0].ToLower()
+    $act = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()
+    if ($act -ne $exp) { throw "Updater hash mismatch: expected $exp, got $act" }
+    & $tmp
+    exit $LASTEXITCODE
+} finally {
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+}
+```
+
+The updater installs to `C:\Scripts\RDD\` and writes a default
+`config.json` with `"configured": false` as a safety gate. The main script
+refuses to run a normal scan until you review the file (smtp settings in
+particular) and flip the flag to `true`. `-LearningMode` and the device-
+management modes (`-ListDevices`, `-ApproveDevice`, etc.) work without the
+flag, so you can seed the baseline before going live.
+
 ## Requirements
 
 - Windows with PowerShell 5.1 or later (pre-installed on Windows 10/11/Server 2016+)

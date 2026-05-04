@@ -177,6 +177,9 @@ function Write-RddConfigFile {
             enrichment    = $true
             absentDays    = 21
             summaryReport = $false
+            # Safety gate: scan refuses to run until operator reviews the file
+            # and flips this to true. See README / -LearningMode.
+            configured    = $false
             smtp          = [ordered]@{
                 host     = $SmtpHost
                 port     = $SmtpPort
@@ -428,4 +431,21 @@ Write-Status "$action completed successfully on $env:COMPUTERNAME" -Level OK
 if (Test-Path "$ScriptPath.backup") {
     Write-Status "Backup retained at: $ScriptPath.backup"
 }
+
+# Post-install hint - only when we wrote a default config that needs review.
+if (-not $NoConfig) {
+    $cfgFile = Join-Path $targetDir 'config.json'
+    if (Test-Path $cfgFile) {
+        try {
+            $written = Get-Content $cfgFile -Raw | ConvertFrom-Json
+            if ($written.PSObject.Properties['configured'] -and -not $written.configured) {
+                Write-Status "Next steps:" -Level WARN
+                Write-Status "  1. Edit $cfgFile - review smtp settings (host/from/to/useSsl)." -Level WARN
+                Write-Status "  2. Run '$ScriptPath -LearningMode' once to seed the baseline." -Level WARN
+                Write-Status "  3. Set 'configured': true in $cfgFile to enable scanning." -Level WARN
+            }
+        } catch { $null = $_ }
+    }
+}
+
 exit 0
