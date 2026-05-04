@@ -67,19 +67,26 @@ jobs:
         id: hash
         shell: pwsh
         run: |
-          $hash = (Get-FileHash rogue-device-detector.ps1 -Algorithm SHA256).Hash.ToLower()
-          Write-Host "SHA-256: $hash"
-          Set-Content -Path 'rogue-device-detector.ps1.sha256' -Value $hash -NoNewline -Encoding ASCII
-          echo "sha256=$hash" >> $env:GITHUB_OUTPUT
+          $mainHash = (Get-FileHash rogue-device-detector.ps1 -Algorithm SHA256).Hash.ToLower()
+          Write-Host "rogue-device-detector.ps1 SHA-256: $mainHash"
+          Set-Content -Path 'rogue-device-detector.ps1.sha256' -Value $mainHash -NoNewline -Encoding ASCII
+
+          $updaterHash = (Get-FileHash Update-RogueDeviceDetector.ps1 -Algorithm SHA256).Hash.ToLower()
+          Write-Host "Update-RogueDeviceDetector.ps1 SHA-256: $updaterHash"
+          Set-Content -Path 'Update-RogueDeviceDetector.ps1.sha256' -Value $updaterHash -NoNewline -Encoding ASCII
+
+          echo "sha256=$mainHash"          >> $env:GITHUB_OUTPUT
+          echo "updaterSha256=$updaterHash" >> $env:GITHUB_OUTPUT
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $tag     = '${{ steps.version.outputs.tag }}'
-          $version = '${{ steps.version.outputs.version }}'
-          $hash    = '${{ steps.hash.outputs.sha256 }}'
+          $tag         = '${{ steps.version.outputs.tag }}'
+          $version     = '${{ steps.version.outputs.version }}'
+          $hash        = '${{ steps.hash.outputs.sha256 }}'
+          $updaterHash = '${{ steps.hash.outputs.updaterSha256 }}'
 
           # Skip if release already exists (idempotent re-runs).
           $existing = gh release view $tag --json tagName 2>$null
@@ -88,12 +95,18 @@ jobs:
             exit 0
           }
 
-          $installCmd = '.\Update-RogueDeviceDetector.ps1 -ScriptPath "C:\Scripts\rdd\rogue-device-detector.ps1"'
+          $bootstrap = "iwr https://github.com/${{ github.repository }}/releases/latest/download/Update-RogueDeviceDetector.ps1 -OutFile `$env:TEMP\u.ps1; & `$env:TEMP\u.ps1"
+          $updateCmd = ".\Update-RogueDeviceDetector.ps1"
           $notes = "## Rogue Device Detector $tag`n`n" +
-                   "### Installation / Update`n" +
-                   "Run ``Update-RogueDeviceDetector.ps1`` via NinjaOne Script Library, or manually:`n" +
-                   "``````powershell`n$installCmd`n```````n`n" +
-                   "### SHA-256`n``````$hash  rogue-device-detector.ps1``````"
+                   "### Bootstrap (fresh host, unattended)`n" +
+                   "``````powershell`n$bootstrap`n```````n`n" +
+                   "Generates ``C:\Scripts\RDD\config.json`` with default-gateway as SMTP host (port 25, no auth).`n" +
+                   "Existing ``config.json`` files are never overwritten.`n`n" +
+                   "### Update existing host`n" +
+                   "``````powershell`n$updateCmd`n```````n`n" +
+                   "### SHA-256`n" +
+                   "``````$hash  rogue-device-detector.ps1`n" +
+                   "$updaterHash  Update-RogueDeviceDetector.ps1``````"
 
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           Set-Content -Path $notesFile -Value $notes -Encoding UTF8
@@ -102,4 +115,6 @@ jobs:
             --title "Rogue Device Detector $tag" `
             --notes-file $notesFile `
             rogue-device-detector.ps1 `
-            'rogue-device-detector.ps1.sha256'
+            'rogue-device-detector.ps1.sha256' `
+            Update-RogueDeviceDetector.ps1 `
+            'Update-RogueDeviceDetector.ps1.sha256'
