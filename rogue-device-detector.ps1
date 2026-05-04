@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.8'
+$SCRIPT_VERSION       = '1.3.9'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -195,6 +195,7 @@ function Get-Configuration {
         }
     }
 
+    $useSslExplicit = $false
     if (Test-Path $ConfigPath) {
         try {
             $file = Get-Content $ConfigPath -Raw | ConvertFrom-Json
@@ -215,13 +216,22 @@ function Get-Configuration {
                 if ($sp['password'] -and $file.smtp.password) { $cfg.smtp.password = $file.smtp.password }
                 if ($sp['from']     -and $file.smtp.from)     { $cfg.smtp.from     = $file.smtp.from }
                 if ($sp['to']       -and $file.smtp.to)       { $cfg.smtp.to       = $file.smtp.to }
-                if ($sp['useSsl']   -and $null -ne $file.smtp.useSsl) { $cfg.smtp.useSsl = [bool]$file.smtp.useSsl }
+                if ($sp['useSsl']   -and $null -ne $file.smtp.useSsl) {
+                    $cfg.smtp.useSsl = [bool]$file.smtp.useSsl
+                    $useSslExplicit  = $true
+                }
             }
         } catch {
             Write-RddLog "Could not parse config file '$ConfigPath': $_" -Level WARN
         }
     } else {
         Write-RddLog "Config file not found at '$ConfigPath'. Using defaults." -Level WARN
+    }
+
+    # Sane SMTP-SSL default: plain on port 25 (typical local relay), TLS otherwise.
+    # Honour an explicit useSsl value in the config without override.
+    if (-not $useSslExplicit) {
+        $cfg.smtp.useSsl = ($cfg.smtp.port -ne 25)
     }
 
     if ($SubnetOverride) { $cfg.subnet = $SubnetOverride }
