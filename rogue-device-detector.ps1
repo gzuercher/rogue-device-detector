@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.3'
+$SCRIPT_VERSION       = '1.3.4'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -1055,7 +1055,7 @@ To review the full baseline:
         Send-MailMessage @mailParams
         Write-RddLog "Alert sent to $($SmtpConfig.to)."
     } catch {
-        Write-RddLog "Failed to send alert: $_" -Level ERROR
+        Write-RddLog "Failed to send notification email via SMTP $($SmtpConfig.host):$($SmtpConfig.port) - $_" -Level ERROR
     }
 }
 
