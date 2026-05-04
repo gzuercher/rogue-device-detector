@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.1'
+$SCRIPT_VERSION       = '1.3.2'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -909,6 +909,20 @@ function Get-State {
             if (-not $d.PSObject.Properties['allowedPorts'] -or $null -eq $d.allowedPorts) {
                 $d | Add-Member -NotePropertyName 'allowedPorts' -NotePropertyValue @() -Force
             }
+            # Canonicalise each allowedPorts entry to PSCustomObject with .port (int).
+            # Tolerates legacy/manually-edited baselines using bare ints/strings.
+            $d.allowedPorts = @(@($d.allowedPorts) | ForEach-Object {
+                if ($null -eq $_) { return }
+                if ($_ -is [int] -or $_ -is [long] -or $_ -is [string]) {
+                    [PSCustomObject]@{
+                        port      = [int]$_
+                        allowedBy = ''
+                        allowedAt = ''
+                    }
+                } elseif ($_.PSObject.Properties['port']) {
+                    $_
+                }
+            })
         }
 
         # Ensure schemaVersion exists
