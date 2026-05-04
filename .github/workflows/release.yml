@@ -1,16 +1,21 @@
 name: Release
 
 on:
+  pull_request:
+    types: [closed]
+    branches: [main]
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write   # needed to create releases and upload assets
+  contents: write
 
 jobs:
   release:
-    runs-on: windows-latest   # required for Get-FileHash and PowerShell signing toolchain
+    # On PR events, only run for merged PRs. Always run on tag pushes.
+    if: github.event_name == 'push' || github.event.pull_request.merged == true
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -28,14 +33,35 @@ jobs:
           $tag = "v$version"
           Write-Host "Version: $version  Tag: $tag"
 
-          # Validate that the pushed tag matches the version in the script
-          $pushedTag = "${{ github.ref_name }}"
-          if ($pushedTag -ne $tag) {
-            throw "Tag mismatch: pushed '$pushedTag' but script declares '$tag'. Update `$SCRIPT_VERSION before tagging."
+          # On tag-push trigger, validate the pushed tag matches the script version.
+          if ('${{ github.event_name }}' -eq 'push') {
+            $pushedTag = '${{ github.ref_name }}'
+            if ($pushedTag -ne $tag) {
+              throw "Tag mismatch: pushed '$pushedTag' but script declares '$tag'. Update `$SCRIPT_VERSION before tagging."
+            }
           }
 
           echo "version=$version" >> $env:GITHUB_OUTPUT
           echo "tag=$tag"         >> $env:GITHUB_OUTPUT
+
+      - name: Create and push tag (PR-merge trigger only)
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+
+          # Skip if tag already exists on origin.
+          git fetch --tags --quiet
+          if ((git tag -l $tag) -or (git ls-remote --tags origin $tag)) {
+            Write-Host "Tag $tag already exists - skipping tag creation."
+            echo "TAG_PREEXISTING=true" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag $tag
+          git push origin $tag
 
       - name: Compute SHA-256
         id: hash
@@ -43,7 +69,6 @@ jobs:
         run: |
           $hash = (Get-FileHash rogue-device-detector.ps1 -Algorithm SHA256).Hash.ToLower()
           Write-Host "SHA-256: $hash"
-          # Write hash file (plain hex string, no filename suffix — updater reads first token)
           Set-Content -Path 'rogue-device-detector.ps1.sha256' -Value $hash -NoNewline -Encoding ASCII
           echo "sha256=$hash" >> $env:GITHUB_OUTPUT
 
@@ -52,9 +77,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
-          $tag     = "${{ steps.version.outputs.tag }}"
-          $version = "${{ steps.version.outputs.version }}"
-          $hash    = "${{ steps.hash.outputs.sha256 }}"
+          $tag     = '${{ steps.version.outputs.tag }}'
+          $version = '${{ steps.version.outputs.version }}'
+          $hash    = '${{ steps.hash.outputs.sha256 }}'
+
+          # Skip if release already exists (idempotent re-runs).
+          $existing = gh release view $tag --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists - skipping."
+            exit 0
+          }
 
           $installCmd = '.\Update-RogueDeviceDetector.ps1 -ScriptPath "C:\Scripts\rdd\rogue-device-detector.ps1"'
           $notes = "## Rogue Device Detector $tag`n`n" +
