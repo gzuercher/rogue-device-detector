@@ -10,5 +10,8 @@ oui.csv
 # Scan lock files
 *.lock
 
+# Audit log (generated at runtime)
+rdd-audit.csv
+
 # macOS
 .DS_Store
