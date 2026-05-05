@@ -2188,8 +2188,12 @@ try {
 
 # Resolve target subnet
 $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
-Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$(if ($LearningMode) { 'learning' } else { 'normal' })"
+$scanMode = if ($LearningMode) { 'learning' } elseif ($ApproveAllRogues) { 'approve-all' } else { 'normal' }
+Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$scanMode"
 Write-RddLog "Target subnet: $targetSubnet"
+if ($ApproveAllRogues) {
+    Write-RddLog '-ApproveAllRogues: running a full scan first - every device detected will be added to the baseline.'
+}
 $subnetInfo = Get-SubnetInfo -Cidr $targetSubnet
 
 # Load OUI vendor database
