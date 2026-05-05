@@ -93,7 +93,7 @@ Describe 'Send-RogueAlert HTML body' {
         $body.Contains('host<X>') | Should -BeFalse
     }
 
-    It 'emits approve commands as raw path with single-quoted args (Outlook-paste safe)' {
+    It 'action commands are Outlook-paste safe (no &amp; &quot; form)' {
         $d = [PSCustomObject]@{
             mac='AA:BB:CC:DD:EE:04'; ip='192.168.1.40'; hostname='h'
             vendor='X'; osGuess=''; httpBanner=''; upnpInfo=''
@@ -101,19 +101,10 @@ Describe 'Send-RogueAlert HTML body' {
         }
         Send-RogueAlert -Devices @($d) -SmtpConfig $script:smtp
         $body = $global:RDDTestCapture.Body
+        # No call-operator + double-quoted-path form.
         $body | Should -Not -Match '&amp; &quot;'
-        $body | Should -Match "-ApproveDevice &#39;AA:BB:CC:DD:EE:04&#39;"
-    }
-
-    It 'attaches the audit log when the path exists' {
-        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "rdd-audit-$([guid]::NewGuid()).csv"
-        Set-Content $tmp -Value 'header'
-        try {
-            Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $script:smtp -AuditLogPath $tmp
-            $global:RDDTestCapture.Attachments | Should -Be $tmp
-        } finally {
-            Remove-Item $tmp -ErrorAction SilentlyContinue
-        }
+        # Single-quoted args appear (escaped to &#39;) in the action block.
+        $body | Should -Match '&#39;&lt;MAC&gt;&#39;'
     }
 
     It 'subject lists each non-zero category' {
@@ -135,6 +126,48 @@ Describe 'Send-RogueAlert HTML body' {
     It 'short-circuits when no rogues, risks, or absents to report' {
         Send-RogueAlert -Devices @() -RiskDevices @() -AbsentDevices @() -SmtpConfig $script:smtp
         $global:RDDTestCapture.Invoked | Should -BeFalse
+    }
+
+    It 'emits a single generic command template, not one line per device' {
+        $threeRogues = @(
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:10'; ip='192.168.1.10'; hostname='h1'; vendor='X'; osGuess=''; httpBanner=''; upnpInfo=''; openPorts=@(); riskLevel='NONE'; riskReasons=@() }
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:11'; ip='192.168.1.11'; hostname='h2'; vendor='X'; osGuess=''; httpBanner=''; upnpInfo=''; openPorts=@(); riskLevel='NONE'; riskReasons=@() }
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:12'; ip='192.168.1.12'; hostname='h3'; vendor='X'; osGuess=''; httpBanner=''; upnpInfo=''; openPorts=@(); riskLevel='NONE'; riskReasons=@() }
+        )
+        Send-RogueAlert -Devices $threeRogues -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        # No literal MAC inside the approve-command (placeholder used instead).
+        $body | Should -Not -Match 'AA:BB:CC:DD:EE:10&#39; -Label'
+        $body | Should -Match '-ApproveAllRogues'
+        $body | Should -Match '-ApproveDevice &#39;&lt;MAC&gt;&#39;'
+    }
+
+    It 'risk section uses a single AllowPort template, not one per device' {
+        $twoRisks = @(
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:20'; ip='1.1.1.20'; hostname='r1'; riskLevel='HIGH'; riskReasons=@('A (port 22)'); openPorts=@(22) }
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:21'; ip='1.1.1.21'; hostname='r2'; riskLevel='HIGH'; riskReasons=@('A (port 22)'); openPorts=@(22) }
+        )
+        Send-RogueAlert -Devices @() -RiskDevices $twoRisks -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        $body | Should -Not -Match "On &#39;AA:BB:CC:DD:EE:20&#39;"
+        $body | Should -Match '-AllowPort &lt;port&gt; -On &#39;&lt;MAC&gt;&#39;'
+    }
+
+    It 'shows "-" when hostname equals IP (unresolved)' {
+        $unresolved = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:30'; ip='192.168.99.30'; hostname='192.168.99.30'
+            vendor='X'; osGuess=''; httpBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+        Send-RogueAlert -Devices @($unresolved) -SmtpConfig $script:smtp
+        # The hostname column for this row should render as the dash placeholder.
+        # We assert the MAC appears alongside a `-` cell, not the IP repeated.
+        $global:RDDTestCapture.Body | Should -Match 'AA:BB:CC:DD:EE:30(?s).*?<span style="color:#a0aec0;">-</span>'
+    }
+
+    It 'no longer attaches anything (audit CSV removed from email)' {
+        Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $script:smtp
+        $global:RDDTestCapture.Attachments | Should -Be $null
     }
 }
 

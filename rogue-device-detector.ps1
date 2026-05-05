@@ -162,7 +162,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.5.0'
+$SCRIPT_VERSION       = '1.5.1'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -1117,7 +1117,6 @@ function Send-RogueAlert {
     .PARAMETER AbsentDevices       Known devices not seen for >= absentDays.
     .PARAMETER IdentityChangeCount Count of hostname-change events this scan.
     .PARAMETER Subnet              Scanned subnet (for the email header).
-    .PARAMETER AuditLogPath        Path to audit CSV; attached if it exists.
     #>
     # Password is read from a plain-text config file; SecureString conversion at this
     # boundary is unavoidable without a full credential-store integration.
@@ -1131,8 +1130,7 @@ function Send-RogueAlert {
         [array]$RiskDevices = @(),
         [array]$AbsentDevices = @(),
         [int]$IdentityChangeCount = 0,
-        [string]$Subnet = '',
-        [string]$AuditLogPath = ''
+        [string]$Subnet = ''
     )
 
     if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
@@ -1215,7 +1213,7 @@ function Send-RogueAlert {
             $d         = $_
             $macCell   = & $esc $d.mac
             $ipCell    = & $esc $d.ip
-            $hostCell  = & $esc $d.hostname
+            $hostCell  = if ($d.hostname -and $d.hostname -ne $d.ip) { & $esc $d.hostname } else { '<span style="color:#a0aec0;">-</span>' }
             $vendor    = & $esc $d.vendor
             $os        = & $esc $d.osGuess
             $portsTxt  = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '<span style="color:#a0aec0;">-</span>' }
@@ -1233,9 +1231,15 @@ function Send-RogueAlert {
 "@
         }) -join "`n"
 
-        $approveCmds = ($Devices | ForEach-Object {
-            "$invokeToken -ApproveDevice '$($_.mac)' -Label '<description>'"
-        }) -join "`n"
+        # One generic command per use case, not per MAC. Operator copies the
+        # MAC from the table and substitutes the placeholder.
+        $approveCmds = @(
+            "# Accept every rogue listed above in one go:"
+            "$invokeToken -ApproveAllRogues"
+            ""
+            "# Or accept a single device (replace <MAC> from the table above):"
+            "$invokeToken -ApproveDevice '<MAC>' -Label '<description>'"
+        ) -join "`n"
 
         $rogueSection = @"
 <h2 style="$h2Style border-left-color:#dc2626;">Rogue Devices ($($Devices.Count))</h2>
@@ -1255,7 +1259,7 @@ function Send-RogueAlert {
 $rows
 </tbody>
 </table>
-<div style="$actionLabel">If authorized, approve on $(& $esc $hostname):</div>
+<div style="$actionLabel">Actions on $(& $esc $hostname):</div>
 $(& $codeBlock $approveCmds)
 "@
     }
@@ -1267,7 +1271,7 @@ $(& $codeBlock $approveCmds)
             $d        = $_
             $macCell  = & $esc $d.mac
             $ipCell   = & $esc $d.ip
-            $hostCell = & $esc $d.hostname
+            $hostCell = if ($d.hostname -and $d.hostname -ne $d.ip) { & $esc $d.hostname } else { '<span style="color:#a0aec0;">-</span>' }
             $reasons  = if ($d.riskReasons) { & $esc ($d.riskReasons -join '; ') } else { '' }
             $portsTxt = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '-' }
             $riskHtml = & $riskBadge $d.riskLevel
@@ -1283,9 +1287,9 @@ $(& $codeBlock $approveCmds)
 "@
         }) -join "`n"
 
-        $allowCmds = ($RiskDevices | ForEach-Object {
-            "$invokeToken -AllowPort <port> -On '$($_.mac)'"
-        }) -join "`n"
+        # One generic template, not per MAC. Operator picks the MAC from the
+        # table above and the port(s) from the Open Ports column.
+        $allowCmds = "$invokeToken -AllowPort <port> -On '<MAC>'"
 
         $riskSection = @"
 <h2 style="$h2Style border-left-color:#ea580c;">Risk Findings on Known Devices ($($RiskDevices.Count))</h2>
@@ -1304,7 +1308,7 @@ $(& $codeBlock $approveCmds)
 $rows
 </tbody>
 </table>
-<div style="$actionLabel">If a port is intentional, allow it (replace &lt;port&gt;):</div>
+<div style="$actionLabel">If a port is intentional, allow it (replace &lt;MAC&gt; from the table and &lt;port&gt; from Open Ports):</div>
 $(& $codeBlock $allowCmds)
 "@
     }
@@ -1338,9 +1342,6 @@ $rows
     }
 
     # ---- Footer ----
-    $auditNote = if ($AuditLogPath -and (Test-Path $AuditLogPath)) {
-        "Full audit log attached as <code style=`"background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;`">$(& $esc (Split-Path $AuditLogPath -Leaf))</code>."
-    } else { '' }
     $listCmd = & $esc "$invokeToken -ListDevices"
 
     # ---- Assemble ----
@@ -1369,8 +1370,7 @@ $riskSection
 $absentSection
 
 <div style="padding:14px 24px;background:#f7fafc;font-size:12px;color:#718096;border-top:1px solid #e2e8f0;line-height:1.6;">
-$auditNote<br>
-Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;">$listCmd</code> for the full baseline.
+Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;">$listCmd</code> on $(& $esc $hostname) for the full baseline.
 </div>
 
 </div>
@@ -1397,10 +1397,6 @@ Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:
         SmtpServer = $SmtpConfig.host
         Port       = [int]$SmtpConfig.port
         UseSsl     = $useSsl
-    }
-
-    if ($AuditLogPath -and (Test-Path $AuditLogPath)) {
-        $mailParams.Attachments = $AuditLogPath
     }
 
     if ($SmtpConfig.user) {
@@ -2248,7 +2244,6 @@ if ($cfg.summaryReport) {
                 -AbsentDevices $absentDevices `
                 -IdentityChangeCount $identityChanges.Count `
                 -Subnet $targetSubnet `
-                -AuditLogPath $cfg.logPath `
                 -SmtpConfig $cfg.smtp
         }
     } else {
