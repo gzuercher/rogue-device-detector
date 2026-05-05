@@ -162,7 +162,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.5.3'
+$SCRIPT_VERSION       = '1.5.4'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 4
@@ -227,15 +227,16 @@ function Get-Configuration {
     )
 
     $cfg = @{
-        subnet        = ''
-        statePath     = Join-Path $PSScriptRoot 'state.json'
-        ouiPath       = Join-Path $PSScriptRoot 'oui.csv'
-        logPath       = Join-Path $PSScriptRoot 'rdd-audit.csv'
-        enrichment    = $true
-        absentDays    = $ABSENT_DAYS_DEFAULT
-        summaryReport = $false
-        configured    = $true
-        smtp          = @{
+        subnet         = ''
+        statePath      = Join-Path $PSScriptRoot 'state.json'
+        ouiPath        = Join-Path $PSScriptRoot 'oui.csv'
+        logPath        = Join-Path $PSScriptRoot 'rdd-audit.csv'
+        enrichment     = $true
+        absentDays     = $ABSENT_DAYS_DEFAULT
+        summaryReport  = $false
+        configured     = $true
+        alertRiskLevel = 'HIGH'    # NONE | LOW | MEDIUM | HIGH | CRITICAL
+        smtp           = @{
             host     = ''
             port     = 587
             user     = ''
@@ -259,6 +260,14 @@ function Get-Configuration {
             if ($p['absentDays'] -and $null -ne $file.absentDays) { $cfg.absentDays = [int]$file.absentDays }
             if ($p['summaryReport'] -and $null -ne $file.summaryReport) { $cfg.summaryReport = [bool]$file.summaryReport }
             if ($p['configured']    -and $null -ne $file.configured)    { $cfg.configured    = [bool]$file.configured }
+            if ($p['alertRiskLevel'] -and $file.alertRiskLevel) {
+                $val = ([string]$file.alertRiskLevel).ToUpper()
+                if ($val -in @('NONE','LOW','MEDIUM','HIGH','CRITICAL')) {
+                    $cfg.alertRiskLevel = $val
+                } else {
+                    Write-RddLog "Invalid alertRiskLevel '$val' in config; falling back to '$($cfg.alertRiskLevel)'." -Level WARN
+                }
+            }
             if ($p['smtp'] -and $null -ne $file.smtp) {
                 $sp = $file.smtp.PSObject.Properties
                 if ($sp['host']     -and $file.smtp.host)     { $cfg.smtp.host     = $file.smtp.host }
@@ -2411,12 +2420,13 @@ foreach ($device in $foundDevices) {
     $device.riskLevel   = $filtered.Level
     $device.riskReasons = $filtered.Reasons
 
-    if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
-        # Both rogues and known devices with HIGH/CRITICAL risk are added to
-        # the Risk-Findings table. The Rogue table is the identity view; the
-        # Risk table is the security view. A risky rogue appears in both -
-        # without the security view, removing the Risk column from rogue
-        # rows would have hidden the alarm.
+    # Threshold from config.alertRiskLevel (default HIGH).
+    #   NONE     -> risk section entirely disabled (operator opt-out)
+    #   LOW/MED/HIGH/CRITICAL -> include findings at-or-above this level
+    # Both rogues and known devices meeting the threshold land in the
+    # Risk-Findings table - rogue + risk are two lenses on the same device.
+    if ($cfg.alertRiskLevel -ne 'NONE' -and
+        $RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER[$cfg.alertRiskLevel]) {
         Write-AuditLog -LogPath $cfg.logPath -EventName 'RISK_FOUND' -Device $device `
             -Details ($device.riskReasons -join '; ')
         $riskDevices.Add($device)

@@ -35,7 +35,8 @@ Scheduled execution (any scheduler, recommended: weekly)
        │         └─ Print simulated alert to console for new devices
        └─ 11b. Learning Mode OFF → delta (new MACs only):
                 ├─ Send alert email or summary report via SMTP
-                ├─ Log RISK_FOUND for known devices with HIGH/CRITICAL risk
+                ├─ Log RISK_FOUND for devices at or above config.alertRiskLevel
+                │     (default HIGH; "NONE" disables the entire risk section)
                 ├─ Log DEVICE_ABSENT / DEVICE_CHANGED events
                 ├─ Write audit log entries
                 └─ Exit with bitmask code for RMM integration
@@ -101,7 +102,7 @@ Events logged (minimal noise principle):
 | `SCAN_DONE` | Every scan run (summary: found/rogue/risks counts) |
 | `DEVICE_NEW` | Learning mode: new device added to baseline |
 | `DEVICE_ROGUE` | Normal scan: unknown device detected |
-| `RISK_FOUND` | Normal scan: known device with HIGH or CRITICAL risk (after allowlist filtering) |
+| `RISK_FOUND` | Normal scan: device at or above `config.alertRiskLevel` (default `HIGH`; `NONE` disables) after allowlist filtering. Both rogue and known devices land here when they cross the threshold |
 | `DEVICE_CHANGED` | Hostname changed since last scan (identity change) |
 | `DEVICE_ABSENT` | Device not seen for longer than `absentDays` |
 | `DEVICE_APPROVED` | Device manually approved via `-ApproveDevice` |

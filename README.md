@@ -175,6 +175,7 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
   "absentDays": 21,
   "summaryReport": false,
   "configured": true,
+  "alertRiskLevel": "HIGH",
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
@@ -197,6 +198,7 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
 | `absentDays` | `21` | Days without a sighting before a device is flagged as absent. |
 | `summaryReport` | `false` | Send a full network health report after every scan (not just rogue alerts). |
 | `configured` | `true` | Safety gate. The unattended installer writes `false`; normal scan mode refuses to run until you flip it to `true` after reviewing this file. `-LearningMode` and admin modes (`-ListDevices`, `-ApproveDevice`, …) bypass the gate. |
+| `alertRiskLevel` | `HIGH` | Threshold for the Risk-Findings table / mail. `NONE` disables the section entirely; `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` is the lowest level reported. See [Risk-alert threshold](#risk-alert-threshold-alertrisklevel) below. |
 | `smtp.host` | – | SMTP server hostname. |
 | `smtp.port` | `587` | SMTP port. |
 | `smtp.user` | – | SMTP username. Optional; alerts skip silently if blank. |
@@ -208,6 +210,26 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
 All path values must include the full filename. Backslashes must be escaped as `\\` in JSON.
 
 `state.json`, `oui.csv`, and `rdd-audit.csv` are also excluded from git.
+
+### Risk-alert threshold (`alertRiskLevel`)
+
+Controls how chatty the Risk-Findings table in the email is. The level a
+device is assigned comes from the worst port on that device (see the
+port→risk mapping in [ARCHITECTURE.md](ARCHITECTURE.md#security-ports-monitored)).
+
+| Setting | Risk-Findings section behaviour | Typical noise level |
+|---------|---------------------------------|---------------------|
+| `NONE` | Section disabled. No risk row, no `RISK_FOUND` audit entry, no risk count in the subject. | Silent |
+| `CRITICAL` | Telnet only (any other CRITICAL port additions live here too). | Very quiet |
+| `HIGH` (default) | FTP, SMB, RDP, **+** CRITICAL. Sane default for most networks. | Quiet |
+| `MEDIUM` | Adds exposed SMTP. | Moderate |
+| `LOW` | Adds SSH and HTTP — every device with any monitored port shows up. | Chatty |
+
+Invalid values fall back to `HIGH` with a WARN line in the console log.
+Rogues with a port at-or-above the threshold appear in **both** the Rogue
+table (identity view) and the Risk-Findings table (security view). Per-
+device port allowlisting via `-AllowPort` is applied before the threshold
+check, so an explicitly-allowed RDP on a known terminal server stays out.
 
 ### Audit log rotation
 
@@ -254,7 +276,7 @@ The script returns a bitmask exit code for use with any RMM or Intune:
 |------|---------|
 | `0`  | Clean — no issues found |
 | `1`  | Rogue (unknown) devices detected |
-| `2`  | Known devices with HIGH/CRITICAL risk ports |
+| `2`  | Devices with risk findings at or above `config.alertRiskLevel` (default `HIGH`) |
 | `4`  | Devices absent for longer than `absentDays` |
 
 Codes combine: e.g. `3` = rogue devices **and** risk findings, `5` = rogue **and** absent.
