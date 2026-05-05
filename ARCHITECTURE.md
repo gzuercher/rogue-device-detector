@@ -13,6 +13,7 @@ Scheduled execution (any scheduler, recommended: weekly)
   └─ PowerShell Script
        ├─ 1. Load config (config.json + parameter overrides)
        ├─ 1b. Validate output paths (statePath, logPath, ouiPath) for writability
+       ├─ 1c. Safety gate: refuse normal-scan path if config.configured == false
        ├─ 2. Determine subnet (auto-detect from NIC or config override)
        ├─ 2b. Acquire scan lock (exclusive lock file prevents concurrent scans)
        ├─ 3. Ping sweep → populate ARP cache (async, ~500ms for /24)
@@ -155,7 +156,8 @@ Mutually exclusive parameter sets enforce valid CLI combinations:
 - **Identity change detection** — Alerts when a known device's hostname changes
 - **Absent device detection** — Flags devices not seen for configurable number of days
 - **Learning mode** — Baseline creation: merges found devices into state, no alerts
-- **SMTP alert** — Enriched with ports, risk, banner, UPnP, OS info; Azure ACS compatible
+- **HTML SMTP alert** — Inline-styled email with per-section tables (Rogue / Risk / Absent), color-coded risk badges, copy-paste-safe action commands, and the audit CSV attached. Sent only when something is to report. Azure ACS compatible
+- **Safety gate** — `config.configured` defaults to `false` in installer-generated configs; the main script refuses normal scans until an operator reviews the config and flips the flag. `-LearningMode` and admin modes bypass the gate
 - **Summary report** — Optional comprehensive network health email with OS breakdown
 - **RMM exit codes** — Bitmask exit code (0=clean, 1=rogue, 2=risk, 4=absent) for any RMM/Intune
 - **Portable state file** — JSON, path configurable, versioned schema with auto-migration
@@ -170,6 +172,36 @@ Mutually exclusive parameter sets enforce valid CLI combinations:
 - Vulnerability scanning
 - Web UI or dashboard
 - Cloud backend or external API dependencies
+
+## Deployment Pipeline
+
+Three-layer install/update model designed for unattended RMM rollouts:
+
+```
+RMM (NinjaOne / ConnectWise / Intune / etc.)
+  └─ ~10-line bootstrap snippet (copy-paste once into the RMM)
+       ├─ Downloads Update-RogueDeviceDetector.ps1 from the latest GitHub Release
+       ├─ Verifies SHA-256 against the published .sha256 sidecar
+       └─ Executes the updater
+            ├─ On a fresh host:
+            │    ├─ Creates C:\Scripts\RDD\ and C:\Scripts\RDD\var\
+            │    ├─ Downloads + verifies + installs rogue-device-detector.ps1
+            │    ├─ Generates a default config.json with "configured": false
+            │    │    └─ SMTP host auto-detected from default gateway, port 25, no auth
+            │    └─ Prints next-steps reminder
+            └─ On an existing host:
+                 ├─ Compares installed $SCRIPT_VERSION to latest release
+                 ├─ Updates the script in place if newer (creates .backup first)
+                 └─ Leaves config.json, state.json, audit log untouched
+```
+
+**Idempotency.** Re-running the bootstrap is always safe. An existing
+`config.json` is never overwritten by the updater; the safety gate enforces
+that operators consciously transition from default to live state.
+
+**Trust boundary.** The bootstrap's SHA-256 check protects against transit
+corruption. Repo-compromise mitigation (code-signing the updater) is tracked
+in `ROADMAP.md`.
 
 ## Code Quality
 

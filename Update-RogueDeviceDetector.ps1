@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Installs or updates rogue-device-detector.ps1 from the latest GitHub Release.

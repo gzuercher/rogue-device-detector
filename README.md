@@ -16,11 +16,14 @@ notepad config.json
 # 2. Run in learning mode to build the baseline (no alerts sent)
 .\rogue-device-detector.ps1 -LearningMode
 
-# 3. Review the baseline — remove anything that shouldn't be trusted
+# 3. Review the baseline; -RemoveDevice can be used to drop entries
 .\rogue-device-detector.ps1 -ListDevices
 
 # 4. Schedule regular scans (see Scheduling section below)
 ```
+
+For unattended deployment via an RMM (NinjaOne / ConnectWise / Intune /
+generic), see **[Unattended Install (RMM)](#unattended-install-rmm)** below.
 
 ## Unattended Install (RMM)
 
@@ -51,6 +54,10 @@ refuses to run a normal scan until you review the file (smtp settings in
 particular) and flip the flag to `true`. `-LearningMode` and the device-
 management modes (`-ListDevices`, `-ApproveDevice`, etc.) work without the
 flag, so you can seed the baseline before going live.
+
+Re-running the same snippet on an existing host updates the script in place
+to the latest release. The existing `config.json`, `state.json`, and audit
+log are left untouched.
 
 ## Requirements
 
@@ -150,13 +157,15 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
   "enrichment": true,
   "absentDays": 21,
   "summaryReport": false,
+  "configured": true,
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
     "user": "alerts@example.com",
     "password": "your-smtp-password",
     "from": "rdd@example.com",
-    "to": "helpdesk@example.com"
+    "to": "helpdesk@example.com",
+    "useSsl": true
   }
 }
 ```
@@ -170,12 +179,14 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
 | `enrichment` | `true` | Set to `false` to skip port scan / banner / UPnP (faster scan). |
 | `absentDays` | `21` | Days without a sighting before a device is flagged as absent. |
 | `summaryReport` | `false` | Send a full network health report after every scan (not just rogue alerts). |
+| `configured` | `true` | Safety gate. The unattended installer writes `false`; normal scan mode refuses to run until you flip it to `true` after reviewing this file. `-LearningMode` and admin modes (`-ListDevices`, `-ApproveDevice`, …) bypass the gate. |
 | `smtp.host` | – | SMTP server hostname. |
-| `smtp.port` | `587` | SMTP port (STARTTLS). |
-| `smtp.user` | – | SMTP username. |
+| `smtp.port` | `587` | SMTP port. |
+| `smtp.user` | – | SMTP username. Optional; alerts skip silently if blank. |
 | `smtp.password` | – | SMTP password. |
 | `smtp.from` | – | Sender email address. |
 | `smtp.to` | – | Alert recipient email address. |
+| `smtp.useSsl` | port-derived | `true` enables TLS (587/465). When omitted, defaults to `false` for port 25 (typical local relay) and `true` otherwise. Explicit value always wins. |
 
 All path values must include the full filename. Backslashes must be escaped as `\\` in JSON.
 
@@ -183,36 +194,26 @@ All path values must include the full filename. Backslashes must be escaped as `
 
 ## Alerts
 
-### Rogue Device Alert
+The default alert (`summaryReport: false`) is an HTML email sent only when
+the scan finds something to report — at least one rogue, risk finding, or
+absent device. The current scan's `rdd-audit.csv` is attached.
 
-When unknown devices are found, an email is sent with MAC, IP, hostname, vendor, OS guess, and open ports for each device. The email includes a copy-paste command to approve the device:
+The body has:
 
-```
-ROGUE: AA:BB:CC:DD:EE:FF  192.168.8.215  unknown-host  [Unknown vendor]
-  -> Approve: & "C:\Scripts\rdd\rogue-device-detector.ps1" -ApproveDevice "AA:BB:CC:DD:EE:FF" -Label "<description>"
-```
+- **Header** with scanner host, timestamp, and subnet.
+- **Summary** with colored badges per category (rogue / risk / absent / hostname-changes).
+- **Rogue Devices** table — MAC, IP, hostname, vendor, OS, open ports, risk level. One copy-paste-ready `-ApproveDevice` command listed below the table for each rogue.
+- **Risk Findings on Known Devices** table — MAC, IP, hostname, level badge, reasons, open ports. One `-AllowPort <port> -On '<mac>'` template per device below the table.
+- **Absent Devices** table — MAC, label, last-seen timestamp.
 
-### Risk Warning
-
-When a known device has risky open ports (HIGH or CRITICAL), the alert includes a command to allow the port:
-
-```
-RISK [HIGH]: 192.168.8.21 fileserver.local - Remote Desktop exposed (port 3389)
-  -> If expected: & "C:\Scripts\rdd\rogue-device-detector.ps1" -AllowPort 3389 -On "AA:BB:CC:DD:EE:FF"
-```
+Risk-level badges use a consistent color scale: CRITICAL = red, HIGH = orange, MEDIUM = amber, LOW = yellow.
 
 ### Summary Report
 
-Set `"summaryReport": true` to receive a comprehensive network health email after every scan:
-
-- Device counts (scanned, baseline, rogue, absent, risks)
-- Rogue device details with approve commands
-- Absent devices (not seen for `absentDays`+ days)
-- Risk findings on known devices with allow commands
-- Identity changes (hostname changed since last scan)
-- OS breakdown
-
-When `summaryReport` is `false` (default), only rogue device alerts are sent.
+Set `"summaryReport": true` for a plain-text comprehensive report after every
+scan (not just on findings). Includes everything above plus identity changes
+and a baseline-size line. Useful for weekly health check-ins where the
+absence of an email would itself be a signal.
 
 ## Exit Codes (RMM Integration)
 
@@ -273,8 +274,9 @@ Arguments: -NonInteractive -ExecutionPolicy Bypass -File "C:\Scripts\rdd\rogue-d
 - The scan continues without vendor names. Delete the cached `oui.csv` to force a fresh download.
 
 **SMTP alerts not sending**
-- Check `config.json` for correct `smtp.host`, `smtp.port`, `smtp.user`, and `smtp.password`.
-- Port 587 (STARTTLS) is the default. Some providers require port 465 (implicit TLS), which is not supported by `Send-MailMessage`.
+- Check `config.json` for correct `smtp.host`, `smtp.port`, `smtp.from`, and `smtp.to`. Alerts skip silently if any of those three are blank.
+- TLS error like *"Das Remotezertifikat ist laut Validierungsverfahren ungültig"*: set `smtp.useSsl: false` for plain SMTP (typical for port 25 local relays). When omitted, `useSsl` is auto-derived from the port (false for 25, true otherwise) — explicit values always win.
+- Port 587 (STARTTLS) is the typical authenticated submission port. Port 465 (implicit TLS) is not supported by `Send-MailMessage`.
 - Verify connectivity: `Test-NetConnection -ComputerName smtp.example.com -Port 587`.
 - Azure Communication Services SMTP requires the full connection string as username.
 
