@@ -52,29 +52,36 @@
     MAC address of the device to modify when using -AllowPort or -BlockPort.
 
 .EXAMPLE
-    # First-time setup - establish baseline
     .\rogue-device-detector.ps1 -LearningMode
+    First-time setup: merge every found device into the baseline without alerts.
 
-    # Regular scan (run via scheduler)
+.EXAMPLE
     .\rogue-device-detector.ps1
+    Regular scan; sends an alert email if rogue/risk/absent devices are found.
 
-    # Override subnet
+.EXAMPLE
     .\rogue-device-detector.ps1 -Subnet "10.0.1.0/24"
+    Override the auto-detected subnet for a single run.
 
-    # Approve a specific device from an alert (copy-paste the command from the email)
+.EXAMPLE
     .\rogue-device-detector.ps1 -ApproveDevice "AA:BB:CC:DD:EE:FF" -Label "John's laptop"
+    Approve a single device from an alert without re-scanning.
 
-    # Remove a device that left the network
+.EXAMPLE
     .\rogue-device-detector.ps1 -RemoveDevice "AA:BB:CC:DD:EE:FF"
+    Remove a device that left the network.
 
-    # Show all approved devices
+.EXAMPLE
     .\rogue-device-detector.ps1 -ListDevices
+    Print all approved devices in the baseline.
 
-    # Allow ports 80 and 443 on a device
+.EXAMPLE
     .\rogue-device-detector.ps1 -AllowPort 80,443 -On "AA:BB:CC:DD:EE:FF"
+    Allowlist ports 80 and 443 on a known device (suppresses risk warnings).
 
-    # Block port 23 on a device
+.EXAMPLE
     .\rogue-device-detector.ps1 -BlockPort 23 -On "AA:BB:CC:DD:EE:FF"
+    Revoke a previously allowlisted port.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
@@ -1585,14 +1592,15 @@ function Send-SummaryReport {
     if ($Report.rogueDevices.Count -gt 0) {
         $lines.Add('')
         $lines.Add('--- Rogue Devices ---')
-        $scriptPath = $PSCommandPath
+        $scriptPath  = $PSCommandPath
+        $invokeToken = if ($scriptPath -match '\s') { "& '$scriptPath'" } else { $scriptPath }
         foreach ($d in $Report.rogueDevices) {
             $os = if ($d.osGuess) { "  OS: $($d.osGuess)" } else { '' }
             $lines.Add("  $($d.mac)  $($d.ip)  $($d.hostname)  [$($d.vendor)]$os")
             if ($d.riskLevel -and $d.riskLevel -ne 'NONE') {
                 $lines.Add("    RISK: [$($d.riskLevel)] $($d.riskReasons -join '; ')")
             }
-            $lines.Add("    -> Approve: & `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<description>`"")
+            $lines.Add("    -> Approve: $invokeToken -ApproveDevice '$($d.mac)' -Label '<description>'")
         }
     }
 
@@ -1609,13 +1617,14 @@ function Send-SummaryReport {
     if ($Report.riskDevices.Count -gt 0) {
         $lines.Add('')
         $lines.Add('--- Risk Findings (known devices) ---')
-        $scriptPath = $PSCommandPath
+        $scriptPath  = $PSCommandPath
+        $invokeToken = if ($scriptPath -match '\s') { "& '$scriptPath'" } else { $scriptPath }
         foreach ($d in $Report.riskDevices) {
             $lines.Add("  [$($d.riskLevel)] $($d.ip) ($($d.hostname)) - $($d.riskReasons -join '; ')")
             foreach ($reason in $d.riskReasons) {
                 if ($reason -match '\(port (\d+)\)') {
                     $port = $Matches[1]
-                    $lines.Add("    -> If expected: & `"$scriptPath`" -AllowPort $port -On `"$($d.mac)`"")
+                    $lines.Add("    -> If expected: $invokeToken -AllowPort $port -On '$($d.mac)'")
                 }
             }
         }
