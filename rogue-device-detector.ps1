@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.4.0'
+$SCRIPT_VERSION       = '1.4.1'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -1026,6 +1026,13 @@ function Send-RogueAlert {
     $hostname   = $env:COMPUTERNAME
     $timestamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
+    # Build a copy-paste-safe path token. Outlook can mangle '& "..."' on
+    # paste (drops the leading '& "' and trailing '"'). For paths without
+    # whitespace we emit the raw path so the line works even if quoting
+    # gets stripped. For paths with spaces we fall back to the call operator
+    # with single-quoted path (single quotes survive copy-paste better).
+    $invokeToken = if ($scriptPath -match '\s') { "& '$scriptPath'" } else { $scriptPath }
+
     $esc = {
         param($t)
         if ($null -eq $t) { return '' }
@@ -1048,13 +1055,15 @@ function Send-RogueAlert {
     $codeBlock = {
         param($Code)
         $safe = & $esc $Code
-        "<pre style=`"background:#1a202c;color:#cbd5e0;padding:10px 12px;margin:0;font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;`">$safe</pre>"
+        "<pre style=`"background:#1a202c;color:#cbd5e0;padding:10px 12px;margin:0 24px 8px;font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;`">$safe</pre>"
     }
 
-    $thStyle = 'padding:10px;font-weight:600;color:#4a5568;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;background:#edf2f7;border-bottom:2px solid #cbd5e0;'
-    $tdStyle = 'padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:13px;'
-    $tdMono  = "$tdStyle font-family:Consolas,Monaco,monospace;font-size:12px;"
-    $actionTd = 'padding:0 10px 12px;border-bottom:1px solid #e2e8f0;background:#fafafa;'
+    $thStyle     = 'padding:10px;font-weight:600;color:#4a5568;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;background:#edf2f7;border-bottom:2px solid #cbd5e0;'
+    $tdStyle     = 'padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:13px;'
+    $tdMono      = "$tdStyle font-family:Consolas,Monaco,monospace;font-size:12px;"
+    $h2Style     = 'font-size:15px;margin:18px 24px 8px;color:#1a202c;font-weight:600;border-left:4px solid;padding-left:10px;'
+    $tableStyle  = 'width:auto;min-width:calc(100% - 48px);margin:0 24px;border-collapse:collapse;border:1px solid #e2e8f0;'
+    $actionLabel = 'font-size:11px;color:#718096;margin:10px 24px 4px;text-transform:uppercase;letter-spacing:0.4px;font-weight:600;'
 
     $criticalCount = @($RiskDevices | Where-Object { $_.riskLevel -eq 'CRITICAL' }).Count
     $highCount     = @($RiskDevices | Where-Object { $_.riskLevel -eq 'HIGH' }).Count
@@ -1088,8 +1097,6 @@ function Send-RogueAlert {
             $os        = & $esc $d.osGuess
             $portsTxt  = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '<span style="color:#a0aec0;">-</span>' }
             $riskHtml  = if ($d.riskLevel -and $d.riskLevel -ne 'NONE') { & $riskBadge $d.riskLevel } else { '<span style="color:#a0aec0;">-</span>' }
-            $cmd       = "& `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<device description>`""
-            $cmdHtml   = & $codeBlock $cmd
             @"
 <tr>
 <td style="$tdMono white-space:nowrap;">$macCell</td>
@@ -1100,18 +1107,16 @@ function Send-RogueAlert {
 <td style="$tdMono">$portsTxt</td>
 <td style="$tdStyle text-align:center;">$riskHtml</td>
 </tr>
-<tr>
-<td colspan="7" style="$actionTd">
-<div style="font-size:11px;color:#718096;margin:6px 0 4px;">If authorized, approve on $(& $esc $hostname):</div>
-$cmdHtml
-</td>
-</tr>
 "@
         }) -join "`n"
 
+        $approveCmds = ($Devices | ForEach-Object {
+            "$invokeToken -ApproveDevice '$($_.mac)' -Label '<description>'"
+        }) -join "`n"
+
         $rogueSection = @"
-<h2 style="font-size:15px;margin:24px 24px 12px;color:#1a202c;font-weight:600;border-left:4px solid #dc2626;padding-left:10px;">Rogue Devices ($($Devices.Count))</h2>
-<table cellpadding="0" cellspacing="0" style="width:auto;min-width:100%;margin:0 24px 16px;border-collapse:collapse;border:1px solid #e2e8f0;">
+<h2 style="$h2Style border-left-color:#dc2626;">Rogue Devices ($($Devices.Count))</h2>
+<table cellpadding="0" cellspacing="0" style="$tableStyle">
 <thead>
 <tr>
 <th align="left" style="$thStyle">MAC</th>
@@ -1127,6 +1132,8 @@ $cmdHtml
 $rows
 </tbody>
 </table>
+<div style="$actionLabel">If authorized, approve on $(& $esc $hostname):</div>
+$(& $codeBlock $approveCmds)
 "@
     }
 
@@ -1141,8 +1148,6 @@ $rows
             $reasons  = if ($d.riskReasons) { & $esc ($d.riskReasons -join '; ') } else { '' }
             $portsTxt = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '-' }
             $riskHtml = & $riskBadge $d.riskLevel
-            $cmd      = "& `"$scriptPath`" -AllowPort <port> -On `"$($d.mac)`""
-            $cmdHtml  = & $codeBlock $cmd
             @"
 <tr>
 <td style="$tdMono white-space:nowrap;">$macCell</td>
@@ -1152,18 +1157,16 @@ $rows
 <td style="$tdStyle color:#4a5568;">$reasons</td>
 <td style="$tdMono">$portsTxt</td>
 </tr>
-<tr>
-<td colspan="6" style="$actionTd">
-<div style="font-size:11px;color:#718096;margin:6px 0 4px;">If a port is intentional, allow it (replace &lt;port&gt;):</div>
-$cmdHtml
-</td>
-</tr>
 "@
         }) -join "`n"
 
+        $allowCmds = ($RiskDevices | ForEach-Object {
+            "$invokeToken -AllowPort <port> -On '$($_.mac)'"
+        }) -join "`n"
+
         $riskSection = @"
-<h2 style="font-size:15px;margin:24px 24px 12px;color:#1a202c;font-weight:600;border-left:4px solid #ea580c;padding-left:10px;">Risk Findings on Known Devices ($($RiskDevices.Count))</h2>
-<table cellpadding="0" cellspacing="0" style="width:auto;min-width:100%;margin:0 24px 16px;border-collapse:collapse;border:1px solid #e2e8f0;">
+<h2 style="$h2Style border-left-color:#ea580c;">Risk Findings on Known Devices ($($RiskDevices.Count))</h2>
+<table cellpadding="0" cellspacing="0" style="$tableStyle">
 <thead>
 <tr>
 <th align="left" style="$thStyle">MAC</th>
@@ -1178,6 +1181,8 @@ $cmdHtml
 $rows
 </tbody>
 </table>
+<div style="$actionLabel">If a port is intentional, allow it (replace &lt;port&gt;):</div>
+$(& $codeBlock $allowCmds)
 "@
     }
 
@@ -1193,8 +1198,8 @@ $rows
         }) -join "`n"
 
         $absentSection = @"
-<h2 style="font-size:15px;margin:24px 24px 12px;color:#1a202c;font-weight:600;border-left:4px solid #718096;padding-left:10px;">Absent Devices ($($AbsentDevices.Count))</h2>
-<table cellpadding="0" cellspacing="0" style="width:auto;min-width:100%;margin:0 24px 16px;border-collapse:collapse;border:1px solid #e2e8f0;">
+<h2 style="$h2Style border-left-color:#718096;">Absent Devices ($($AbsentDevices.Count))</h2>
+<table cellpadding="0" cellspacing="0" style="$tableStyle margin-bottom:8px;">
 <thead>
 <tr>
 <th align="left" style="$thStyle">MAC</th>
@@ -1213,7 +1218,7 @@ $rows
     $auditNote = if ($AuditLogPath -and (Test-Path $AuditLogPath)) {
         "Full audit log attached as <code style=`"background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;`">$(& $esc (Split-Path $AuditLogPath -Leaf))</code>."
     } else { '' }
-    $listCmd = & $esc "& `"$scriptPath`" -ListDevices"
+    $listCmd = & $esc "$invokeToken -ListDevices"
 
     # ---- Assemble ----
     $subnetDisplay = if ($Subnet) { " &middot; subnet $(& $esc $Subnet)" } else { '' }
