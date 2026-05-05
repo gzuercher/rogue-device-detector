@@ -437,6 +437,12 @@ Describe 'Get-AbsentDevices' {
         $result | Should -HaveCount 0
     }
 
+    It 'accepts an empty baseline and returns nothing' {
+        $now = '2024-06-01T00:00:00Z'
+        $result = @(Get-AbsentDevices -KnownDevices @() -AbsentDays 21 -Now $now)
+        $result | Should -HaveCount 0
+    }
+
     It 'returns all absent devices when multiple are past threshold' {
         $now = '2024-06-01T00:00:00Z'
         $devices = @(
