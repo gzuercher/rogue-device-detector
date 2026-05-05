@@ -227,7 +227,7 @@ network is unchanged.
 
 The default alert (`summaryReport: false`) is an HTML email sent only when
 the scan finds something to report — at least one rogue, risk finding, or
-absent device. The current scan's `rdd-audit.csv` is attached.
+absent device.
 
 The body has:
 

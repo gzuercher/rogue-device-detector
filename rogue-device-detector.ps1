@@ -162,10 +162,10 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.5.0'
+$SCRIPT_VERSION       = '1.5.2'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
-$STATE_SCHEMA_VERSION = 3
+$STATE_SCHEMA_VERSION = 4
 
 $SECURITY_PORTS = @(
     [PSCustomObject]@{ Port = 21;   Label = 'FTP';        Risk = 'HIGH';     Reason = 'Unencrypted file transfer' },
@@ -416,6 +416,151 @@ function Get-OsGuess {
     if ($Ttl -le 64)  { return 'Linux/macOS' }
     if ($Ttl -le 128) { return 'Windows' }
     return 'Network device'
+}
+
+function Get-OsLabel {
+    <#
+    .SYNOPSIS
+        Combines TTL guess with service banners into the most informative
+        OS label available. Banner-derived strings (which usually identify
+        distro + version) win over the coarse TTL bucket.
+    .PARAMETER TtlGuess     Coarse OS family from Get-OsGuess.
+    .PARAMETER HttpBanner   Output of Get-HttpBanner.
+    .PARAMETER SshBanner    Output of Get-SshBanner.
+    .PARAMETER TelnetBanner Output of Get-TelnetBanner.
+    #>
+    param(
+        [string]$TtlGuess     = '',
+        [string]$HttpBanner   = '',
+        [string]$SshBanner    = '',
+        [string]$TelnetBanner = ''
+    )
+
+    # SSH banner: 'SSH-2.0-OpenSSH_9.6 Ubuntu-22.04' -> 'Ubuntu 22.04'
+    if ($SshBanner -match 'SSH-2\.0-OpenSSH[_\s]\S+\s+(Debian|Ubuntu|Alpine|CentOS|Fedora|FreeBSD|OpenBSD|NetBSD|Raspbian)[\s\-]?(\S+)?') {
+        $distro = $Matches[1]
+        $ver    = if ($Matches[2]) { " $($Matches[2])" } else { '' }
+        return "$distro$ver".Trim()
+    }
+    if ($SshBanner -match 'SSH-2\.0-(dropbear|libssh|paramiko|cisco|wolfssh)') {
+        return "$($Matches[1].ToUpper().Substring(0,1))$($Matches[1].Substring(1)) host"
+    }
+
+    # HTTP banner: 'nginx/1.24.0 (Ubuntu)' or 'Apache/2.4.41 (Ubuntu)'
+    if ($HttpBanner -match '\(([A-Za-z][\w\-/. ]{1,30})\)') {
+        $parens = $Matches[1].Trim()
+        if ($parens -match '^(Ubuntu|Debian|CentOS|Fedora|RHEL|Win\d+|FreeBSD|Synology|Unix)') {
+            return $parens
+        }
+    }
+
+    # Telnet banner: hostnames/banners often reveal vendor directly
+    if ($TelnetBanner -match '(Cisco|Hikvision|MikroTik|Synology|FreeBSD|HP\s*ProCurve|Aruba|FortiGate|Ubiquiti)') {
+        return $Matches[1]
+    }
+
+    return $TtlGuess
+}
+
+function Get-SshBanner {
+    <#
+    .SYNOPSIS
+        Reads the SSH protocol banner (first line server sends on connect).
+        Format: 'SSH-2.0-<software> <comment>'.
+    .RETURNS Banner string or empty on failure / port closed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$Port = 22,
+        [int]$TimeoutMs = 1500
+    )
+
+    if ($Port -ne 22) { return '' }
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $task   = $client.ConnectAsync($IP, $Port)
+        if (-not $task.Wait($TimeoutMs)) { return '' }
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = $TimeoutMs
+        $buf  = [byte[]]::new(256)
+        $read = $stream.Read($buf, 0, 256)
+        if ($read -gt 0) {
+            $line = [System.Text.Encoding]::ASCII.GetString($buf, 0, $read)
+            return ($line -split "`n" | Select-Object -First 1).Trim()
+        }
+    } catch { $null = $_ }
+    finally { if ($client) { try { $client.Dispose() } catch { $null = $_ } } }
+    return ''
+}
+
+function Get-TelnetBanner {
+    <#
+    .SYNOPSIS
+        Grabs the first chunk of a Telnet session, stripping IAC negotiation
+        bytes. The remaining text is usually a vendor banner or login prompt.
+    .RETURNS Printable banner or empty on failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$Port = 23,
+        [int]$TimeoutMs = 1500
+    )
+
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $task   = $client.ConnectAsync($IP, $Port)
+        if (-not $task.Wait($TimeoutMs)) { return '' }
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = $TimeoutMs
+        $buf  = [byte[]]::new(512)
+        $read = $stream.Read($buf, 0, 512)
+        if ($read -le 0) { return '' }
+
+        # Strip Telnet IAC (0xFF) negotiation triplets.
+        $sb = [System.Text.StringBuilder]::new()
+        $i = 0
+        while ($i -lt $read) {
+            if ($buf[$i] -eq 0xFF -and ($i + 2) -lt $read) {
+                $i += 3   # skip IAC + verb + option
+                continue
+            }
+            $b = $buf[$i]
+            if ($b -ge 0x20 -and $b -lt 0x7F) {
+                [void]$sb.Append([char]$b)
+            } elseif ($b -eq 0x0A -or $b -eq 0x0D) {
+                [void]$sb.Append(' ')
+            }
+            $i++
+        }
+        return $sb.ToString().Trim() -replace '\s+', ' '
+    } catch { $null = $_ }
+    finally { if ($client) { try { $client.Dispose() } catch { $null = $_ } } }
+    return ''
+}
+
+function Get-RelativeAge {
+    <#
+    .SYNOPSIS
+        Formats an ISO timestamp as a short relative-age string.
+        today | yesterday | N days ago | YYYY-MM-DD (for older dates)
+    #>
+    param(
+        [string]$IsoTimestamp,
+        [datetime]$Now = (Get-Date).ToUniversalTime()
+    )
+    if (-not $IsoTimestamp) { return '' }
+    try {
+        $then = [datetime]::Parse($IsoTimestamp).ToUniversalTime()
+        $diff = $Now - $then
+        if ($diff.TotalHours -lt 24) { return 'today' }
+        if ($diff.TotalHours -lt 48) { return 'yesterday' }
+        if ($diff.TotalDays  -lt 14) { return ("{0} days ago" -f [int]$diff.TotalDays) }
+        return $then.ToString('yyyy-MM-dd')
+    } catch {
+        return $IsoTimestamp
+    }
 }
 
 function Get-ArpEntry {
@@ -801,12 +946,18 @@ function Invoke-DeviceEnrichment {
                        -Status "$i/$($Devices.Count) - $($d.ip)" `
                        -PercentComplete ([int]($i / $Devices.Count * 100))
 
-        $d.openPorts   = @(Invoke-PortScan -IP $d.ip)
-        $d.httpBanner  = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
-        $d.upnpInfo    = if ($upnpMap.ContainsKey($d.ip)) { $upnpMap[$d.ip] } else { '' }
-        $risk          = Get-DeviceRisk  -OpenPorts $d.openPorts
-        $d.riskLevel   = $risk.Level
-        $d.riskReasons = $risk.Reasons
+        $d.openPorts    = @(Invoke-PortScan -IP $d.ip)
+        $d.httpBanner   = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
+        $d.sshBanner    = if (22 -in $d.openPorts) { Get-SshBanner    -IP $d.ip } else { '' }
+        $d.telnetBanner = if (23 -in $d.openPorts) { Get-TelnetBanner -IP $d.ip } else { '' }
+        $d.upnpInfo     = if ($upnpMap.ContainsKey($d.ip)) { $upnpMap[$d.ip] } else { '' }
+        $d.osLabel      = Get-OsLabel -TtlGuess $d.osGuess `
+                                       -HttpBanner $d.httpBanner `
+                                       -SshBanner  $d.sshBanner `
+                                       -TelnetBanner $d.telnetBanner
+        $risk           = Get-DeviceRisk  -OpenPorts $d.openPorts
+        $d.riskLevel    = $risk.Level
+        $d.riskReasons  = $risk.Reasons
     }
 
     Write-Progress -Activity 'Enriching devices' -Completed
@@ -972,6 +1123,7 @@ function Get-State {
                 schemaVersion = $STATE_SCHEMA_VERSION
                 lastScan      = $null
                 knownDevices  = @()
+                seenRogues    = @()
             }
         }
         # Ensure lastScan property exists (older state files may lack it)
@@ -1024,6 +1176,12 @@ function Get-State {
             Add-Member -InputObject $raw -NotePropertyName 'schemaVersion' `
                 -NotePropertyValue $STATE_SCHEMA_VERSION -Force
         }
+        # v3 -> v4 migration: seenRogues tracks unapproved-but-recurring MACs so
+        # the rogue alert can show "first seen N days ago" instead of always today.
+        if (-not $raw.PSObject.Properties['seenRogues'] -or $null -eq $raw.seenRogues) {
+            Add-Member -InputObject $raw -NotePropertyName 'seenRogues' `
+                -NotePropertyValue ([object[]]@()) -Force
+        }
         return $raw
     }
 
@@ -1031,6 +1189,7 @@ function Get-State {
         schemaVersion = $STATE_SCHEMA_VERSION
         lastScan      = $null
         knownDevices  = @()
+        seenRogues    = @()
     }
 }
 
@@ -1110,20 +1269,25 @@ function Send-RogueAlert {
     <#
     .SYNOPSIS
         Sends an HTML alert email summarising rogue devices, risk findings,
-        and absent devices. The audit CSV is attached when available.
+        and absent devices.
     .PARAMETER Devices             Rogue (unknown-MAC) devices.
     .PARAMETER SmtpConfig          Hashtable with SMTP connection settings.
     .PARAMETER RiskDevices         Known devices with HIGH/CRITICAL risk findings.
     .PARAMETER AbsentDevices       Known devices not seen for >= absentDays.
     .PARAMETER IdentityChangeCount Count of hostname-change events this scan.
     .PARAMETER Subnet              Scanned subnet (for the email header).
-    .PARAMETER AuditLogPath        Path to audit CSV; attached if it exists.
+    .PARAMETER SeenRogues          State.seenRogues list (for "first seen" age in
+                                   the rogue table).
     #>
     # Password is read from a plain-text config file; SecureString conversion at this
     # boundary is unavoidable without a full credential-store integration.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingConvertToSecureStringWithPlainText', '',
         Justification = 'Password sourced from config file; plain-text conversion is unavoidable at this integration point.'
+    )]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSReviewUnusedParameter', 'SeenRogues',
+        Justification = 'SeenRogues is consumed inside the $firstSeenCell scriptblock via closure; PSSA cannot track that.'
     )]
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$Devices,
@@ -1132,7 +1296,7 @@ function Send-RogueAlert {
         [array]$AbsentDevices = @(),
         [int]$IdentityChangeCount = 0,
         [string]$Subnet = '',
-        [string]$AuditLogPath = ''
+        [array]$SeenRogues = @()
     )
 
     if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
@@ -1181,6 +1345,37 @@ function Send-RogueAlert {
         "<pre style=`"background:#1a202c;color:#cbd5e0;padding:10px 12px;margin:0 24px 8px;font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;`">$safe</pre>"
     }
 
+    # Stack non-empty identifier hints for one device into a multi-line cell.
+    # Defensive PSObject.Properties checks because some callers (e.g. Risk
+    # devices in Send-SummaryReport, or hand-built test fixtures) may omit
+    # banner/upnp fields entirely.
+    $detailsCell = {
+        param($Device)
+        $lines = [System.Collections.Generic.List[string]]::new()
+        foreach ($pair in @(
+            @{ Field='upnpInfo';     Label='upnp'   },
+            @{ Field='httpBanner';   Label='http'   },
+            @{ Field='sshBanner';    Label='ssh'    },
+            @{ Field='telnetBanner'; Label='telnet' }
+        )) {
+            if ($Device.PSObject.Properties[$pair.Field]) {
+                $val = $Device.($pair.Field)
+                if ($val) { $lines.Add("$($pair.Label): $(& $esc $val)") }
+            }
+        }
+        if ($lines.Count -eq 0) { return '<span style="color:#a0aec0;">-</span>' }
+        ($lines -join '<br>')
+    }
+
+    $now = (Get-Date).ToUniversalTime()
+    $firstSeenCell = {
+        param($Mac)
+        $entry = @($SeenRogues) | Where-Object { $_.mac -eq $Mac } | Select-Object -First 1
+        $iso = if ($entry -and $entry.firstSeen) { $entry.firstSeen } else { $null }
+        if (-not $iso) { return 'today' }
+        Get-RelativeAge -IsoTimestamp ([string]$iso) -Now $now
+    }
+
     $thStyle     = 'padding:10px;font-weight:600;color:#4a5568;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;background:#edf2f7;border-bottom:2px solid #cbd5e0;'
     $tdStyle     = 'padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:13px;'
     $tdMono      = "$tdStyle font-family:Consolas,Monaco,monospace;font-size:12px;"
@@ -1215,11 +1410,12 @@ function Send-RogueAlert {
             $d         = $_
             $macCell   = & $esc $d.mac
             $ipCell    = & $esc $d.ip
-            $hostCell  = & $esc $d.hostname
+            $hostCell  = if ($d.hostname -and $d.hostname -ne $d.ip) { & $esc $d.hostname } else { '<span style="color:#a0aec0;">-</span>' }
             $vendor    = & $esc $d.vendor
-            $os        = & $esc $d.osGuess
-            $portsTxt  = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '<span style="color:#a0aec0;">-</span>' }
-            $riskHtml  = if ($d.riskLevel -and $d.riskLevel -ne 'NONE') { & $riskBadge $d.riskLevel } else { '<span style="color:#a0aec0;">-</span>' }
+            $osText    = if ($d.PSObject.Properties['osLabel'] -and $d.osLabel) { $d.osLabel } else { $d.osGuess }
+            $os        = & $esc $osText
+            $firstSeen = & $firstSeenCell $d.mac
+            $details   = & $detailsCell  $d
             @"
 <tr>
 <td style="$tdMono white-space:nowrap;">$macCell</td>
@@ -1227,15 +1423,21 @@ function Send-RogueAlert {
 <td style="$tdStyle">$hostCell</td>
 <td style="$tdStyle color:#4a5568;">$vendor</td>
 <td style="$tdStyle color:#4a5568;">$os</td>
-<td style="$tdMono">$portsTxt</td>
-<td style="$tdStyle text-align:center;">$riskHtml</td>
+<td style="$tdStyle color:#4a5568;font-size:12px;">$firstSeen</td>
+<td style="$tdStyle color:#4a5568;font-size:12px;line-height:1.4;">$details</td>
 </tr>
 "@
         }) -join "`n"
 
-        $approveCmds = ($Devices | ForEach-Object {
-            "$invokeToken -ApproveDevice '$($_.mac)' -Label '<description>'"
-        }) -join "`n"
+        # One generic command per use case, not per MAC. Operator copies the
+        # MAC from the table and substitutes the placeholder.
+        $approveCmds = @(
+            "# Accept every rogue listed above in one go:"
+            "$invokeToken -ApproveAllRogues"
+            ""
+            "# Or accept a single device (replace <MAC> from the table above):"
+            "$invokeToken -ApproveDevice '<MAC>' -Label '<description>'"
+        ) -join "`n"
 
         $rogueSection = @"
 <h2 style="$h2Style border-left-color:#dc2626;">Rogue Devices ($($Devices.Count))</h2>
@@ -1247,15 +1449,15 @@ function Send-RogueAlert {
 <th align="left" style="$thStyle">Hostname</th>
 <th align="left" style="$thStyle">Vendor</th>
 <th align="left" style="$thStyle">OS</th>
-<th align="left" style="$thStyle">Ports</th>
-<th align="center" style="$thStyle">Risk</th>
+<th align="left" style="$thStyle">First Seen</th>
+<th align="left" style="$thStyle">Details</th>
 </tr>
 </thead>
 <tbody>
 $rows
 </tbody>
 </table>
-<div style="$actionLabel">If authorized, approve on $(& $esc $hostname):</div>
+<div style="$actionLabel">Actions on $(& $esc $hostname):</div>
 $(& $codeBlock $approveCmds)
 "@
     }
@@ -1267,10 +1469,11 @@ $(& $codeBlock $approveCmds)
             $d        = $_
             $macCell  = & $esc $d.mac
             $ipCell   = & $esc $d.ip
-            $hostCell = & $esc $d.hostname
+            $hostCell = if ($d.hostname -and $d.hostname -ne $d.ip) { & $esc $d.hostname } else { '<span style="color:#a0aec0;">-</span>' }
             $reasons  = if ($d.riskReasons) { & $esc ($d.riskReasons -join '; ') } else { '' }
             $portsTxt = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '-' }
             $riskHtml = & $riskBadge $d.riskLevel
+            $details  = & $detailsCell $d
             @"
 <tr>
 <td style="$tdMono white-space:nowrap;">$macCell</td>
@@ -1279,13 +1482,14 @@ $(& $codeBlock $approveCmds)
 <td style="$tdStyle text-align:center;">$riskHtml</td>
 <td style="$tdStyle color:#4a5568;">$reasons</td>
 <td style="$tdMono">$portsTxt</td>
+<td style="$tdStyle color:#4a5568;font-size:12px;line-height:1.4;">$details</td>
 </tr>
 "@
         }) -join "`n"
 
-        $allowCmds = ($RiskDevices | ForEach-Object {
-            "$invokeToken -AllowPort <port> -On '$($_.mac)'"
-        }) -join "`n"
+        # One generic template, not per MAC. Operator picks the MAC from the
+        # table above and the port(s) from the Open Ports column.
+        $allowCmds = "$invokeToken -AllowPort <port> -On '<MAC>'"
 
         $riskSection = @"
 <h2 style="$h2Style border-left-color:#ea580c;">Risk Findings on Known Devices ($($RiskDevices.Count))</h2>
@@ -1298,13 +1502,14 @@ $(& $codeBlock $approveCmds)
 <th align="center" style="$thStyle">Level</th>
 <th align="left" style="$thStyle">Reasons</th>
 <th align="left" style="$thStyle">Open Ports</th>
+<th align="left" style="$thStyle">Details</th>
 </tr>
 </thead>
 <tbody>
 $rows
 </tbody>
 </table>
-<div style="$actionLabel">If a port is intentional, allow it (replace &lt;port&gt;):</div>
+<div style="$actionLabel">If a port is intentional, allow it (replace &lt;MAC&gt; from the table and &lt;port&gt; from Open Ports):</div>
 $(& $codeBlock $allowCmds)
 "@
     }
@@ -1338,9 +1543,6 @@ $rows
     }
 
     # ---- Footer ----
-    $auditNote = if ($AuditLogPath -and (Test-Path $AuditLogPath)) {
-        "Full audit log attached as <code style=`"background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;`">$(& $esc (Split-Path $AuditLogPath -Leaf))</code>."
-    } else { '' }
     $listCmd = & $esc "$invokeToken -ListDevices"
 
     # ---- Assemble ----
@@ -1369,8 +1571,7 @@ $riskSection
 $absentSection
 
 <div style="padding:14px 24px;background:#f7fafc;font-size:12px;color:#718096;border-top:1px solid #e2e8f0;line-height:1.6;">
-$auditNote<br>
-Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;">$listCmd</code> for the full baseline.
+Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;">$listCmd</code> on $(& $esc $hostname) for the full baseline.
 </div>
 
 </div>
@@ -1397,10 +1598,6 @@ Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:
         SmtpServer = $SmtpConfig.host
         Port       = [int]$SmtpConfig.port
         UseSsl     = $useSsl
-    }
-
-    if ($AuditLogPath -and (Test-Path $AuditLogPath)) {
-        $mailParams.Attachments = $AuditLogPath
     }
 
     if ($SmtpConfig.user) {
@@ -1461,6 +1658,11 @@ function Invoke-ApproveDevice {
             allowedPorts = @()
         }
         Write-RddLog "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
+    }
+
+    # An approved MAC is no longer a rogue; clean it out of seenRogues.
+    if ($State.PSObject.Properties['seenRogues']) {
+        $State.seenRogues = @(@($State.seenRogues) | Where-Object { $_.mac -ne $mac })
     }
 }
 
@@ -1998,16 +2200,19 @@ if ($arpEntries.Count -eq 0) {
 $foundDevices = @($arpEntries | ForEach-Object {
     $osGuess = if ($ttlMap.ContainsKey($_.IP)) { Get-OsGuess -Ttl $ttlMap[$_.IP] } else { '' }
     [PSCustomObject]@{
-        mac         = $_.MAC
-        ip          = $_.IP
-        hostname    = $_.IP   # placeholder, overwritten by Resolve-Hostname
-        vendor      = ''
-        osGuess     = $osGuess
-        openPorts   = @()
-        httpBanner  = ''
-        upnpInfo    = ''
-        riskLevel   = 'NONE'
-        riskReasons = @()
+        mac           = $_.MAC
+        ip            = $_.IP
+        hostname      = $_.IP   # placeholder, overwritten by Resolve-Hostname
+        vendor        = ''
+        osGuess       = $osGuess
+        osLabel       = $osGuess  # refined later by Get-OsLabel using banners
+        openPorts     = @()
+        httpBanner    = ''
+        sshBanner     = ''
+        telnetBanner  = ''
+        upnpInfo      = ''
+        riskLevel     = 'NONE'
+        riskReasons   = @()
     }
 })
 
@@ -2132,6 +2337,21 @@ foreach ($device in $foundDevices) {
     }
 }
 
+# Track rogue first/last sightings so the alert can show "first seen N days ago"
+# rather than always 'today'. Updated in place; serialised on the next Save-State.
+foreach ($d in $rogueDevices) {
+    $entry = @($state.seenRogues) | Where-Object { $_.mac -eq $d.mac } | Select-Object -First 1
+    if ($entry) {
+        $entry.lastSeen = $now
+    } else {
+        $state.seenRogues = @($state.seenRogues) + @([PSCustomObject]@{
+            mac       = $d.mac
+            firstSeen = $now
+            lastSeen  = $now
+        })
+    }
+}
+
 # Bulk-approve mode: add every detected rogue to the baseline and exit.
 # Risk findings are NOT carried into allowedPorts - they will be reported
 # on the next scan, giving the operator a chance to review per-port.
@@ -2163,6 +2383,10 @@ if ($ApproveAllRogues) {
         Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_APPROVED' -Device $d `
             -Details "bulk-approve risk=$($d.riskLevel)"
     }
+
+    # The approved MACs are no longer rogues; clean them out of seenRogues.
+    $approvedMacs = @($rogueDevices | ForEach-Object { $_.mac })
+    $state.seenRogues = @(@($state.seenRogues) | Where-Object { $_.mac -notin $approvedMacs })
 
     $state.lastScan = $now
     Save-State -State $state -StatePath $cfg.statePath
@@ -2248,7 +2472,7 @@ if ($cfg.summaryReport) {
                 -AbsentDevices $absentDevices `
                 -IdentityChangeCount $identityChanges.Count `
                 -Subnet $targetSubnet `
-                -AuditLogPath $cfg.logPath `
+                -SeenRogues @($state.seenRogues) `
                 -SmtpConfig $cfg.smtp
         }
     } else {
