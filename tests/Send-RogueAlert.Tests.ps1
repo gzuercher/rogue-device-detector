@@ -56,7 +56,8 @@ Describe 'Send-RogueAlert HTML body' {
 
         $script:rogueDevice = [PSCustomObject]@{
             mac='AA:BB:CC:DD:EE:01'; ip='192.168.1.10'; hostname='unknown'
-            vendor='Acme'; osGuess='Windows'; httpBanner=''; upnpInfo=''
+            vendor='Acme'; osGuess='Windows'; osLabel='Windows'
+            httpBanner=''; sshBanner=''; telnetBanner=''; upnpInfo=''
             openPorts=@(); riskLevel='NONE'; riskReasons=@()
         }
     }
@@ -72,6 +73,7 @@ Describe 'Send-RogueAlert HTML body' {
         $risk = [PSCustomObject]@{
             mac='AA:BB:CC:DD:EE:02'; ip='192.168.1.20'; hostname='srv1'
             riskLevel='HIGH'; riskReasons=@('SSH (port 22)'); openPorts=@(22)
+            httpBanner=''; sshBanner=''; telnetBanner=''; upnpInfo=''
         }
         Send-RogueAlert -Devices @() -RiskDevices @($risk) -SmtpConfig $script:smtp
         $global:RDDTestCapture.Body | Should -Not -Match 'Rogue Devices \('
@@ -144,8 +146,8 @@ Describe 'Send-RogueAlert HTML body' {
 
     It 'risk section uses a single AllowPort template, not one per device' {
         $twoRisks = @(
-            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:20'; ip='1.1.1.20'; hostname='r1'; riskLevel='HIGH'; riskReasons=@('A (port 22)'); openPorts=@(22) }
-            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:21'; ip='1.1.1.21'; hostname='r2'; riskLevel='HIGH'; riskReasons=@('A (port 22)'); openPorts=@(22) }
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:20'; ip='1.1.1.20'; hostname='r1'; riskLevel='HIGH'; riskReasons=@('A (port 22)'); openPorts=@(22); httpBanner=''; sshBanner=''; telnetBanner=''; upnpInfo='' }
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:21'; ip='1.1.1.21'; hostname='r2'; riskLevel='HIGH'; riskReasons=@('A (port 22)'); openPorts=@(22); httpBanner=''; sshBanner=''; telnetBanner=''; upnpInfo='' }
         )
         Send-RogueAlert -Devices @() -RiskDevices $twoRisks -SmtpConfig $script:smtp
         $body = $global:RDDTestCapture.Body
@@ -168,6 +170,56 @@ Describe 'Send-RogueAlert HTML body' {
     It 'no longer attaches anything (audit CSV removed from email)' {
         Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $script:smtp
         $global:RDDTestCapture.Attachments | Should -Be $null
+    }
+
+    It 'rogue table headers no longer include Risk or Ports columns' {
+        Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        # Locate the rogue table block.
+        $rogueBlock = if ($body -match '(?s)Rogue Devices \(\d+\).*?</table>') { $Matches[0] } else { '' }
+        $rogueBlock | Should -Not -BeNullOrEmpty
+        $rogueBlock | Should -Not -Match '<th[^>]*>Risk</th>'
+        $rogueBlock | Should -Not -Match '<th[^>]*>Ports</th>'
+        $rogueBlock | Should -Match '<th[^>]*>First Seen</th>'
+        $rogueBlock | Should -Match '<th[^>]*>Details</th>'
+    }
+
+    It 'risk table includes a Details column' {
+        $risk = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:40'; ip='1.1.1.40'; hostname='srv'
+            riskLevel='HIGH'; riskReasons=@('SSH (port 22)'); openPorts=@(22)
+            httpBanner='nginx/1.24'; sshBanner='SSH-2.0-OpenSSH_9.6 Ubuntu'
+            telnetBanner=''; upnpInfo=''
+        }
+        Send-RogueAlert -Devices @() -RiskDevices @($risk) -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        $body | Should -Match 'http: nginx/1.24'
+        $body | Should -Match 'ssh: SSH-2.0-OpenSSH'
+    }
+
+    It 'rogue First Seen shows "today" for fresh rogues with no SeenRogues entry' {
+        $fresh = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:50'; ip='1.1.1.50'; hostname='h'
+            vendor='V'; osGuess='Linux/macOS'; osLabel='Linux/macOS'
+            httpBanner=''; sshBanner=''; telnetBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+        Send-RogueAlert -Devices @($fresh) -SmtpConfig $script:smtp -SeenRogues @()
+        # First Seen cell appears in the row.
+        $global:RDDTestCapture.Body | Should -Match '>today<'
+    }
+
+    It 'rogue First Seen reflects relative age from SeenRogues' {
+        $oldRogue = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:51'; ip='1.1.1.51'; hostname='h'
+            vendor='V'; osGuess='Linux/macOS'; osLabel='Linux/macOS'
+            httpBanner=''; sshBanner=''; telnetBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+        $longAgo = [datetime]::UtcNow.AddDays(-7).ToString('o')
+        $seen = @([PSCustomObject]@{ mac='AA:BB:CC:DD:EE:51'; firstSeen=$longAgo; lastSeen=$longAgo })
+        Send-RogueAlert -Devices @($oldRogue) -SmtpConfig $script:smtp -SeenRogues $seen
+        $global:RDDTestCapture.Body | Should -Match '\d+ days ago'
     }
 }
 

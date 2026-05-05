@@ -287,6 +287,72 @@ Describe 'Get-OsGuess' {
     }
 }
 
+# ── Get-OsLabel ────────────────────────────────────────────────────────────────
+
+Describe 'Get-OsLabel' {
+
+    It 'extracts distro from OpenSSH banner' {
+        Get-OsLabel -SshBanner 'SSH-2.0-OpenSSH_9.6 Ubuntu-22.04' | Should -Match 'Ubuntu'
+    }
+
+    It 'extracts Debian from OpenSSH banner with hyphen' {
+        Get-OsLabel -SshBanner 'SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3' | Should -Match 'Debian'
+    }
+
+    It 'identifies dropbear-based devices' {
+        Get-OsLabel -SshBanner 'SSH-2.0-dropbear_2022.83' | Should -Match 'Dropbear'
+    }
+
+    It 'extracts Ubuntu from HTTP server-with-parens header' {
+        Get-OsLabel -HttpBanner 'Title | Server: nginx/1.24.0 (Ubuntu)' | Should -Be 'Ubuntu'
+    }
+
+    It 'identifies vendor from telnet banner' {
+        Get-OsLabel -TelnetBanner 'Welcome to Cisco IOS XE Software' | Should -Be 'Cisco'
+    }
+
+    It 'falls back to TTL guess when no banner is informative' {
+        Get-OsLabel -TtlGuess 'Linux/macOS' -SshBanner 'SSH-2.0-Custom_1.0' | Should -Be 'Linux/macOS'
+    }
+
+    It 'returns empty when nothing is known' {
+        Get-OsLabel | Should -Be ''
+    }
+}
+
+# ── Get-RelativeAge ────────────────────────────────────────────────────────────
+
+Describe 'Get-RelativeAge' {
+
+    BeforeAll {
+        $script:fixedNow = [datetime]'2026-05-05T12:00:00Z'
+    }
+
+    It 'returns "today" for an event a few hours ago' {
+        Get-RelativeAge -IsoTimestamp '2026-05-05T03:00:00Z' -Now $script:fixedNow | Should -Be 'today'
+    }
+
+    It 'returns "yesterday" for ~30 hours ago' {
+        Get-RelativeAge -IsoTimestamp '2026-05-04T06:00:00Z' -Now $script:fixedNow | Should -Be 'yesterday'
+    }
+
+    It 'returns "N days ago" for several days back' {
+        Get-RelativeAge -IsoTimestamp '2026-05-01T00:00:00Z' -Now $script:fixedNow | Should -Match '^\d+ days ago$'
+    }
+
+    It 'returns absolute date for events older than 14 days' {
+        Get-RelativeAge -IsoTimestamp '2026-04-01T00:00:00Z' -Now $script:fixedNow | Should -Be '2026-04-01'
+    }
+
+    It 'returns empty string for empty input' {
+        Get-RelativeAge -IsoTimestamp '' -Now $script:fixedNow | Should -Be ''
+    }
+
+    It 'returns the original string on parse failure' {
+        Get-RelativeAge -IsoTimestamp 'not-a-date' -Now $script:fixedNow | Should -Be 'not-a-date'
+    }
+}
+
 # ── Test-IdentityChange ──────────────────────────────────────────────────────
 
 Describe 'Test-IdentityChange' {
@@ -955,20 +1021,48 @@ Describe 'Invoke-BlockPort' {
     }
 }
 
-# ── State Schema v3 ────────────────────────────────────────────────────────────
+# ── State Schema v4 ────────────────────────────────────────────────────────────
 
-Describe 'State Schema v3' {
+Describe 'State Schema v4' {
 
-    It 'uses schema version 3' {
-        $STATE_SCHEMA_VERSION | Should -Be 3
+    It 'uses schema version 4' {
+        $STATE_SCHEMA_VERSION | Should -Be 4
     }
 
     It 'new devices from Invoke-ApproveDevice include allowedPorts field' {
-        $state = [PSCustomObject]@{ schemaVersion = 3; knownDevices = @(); lastScan = '' }
+        $state = [PSCustomObject]@{ schemaVersion = 4; knownDevices = @(); seenRogues = @(); lastScan = '' }
         Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:FF' -State $state -Now '2026-03-23T00:00:00Z'
         $device = $state.knownDevices[0]
         $device.PSObject.Properties.Name | Should -Contain 'allowedPorts'
         @($device.allowedPorts) | Should -HaveCount 0
+    }
+
+    It 'Get-State migrates a v3 file by adding seenRogues' {
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "rdd-state-v3-$([guid]::NewGuid()).json"
+        try {
+            $v3 = @{ schemaVersion = 3; lastScan = ''; knownDevices = @() } | ConvertTo-Json
+            Set-Content $tmp -Value $v3 -Encoding UTF8
+            $state = Get-State -StatePath $tmp
+            $state.PSObject.Properties.Name | Should -Contain 'seenRogues'
+            @($state.seenRogues) | Should -HaveCount 0
+        } finally {
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'Invoke-ApproveDevice removes the MAC from seenRogues' {
+        $state = [PSCustomObject]@{
+            schemaVersion = 4
+            knownDevices  = @()
+            seenRogues    = @(
+                [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:FF'; firstSeen='2026-04-01'; lastSeen='2026-05-01' }
+                [PSCustomObject]@{ mac='11:22:33:44:55:66'; firstSeen='2026-04-15'; lastSeen='2026-05-01' }
+            )
+            lastScan = ''
+        }
+        Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:FF' -State $state -Now '2026-05-05T00:00:00Z'
+        @($state.seenRogues).Count | Should -Be 1
+        @($state.seenRogues)[0].mac | Should -Be '11:22:33:44:55:66'
     }
 }
 
