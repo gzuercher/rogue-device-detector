@@ -1,0 +1,175 @@
+#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0' }
+<#
+.SYNOPSIS
+    Pester tests for the HTML alert email assembly. Mocks Send-MailMessage
+    so the body / subject / attachments can be inspected without going on
+    the wire.
+#>
+
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'Test capture pattern: cross-scope variable to inspect Mock parameters.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUsePSCredentialType', '',
+    Justification = 'Mock signature mirrors Send-MailMessage param shape; not a real credential consumer.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '',
+    Justification = 'Mock signature only - no password handling.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'Mock signature mirrors Send-MailMessage; unused params are intentional.')]
+param()
+
+BeforeAll {
+    $script:ScriptPath = Resolve-Path "$PSScriptRoot\..\rogue-device-detector.ps1"
+    . $script:ScriptPath
+}
+
+Describe 'Send-RogueAlert HTML body' {
+    BeforeAll {
+        # Override Send-MailMessage in global scope - dot-sourced functions
+        # resolve commands by global name, so this intercepts the call.
+        function global:Send-MailMessage {
+            [CmdletBinding()]
+            param(
+                [string]$From, [string]$To, [string]$Subject, $Body,
+                [switch]$BodyAsHtml, [string]$SmtpServer, [int]$Port,
+                [switch]$UseSsl, $Credential, $Attachments
+            )
+            $global:RDDTestCapture = @{
+                From = $From; To = $To; Subject = $Subject; Body = $Body
+                BodyAsHtml = [bool]$BodyAsHtml; UseSsl = [bool]$UseSsl
+                Port = $Port; Attachments = $Attachments
+                Invoked = $true
+            }
+        }
+    }
+
+    AfterAll {
+        Remove-Item Function:\global:Send-MailMessage -ErrorAction SilentlyContinue
+        Remove-Variable -Name RDDTestCapture -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    BeforeEach {
+        $global:RDDTestCapture = @{ Invoked = $false }
+
+        $script:smtp = @{
+            host = 'smtp.example'; port = 25; from = 'a@b'; to = 'c@d'
+            user = ''; password = ''; useSsl = $false
+        }
+
+        $script:rogueDevice = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:01'; ip='192.168.1.10'; hostname='unknown'
+            vendor='Acme'; osGuess='Windows'; httpBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+    }
+
+    It 'sends BodyAsHtml with a recognisable HTML envelope' {
+        Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $script:smtp -Subnet '192.168.1.0/24'
+        $global:RDDTestCapture.BodyAsHtml | Should -BeTrue
+        $global:RDDTestCapture.Body       | Should -Match '<!DOCTYPE html>'
+        $global:RDDTestCapture.Body       | Should -Match 'Rogue Device Detector'
+    }
+
+    It 'omits the rogue section when no rogues are passed' {
+        $risk = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:02'; ip='192.168.1.20'; hostname='srv1'
+            riskLevel='HIGH'; riskReasons=@('SSH (port 22)'); openPorts=@(22)
+        }
+        Send-RogueAlert -Devices @() -RiskDevices @($risk) -SmtpConfig $script:smtp
+        $global:RDDTestCapture.Body | Should -Not -Match 'Rogue Devices \('
+        $global:RDDTestCapture.Body | Should -Match 'Risk Findings on Known Devices \(1\)'
+    }
+
+    It 'HTML-escapes hostnames containing angle brackets and ampersands' {
+        $bad = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:03'; ip='192.168.1.30'
+            hostname='host<X>&Y'; vendor='X'
+            osGuess=''; httpBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+        Send-RogueAlert -Devices @($bad) -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        # Raw angle brackets must be escaped.
+        $body | Should -Match 'host&lt;X&gt;&amp;Y'
+        # Raw '<X>' must NOT appear in the rendered body.
+        $body.Contains('host<X>') | Should -BeFalse
+    }
+
+    It 'emits approve commands as raw path with single-quoted args (Outlook-paste safe)' {
+        $d = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:04'; ip='192.168.1.40'; hostname='h'
+            vendor='X'; osGuess=''; httpBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+        Send-RogueAlert -Devices @($d) -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        $body | Should -Not -Match '&amp; &quot;'
+        $body | Should -Match "-ApproveDevice &#39;AA:BB:CC:DD:EE:04&#39;"
+    }
+
+    It 'attaches the audit log when the path exists' {
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "rdd-audit-$([guid]::NewGuid()).csv"
+        Set-Content $tmp -Value 'header'
+        try {
+            Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $script:smtp -AuditLogPath $tmp
+            $global:RDDTestCapture.Attachments | Should -Be $tmp
+        } finally {
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'subject lists each non-zero category' {
+        $absent = [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:07'; label='old'; lastSeen='2026-04-01' }
+        Send-RogueAlert -Devices @($script:rogueDevice) -AbsentDevices @($absent) -SmtpConfig $script:smtp
+        $global:RDDTestCapture.Subject | Should -Match '1 rogue, 1 absent'
+    }
+
+    It 'honours smtp.useSsl from config' {
+        $smtpTls = @{ host='s'; port=587; from='a@b'; to='c@d'; user=''; password=''; useSsl=$true }
+        Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $smtpTls
+        $global:RDDTestCapture.UseSsl | Should -BeTrue
+
+        $smtpPlain = @{ host='s'; port=25; from='a@b'; to='c@d'; user=''; password=''; useSsl=$false }
+        Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $smtpPlain
+        $global:RDDTestCapture.UseSsl | Should -BeFalse
+    }
+
+    It 'short-circuits when no rogues, risks, or absents to report' {
+        Send-RogueAlert -Devices @() -RiskDevices @() -AbsentDevices @() -SmtpConfig $script:smtp
+        $global:RDDTestCapture.Invoked | Should -BeFalse
+    }
+}
+
+Describe 'Audit log rotation' {
+    BeforeEach {
+        $script:tmpLog = Join-Path ([System.IO.Path]::GetTempPath()) "rdd-rotation-$([guid]::NewGuid()).csv"
+    }
+    AfterEach {
+        $dir  = Split-Path $script:tmpLog -Parent
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($script:tmpLog)
+        Get-ChildItem -Path $dir -Filter "$base*.csv" -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'rotates the active file when it exceeds AUDIT_LOG_MAX_BYTES' {
+        $oversize = [byte[]]::new($AUDIT_LOG_MAX_BYTES + 100)
+        [System.IO.File]::WriteAllBytes($script:tmpLog, $oversize)
+
+        Write-AuditLog -LogPath $script:tmpLog -EventName 'TEST'
+
+        $dir  = Split-Path $script:tmpLog -Parent
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($script:tmpLog)
+        $rotated = @(Get-ChildItem -Path $dir -Filter "$base.*.csv" -ErrorAction SilentlyContinue)
+        $rotated.Count | Should -BeGreaterThan 0
+        (Get-Item $script:tmpLog).Length | Should -BeLessThan 1KB
+    }
+
+    It 'does not rotate when the file is below the threshold' {
+        Set-Content $script:tmpLog -Value 'small'
+
+        Write-AuditLog -LogPath $script:tmpLog -EventName 'TEST'
+
+        $dir  = Split-Path $script:tmpLog -Parent
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($script:tmpLog)
+        $rotated = @(Get-ChildItem -Path $dir -Filter "$base.*.csv" -ErrorAction SilentlyContinue)
+        $rotated.Count | Should -Be 0
+    }
+}

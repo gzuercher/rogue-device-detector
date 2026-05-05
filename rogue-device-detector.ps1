@@ -89,6 +89,20 @@
     one go. Useful when reviewing alerts in bulk after a known network
     change. Risk findings are NOT auto-allowed - any risky open ports on
     the approved devices will be reported as RISK on the next scan.
+
+.EXAMPLE
+    .\rogue-device-detector.ps1 -Version
+    Print the script version and exit.
+
+.EXAMPLE
+    .\rogue-device-detector.ps1 -TestSmtp
+    Send a test email to the configured recipient and exit, without scanning.
+    Use during initial setup to validate smtp.host / port / credentials / TLS.
+
+.EXAMPLE
+    .\rogue-device-detector.ps1 -DryRun
+    Run a full scan but do not save state, do not send mail, do not write
+    to the audit log. Useful for testing config changes without side effects.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
@@ -103,8 +117,20 @@ param(
     [Parameter(ParameterSetName = 'Scan')]
     [switch]$LearningMode,
 
+    [Parameter(ParameterSetName = 'Scan')]
+    [switch]$DryRun,
+
     [Parameter(Mandatory, ParameterSetName = 'ApproveAllRogues')]
     [switch]$ApproveAllRogues,
+
+    [Parameter(Mandatory, ParameterSetName = 'Version')]
+    [switch]$Version,
+
+    [Parameter(Mandatory, ParameterSetName = 'TestSmtp')]
+    [switch]$TestSmtp,
+
+    [Parameter(ParameterSetName = 'TestSmtp')]
+    [string]$TestSmtpConfig = '',
 
     [Parameter(Mandatory, ParameterSetName = 'ApproveDevice')]
     [ValidateNotNullOrEmpty()]
@@ -136,7 +162,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.4.2'
+$SCRIPT_VERSION       = '1.5.0'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -157,6 +183,11 @@ $SECURITY_PORTS = @(
 $RISK_ORDER = @{ 'NONE' = 0; 'LOW' = 1; 'MEDIUM' = 2; 'HIGH' = 3; 'CRITICAL' = 4 }
 
 $ABSENT_DAYS_DEFAULT = 21
+
+# Audit log rotation: when the active CSV exceeds this size, it is renamed to
+# <base>.YYYY-MM-DD-HHmmss.csv and a fresh file is started. Old rotations are
+# kept on disk for the operator to archive or prune.
+$AUDIT_LOG_MAX_BYTES = 10MB
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -802,9 +833,31 @@ function Write-AuditLog {
         [string]$Details         = ''
     )
 
+    # DryRun mode: skip audit writes so a test scan leaves no trace.
+    if ((Get-Variable -Name DryRun -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { return }
+
     $logDir = Split-Path $LogPath -Parent
     if ($logDir -and -not (Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+
+    # Size-based rotation: if the active log exceeds the cap, move it aside
+    # with a timestamp suffix. Keeps the active CSV manageable as an email
+    # attachment without losing history.
+    if (Test-Path $LogPath) {
+        $size = (Get-Item $LogPath).Length
+        if ($size -gt $AUDIT_LOG_MAX_BYTES) {
+            $base    = [System.IO.Path]::GetFileNameWithoutExtension($LogPath)
+            $ext     = [System.IO.Path]::GetExtension($LogPath)
+            $stamp   = Get-Date -Format 'yyyy-MM-dd-HHmmss'
+            $rotated = Join-Path $logDir "$base.$stamp$ext"
+            try {
+                Move-Item -Path $LogPath -Destination $rotated -Force -ErrorAction Stop
+            } catch {
+                # Log rotation must never break the scan; carry on appending.
+                $null = $_
+            }
+        }
     }
 
     if (-not (Test-Path $LogPath)) {
@@ -993,6 +1046,9 @@ function Save-State {
         [Parameter(Mandatory)][string]$StatePath
     )
 
+    # DryRun mode: skip persistence so a test scan leaves no trace.
+    if ((Get-Variable -Name DryRun -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { return }
+
     $stateDir = Split-Path $StatePath -Parent
     if ($stateDir -and -not (Test-Path $stateDir)) {
         New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
@@ -1002,6 +1058,53 @@ function Save-State {
 }
 
 # ── Alert ──────────────────────────────────────────────────────────────────────
+
+function Invoke-SmtpTest {
+    <#
+    .SYNOPSIS
+        Sends a one-shot self-test email to verify SMTP configuration.
+        Sets $global:LASTEXITCODE to 0 on success, 1 on failure.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'Password sourced from config file; plain-text conversion is unavoidable at this integration point.'
+    )]
+    param(
+        [Parameter(Mandatory)][hashtable]$SmtpConfig,
+        [Parameter(Mandatory)][string]$Version
+    )
+
+    if (-not $SmtpConfig.host -or -not $SmtpConfig.from -or -not $SmtpConfig.to) {
+        Write-RddLog 'SMTP not configured (host/from/to required). Edit config.json first.' -Level ERROR
+        $global:LASTEXITCODE = 1
+        return
+    }
+
+    $useSsl = [bool]$SmtpConfig.useSsl
+    Write-RddLog "Sending test email via SMTP $($SmtpConfig.host):$($SmtpConfig.port) (useSsl=$useSsl) ..."
+    $mailParams = @{
+        From       = $SmtpConfig.from
+        To         = $SmtpConfig.to
+        Subject    = "[$env:COMPUTERNAME] Rogue Device Detector - SMTP test - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Body       = "<p>This is a test email from <code>rogue-device-detector.ps1</code> v$Version running on <strong>$env:COMPUTERNAME</strong>.</p><p>If you received this, your SMTP configuration is working.</p>"
+        BodyAsHtml = $true
+        SmtpServer = $SmtpConfig.host
+        Port       = [int]$SmtpConfig.port
+        UseSsl     = $useSsl
+    }
+    if ($SmtpConfig.user) {
+        $securePass            = ConvertTo-SecureString -String $SmtpConfig.password -AsPlainText -Force
+        $mailParams.Credential = New-Object System.Management.Automation.PSCredential($SmtpConfig.user, $securePass)
+    }
+    try {
+        Send-MailMessage @mailParams
+        Write-RddLog "Test email sent to $($SmtpConfig.to)."
+        $global:LASTEXITCODE = 0
+    } catch {
+        Write-RddLog "SMTP test failed: $_" -Level ERROR
+        $global:LASTEXITCODE = 1
+    }
+}
 
 function Send-RogueAlert {
     <#
@@ -1023,7 +1126,7 @@ function Send-RogueAlert {
         Justification = 'Password sourced from config file; plain-text conversion is unavoidable at this integration point.'
     )]
     param(
-        [Parameter(Mandatory)][array]$Devices,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Devices,
         [Parameter(Mandatory)][hashtable]$SmtpConfig,
         [array]$RiskDevices = @(),
         [array]$AbsentDevices = @(),
@@ -1775,11 +1878,28 @@ function Exit-ScanLock {
 # Guard: skip main body when dot-sourced for unit testing (e.g. Pester)
 if ($MyInvocation.InvocationName -eq '.') { return }
 
+# -Version: print and exit before doing anything else.
+if ($Version) {
+    Write-Host $SCRIPT_VERSION
+    exit 0
+}
+
 Write-RddLog "Rogue Device Detector v$SCRIPT_VERSION starting on $env:COMPUTERNAME"
+if ($DryRun) {
+    Write-RddLog "[DryRun] No state, audit, or email side effects will be written." -Level WARN
+}
 
 # Load configuration
-$configPath = if ($Config) { $Config } else { Join-Path $PSScriptRoot 'config.json' }
+$configPath = if ($TestSmtp -and $TestSmtpConfig) { $TestSmtpConfig }
+              elseif ($Config) { $Config }
+              else { Join-Path $PSScriptRoot 'config.json' }
 $cfg        = Get-Configuration -ConfigPath $configPath -SubnetOverride $Subnet
+
+# -TestSmtp: send a self-test email and exit. No scan, no state mutation.
+if ($TestSmtp) {
+    Invoke-SmtpTest -SmtpConfig $cfg.smtp -Version $SCRIPT_VERSION
+    exit $LASTEXITCODE
+}
 
 # ── Path validation ───────────────────────────────────────────────────────────
 
@@ -2105,7 +2225,11 @@ if ($cfg.summaryReport) {
         riskDevices     = $riskDevices.ToArray()
         identityChanges = $identityChanges.ToArray()
     }
-    Send-SummaryReport -Report $report -SmtpConfig $cfg.smtp
+    if ($DryRun) {
+        Write-RddLog "[DryRun] Skipping summary report email."
+    } else {
+        Send-SummaryReport -Report $report -SmtpConfig $cfg.smtp
+    }
 } else {
     $criticalCount = @($riskDevices | Where-Object { $_.riskLevel -eq 'CRITICAL' }).Count
     $highCount     = @($riskDevices | Where-Object { $_.riskLevel -eq 'HIGH' }).Count
@@ -2116,13 +2240,17 @@ if ($cfg.summaryReport) {
                   "$($identityChanges.Count) hostname changes.")
 
     if ($rogueDevices.Count -gt 0 -or $riskDevices.Count -gt 0 -or $absentDevices.Count -gt 0) {
-        Send-RogueAlert -Devices $rogueDevices.ToArray() `
-            -RiskDevices $riskDevices.ToArray() `
-            -AbsentDevices $absentDevices `
-            -IdentityChangeCount $identityChanges.Count `
-            -Subnet $targetSubnet `
-            -AuditLogPath $cfg.logPath `
-            -SmtpConfig $cfg.smtp
+        if ($DryRun) {
+            Write-RddLog "[DryRun] Skipping alert email; would have notified $($cfg.smtp.to)."
+        } else {
+            Send-RogueAlert -Devices $rogueDevices.ToArray() `
+                -RiskDevices $riskDevices.ToArray() `
+                -AbsentDevices $absentDevices `
+                -IdentityChangeCount $identityChanges.Count `
+                -Subnet $targetSubnet `
+                -AuditLogPath $cfg.logPath `
+                -SmtpConfig $cfg.smtp
+        }
     } else {
         Write-RddLog 'Scan complete - all devices are known.'
     }
