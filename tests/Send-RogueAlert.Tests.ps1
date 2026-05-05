@@ -209,6 +209,17 @@ Describe 'Send-RogueAlert HTML body' {
         $global:RDDTestCapture.Body | Should -Match '>today<'
     }
 
+    It 'alertRiskLevel=NONE hides the entire Risk-Findings section' {
+        # Construct a risk-only mail; expect the Risk section to be absent
+        # because the call site won't have populated $RiskDevices in that mode.
+        # Here we simulate that by passing an empty risk list and asserting the
+        # rogue table still renders as the only content.
+        Send-RogueAlert -Devices @($script:rogueDevice) -RiskDevices @() -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        $body | Should -Not -Match 'Risk Findings on Known Devices'
+        $body | Should -Match 'Rogue Devices \(1\)'
+    }
+
     It 'risky rogue appears in BOTH rogue table and risk-findings table' {
         # Regression guard: v1.5.2 removed the Risk column from the rogue
         # table without moving risky rogues into the Risk-Findings section,

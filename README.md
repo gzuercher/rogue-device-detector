@@ -175,6 +175,7 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
   "absentDays": 21,
   "summaryReport": false,
   "configured": true,
+  "alertRiskLevel": "HIGH",
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
@@ -197,6 +198,7 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
 | `absentDays` | `21` | Days without a sighting before a device is flagged as absent. |
 | `summaryReport` | `false` | Send a full network health report after every scan (not just rogue alerts). |
 | `configured` | `true` | Safety gate. The unattended installer writes `false`; normal scan mode refuses to run until you flip it to `true` after reviewing this file. `-LearningMode` and admin modes (`-ListDevices`, `-ApproveDevice`, …) bypass the gate. |
+| `alertRiskLevel` | `HIGH` | Threshold for the Risk-Findings table / mail. `NONE` disables the section entirely. Otherwise `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` is the lowest level reported. Default `HIGH` includes only HIGH+CRITICAL (e.g. SSH alone is LOW and stays out). Set to `MEDIUM` to also flag SMTP, `LOW` to flag everything except clean. |
 | `smtp.host` | – | SMTP server hostname. |
 | `smtp.port` | `587` | SMTP port. |
 | `smtp.user` | – | SMTP username. Optional; alerts skip silently if blank. |
