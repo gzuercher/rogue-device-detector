@@ -162,7 +162,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.5.4'
+$SCRIPT_VERSION       = '1.5.5'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 4
@@ -1867,7 +1867,7 @@ function Get-AbsentDevices {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
         Justification = 'Function returns a collection of devices; plural is intentional.')]
     param(
-        [Parameter(Mandatory)][array]$KnownDevices,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$KnownDevices,
         [Parameter(Mandatory)][int]$AbsentDays,
         [Parameter(Mandatory)][string]$Now
     )
