@@ -123,6 +123,7 @@ Mutually exclusive parameter sets enforce valid CLI combinations:
 | `AllowPort` | `-AllowPort`, `-On` (mandatory) | Allow port(s) on a device |
 | `BlockPort` | `-BlockPort`, `-On` (mandatory) | Revoke port allowance |
 | `ListDevices` | `-ListDevices` | Show approved devices |
+| `ApproveAllRogues` | `-ApproveAllRogues`, `-Config`, `-Subnet` | Scan, then bulk-add every detected rogue to baseline. Risk findings are not auto-allowed |
 
 ## Security Ports Monitored
 

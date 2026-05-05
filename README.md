@@ -94,6 +94,7 @@ log are left untouched.
 | `-Label "name"` | String | Human-readable name for the device (only with `-ApproveDevice`). |
 | `-RemoveDevice "MAC"` | String | Remove a device from the baseline. |
 | `-ListDevices` | Switch | Show all approved devices and exit. No scan is performed. |
+| `-ApproveAllRogues` | Switch | Run a full scan and add every detected rogue to the baseline at once. Risk findings are NOT auto-allowed — risky open ports on the approved devices will be reported as RISK on the next scan. Use after acknowledging a batch of expected new devices. |
 
 ### Port Allowlist
 
@@ -133,6 +134,9 @@ Known devices with open ports trigger risk warnings by default. If a port is int
 
 # List all approved devices with their allowed ports
 .\rogue-device-detector.ps1 -ListDevices
+
+# Bulk-approve every currently-rogue device after a known network change
+.\rogue-device-detector.ps1 -ApproveAllRogues
 
 
 # --- Port Allowlist ---
