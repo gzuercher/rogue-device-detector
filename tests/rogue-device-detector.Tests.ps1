@@ -692,12 +692,27 @@ Describe 'Get-Configuration' {
     It 'returns defaults when config file does not exist' {
         $result = Get-Configuration -ConfigPath (Join-Path $TestDrive 'nonexistent.json')
 
-        $result.subnet        | Should -BeNullOrEmpty
-        $result.enrichment    | Should -Be $true
-        $result.absentDays    | Should -Be 21
-        $result.summaryReport | Should -Be $false
-        $result.smtp.port     | Should -Be 587
-        $result.smtp.host     | Should -BeNullOrEmpty
+        $result.subnet         | Should -BeNullOrEmpty
+        $result.enrichment     | Should -Be $true
+        $result.absentDays     | Should -Be 21
+        $result.summaryReport  | Should -Be $false
+        $result.alertRiskLevel | Should -Be 'HIGH'
+        $result.smtp.port      | Should -Be 587
+        $result.smtp.host      | Should -BeNullOrEmpty
+    }
+
+    It 'loads alertRiskLevel from config and uppercases it' {
+        $configPath = Join-Path $TestDrive 'alert-level-config.json'
+        @{ alertRiskLevel = 'medium' } | ConvertTo-Json | Set-Content $configPath
+        $result = Get-Configuration -ConfigPath $configPath
+        $result.alertRiskLevel | Should -Be 'MEDIUM'
+    }
+
+    It 'falls back to default when alertRiskLevel is invalid' {
+        $configPath = Join-Path $TestDrive 'alert-level-bad.json'
+        @{ alertRiskLevel = 'EXTREME' } | ConvertTo-Json | Set-Content $configPath
+        $result = Get-Configuration -ConfigPath $configPath
+        $result.alertRiskLevel | Should -Be 'HIGH'
     }
 
     It 'loads absentDays and summaryReport from config file' {

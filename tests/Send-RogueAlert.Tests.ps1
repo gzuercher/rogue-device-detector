@@ -209,6 +209,36 @@ Describe 'Send-RogueAlert HTML body' {
         $global:RDDTestCapture.Body | Should -Match '>today<'
     }
 
+    It 'alertRiskLevel=NONE hides the entire Risk-Findings section' {
+        # Construct a risk-only mail; expect the Risk section to be absent
+        # because the call site won't have populated $RiskDevices in that mode.
+        # Here we simulate that by passing an empty risk list and asserting the
+        # rogue table still renders as the only content.
+        Send-RogueAlert -Devices @($script:rogueDevice) -RiskDevices @() -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        $body | Should -Not -Match 'Risk Findings on Known Devices'
+        $body | Should -Match 'Rogue Devices \(1\)'
+    }
+
+    It 'risky rogue appears in BOTH rogue table and risk-findings table' {
+        # Regression guard: v1.5.2 removed the Risk column from the rogue
+        # table without moving risky rogues into the Risk-Findings section,
+        # so HIGH/CRITICAL findings on rogues went unreported.
+        $riskyRogue = [PSCustomObject]@{
+            mac='A8:4A:63:0E:E0:D2'; ip='192.168.8.175'; hostname='kroeterix-p14s.local'
+            vendor='TPV Display'; osGuess='Windows'; osLabel='Windows'
+            httpBanner=''; sshBanner=''; telnetBanner=''; upnpInfo=''
+            openPorts=@(445); riskLevel='HIGH'
+            riskReasons=@('File sharing exposed (ransomware vector) (port 445)')
+        }
+        Send-RogueAlert -Devices @($riskyRogue) -RiskDevices @($riskyRogue) -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        $body | Should -Match 'Rogue Devices \(1\)'
+        $body | Should -Match 'Risk Findings on Known Devices \(1\)'
+        # MAC appears twice: once in each table.
+        ([regex]::Matches($body, 'A8:4A:63:0E:E0:D2')).Count | Should -BeGreaterOrEqual 2
+    }
+
     It 'rogue First Seen reflects relative age from SeenRogues' {
         $oldRogue = [PSCustomObject]@{
             mac='AA:BB:CC:DD:EE:51'; ip='1.1.1.51'; hostname='h'

@@ -7,6 +7,7 @@
   "absentDays": 21,
   "summaryReport": false,
   "configured": true,
+  "alertRiskLevel": "HIGH",
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,

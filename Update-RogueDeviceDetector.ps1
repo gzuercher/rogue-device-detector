@@ -181,6 +181,9 @@ function Write-RddConfigFile {
             # Safety gate: scan refuses to run until operator reviews the file
             # and flips this to true. See README / -LearningMode.
             configured    = $false
+            # Risk-Findings threshold. NONE disables the section entirely;
+            # otherwise the lowest level to include (LOW | MEDIUM | HIGH | CRITICAL).
+            alertRiskLevel = 'HIGH'
             smtp          = [ordered]@{
                 host     = $SmtpHost
                 port     = $SmtpPort
