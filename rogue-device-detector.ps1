@@ -82,17 +82,29 @@
 .EXAMPLE
     .\rogue-device-detector.ps1 -BlockPort 23 -On "AA:BB:CC:DD:EE:FF"
     Revoke a previously allowlisted port.
+
+.EXAMPLE
+    .\rogue-device-detector.ps1 -ApproveAllRogues
+    Run a full scan and add every detected rogue device to the baseline in
+    one go. Useful when reviewing alerts in bulk after a known network
+    change. Risk findings are NOT auto-allowed - any risky open ports on
+    the approved devices will be reported as RISK on the next scan.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
     [Parameter(ParameterSetName = 'Scan')]
+    [Parameter(ParameterSetName = 'ApproveAllRogues')]
     [string]$Config = '',
 
     [Parameter(ParameterSetName = 'Scan')]
+    [Parameter(ParameterSetName = 'ApproveAllRogues')]
     [string]$Subnet = '',
 
     [Parameter(ParameterSetName = 'Scan')]
     [switch]$LearningMode,
+
+    [Parameter(Mandatory, ParameterSetName = 'ApproveAllRogues')]
+    [switch]$ApproveAllRogues,
 
     [Parameter(Mandatory, ParameterSetName = 'ApproveDevice')]
     [ValidateNotNullOrEmpty()]
@@ -124,7 +136,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.4.1'
+$SCRIPT_VERSION       = '1.4.2'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -1962,8 +1974,9 @@ if ($LearningMode -or -not $stateFileExists) {
 # Refuse to run a normal scan against an unreviewed default config.
 # Updater-generated configs ship with "configured": false; the operator
 # must review smtp settings (and anything else) and flip the flag.
-# Back-compat: configs without the field default to $true.
-if (-not $cfg.configured) {
+# Admin operations (-LearningMode handled earlier; -ApproveAllRogues here)
+# bypass the gate. Back-compat: configs without the field default to $true.
+if (-not $cfg.configured -and -not $ApproveAllRogues) {
     Write-RddLog "Config has 'configured: false' (unreviewed default config)." -Level ERROR
     Write-RddLog "Edit '$configPath' - review smtp settings, then set 'configured': true." -Level ERROR
     Write-RddLog "Use -LearningMode to seed the baseline before flipping the flag." -Level ERROR
@@ -1997,6 +2010,47 @@ foreach ($device in $foundDevices) {
         Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ROGUE' -Device $device `
             -Details ($device.riskReasons -join '; ')
     }
+}
+
+# Bulk-approve mode: add every detected rogue to the baseline and exit.
+# Risk findings are NOT carried into allowedPorts - they will be reported
+# on the next scan, giving the operator a chance to review per-port.
+if ($ApproveAllRogues) {
+    if ($rogueDevices.Count -eq 0) {
+        Write-RddLog 'No rogue devices found - baseline already covers every device on the subnet.'
+        exit 0
+    }
+
+    $approver = "$env:USERDOMAIN\$env:USERNAME"
+    $highRiskApproved = 0
+    foreach ($d in $rogueDevices) {
+        $state.knownDevices += [PSCustomObject]@{
+            mac          = $d.mac
+            ip           = $d.ip
+            hostname     = $d.hostname
+            vendor       = $d.vendor
+            osGuess      = $d.osGuess
+            label        = ''
+            firstSeen    = $now
+            lastSeen     = $now
+            approvedBy   = $approver
+            approvedAt   = $now
+            allowedPorts = @()
+        }
+        $riskTag = if ($d.riskLevel -and $d.riskLevel -ne 'NONE') { " [$($d.riskLevel)]" } else { '' }
+        if ($d.riskLevel -and $RISK_ORDER[$d.riskLevel] -ge $RISK_ORDER['HIGH']) { $highRiskApproved++ }
+        Write-RddLog "  Approved: $($d.mac)  $($d.ip)  $($d.hostname)  [$($d.vendor)]$riskTag"
+        Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_APPROVED' -Device $d `
+            -Details "bulk-approve risk=$($d.riskLevel)"
+    }
+
+    $state.lastScan = $now
+    Save-State -State $state -StatePath $cfg.statePath
+    Write-RddLog "$($rogueDevices.Count) device(s) approved into baseline."
+    if ($highRiskApproved -gt 0) {
+        Write-RddLog "$highRiskApproved approved device(s) have HIGH/CRITICAL risk findings; they will be reported as RISK on the next scan." -Level WARN
+    }
+    exit 0
 }
 
 # Filter allowed ports and log risk findings for known devices
