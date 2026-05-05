@@ -1,6 +1,10 @@
 # Rogue Device Detector (RDD)
 
+[![Releases](https://img.shields.io/github/v/release/gzuercher/rogue-device-detector)](https://github.com/gzuercher/rogue-device-detector/releases) [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![CI](https://github.com/gzuercher/rogue-device-detector/actions/workflows/test.yml/badge.svg)](https://github.com/gzuercher/rogue-device-detector/actions/workflows/test.yml)
+
 A standalone PowerShell script that detects unauthorized devices on your network. Built for MSPs and IT admins who need visibility into what's connected — without agents, cloud services, or vendor lock-in.
+
+See [release notes](https://github.com/gzuercher/rogue-device-detector/releases) for changes between versions, [SECURITY.md](SECURITY.md) for vulnerability reporting, and [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup.
 
 **What it does:** Scans your network, builds a baseline of known devices, and alerts you when something new shows up. It also monitors known devices for risky open ports and flags devices that disappear.
 
@@ -95,6 +99,15 @@ log are left untouched.
 | `-RemoveDevice "MAC"` | String | Remove a device from the baseline. |
 | `-ListDevices` | Switch | Show all approved devices and exit. No scan is performed. |
 | `-ApproveAllRogues` | Switch | Run a full scan and add every detected rogue to the baseline at once. Risk findings are NOT auto-allowed — risky open ports on the approved devices will be reported as RISK on the next scan. Use after acknowledging a batch of expected new devices. |
+
+### Diagnostics
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `-Version` | Switch | Print the script version and exit. |
+| `-TestSmtp` | Switch | Send a single test email using the configured SMTP settings, then exit. No scan, no state mutation. Use to validate config during initial setup. |
+| `-DryRun` | Switch | (Combine with default scan mode.) Run a full scan but skip `state.json`, audit log, and email side effects. Useful for testing config changes without consequences. |
+| `-?` / `Get-Help .\rogue-device-detector.ps1 -Full` | — | Built-in PowerShell help. Shows full parameter docs and usage examples. |
 
 ### Port Allowlist
 
@@ -195,6 +208,20 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
 All path values must include the full filename. Backslashes must be escaped as `\\` in JSON.
 
 `state.json`, `oui.csv`, and `rdd-audit.csv` are also excluded from git.
+
+### Audit log rotation
+
+`rdd-audit.csv` is rotated automatically when its size exceeds 10 MB. The
+active file is renamed to `<base>.YYYY-MM-DD-HHmmss.csv` and a fresh CSV
+with the same header is started. Rotated files stay on disk for the
+operator to archive or prune.
+
+### Migrating state to another host
+
+`state.json` is a portable JSON file with a versioned schema. Copy it to
+the new host's configured `statePath` and the schema migrator brings older
+versions up to current on first read. No re-baselining required if the
+network is unchanged.
 
 ## Alerts
 

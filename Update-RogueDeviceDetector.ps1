@@ -202,7 +202,10 @@ function Write-RddConfigFile {
     }
 }
 
-# -- Main 
+# -- Main
+
+# Guard: skip main body when dot-sourced for unit testing (e.g. Pester).
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 Write-Status "Rogue Device Detector updater starting on $env:COMPUTERNAME"
 Write-Status "Target path : $ScriptPath"
