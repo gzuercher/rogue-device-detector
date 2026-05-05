@@ -162,7 +162,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.5.2'
+$SCRIPT_VERSION       = '1.5.3'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 4
@@ -2412,12 +2412,14 @@ foreach ($device in $foundDevices) {
     $device.riskReasons = $filtered.Reasons
 
     if ($RISK_ORDER[$device.riskLevel] -ge $RISK_ORDER['HIGH']) {
-        $isRogue = $rogueDevices | Where-Object { $_.mac -eq $device.mac }
-        if (-not $isRogue) {
-            Write-AuditLog -LogPath $cfg.logPath -EventName 'RISK_FOUND' -Device $device `
-                -Details ($device.riskReasons -join '; ')
-            $riskDevices.Add($device)
-        }
+        # Both rogues and known devices with HIGH/CRITICAL risk are added to
+        # the Risk-Findings table. The Rogue table is the identity view; the
+        # Risk table is the security view. A risky rogue appears in both -
+        # without the security view, removing the Risk column from rogue
+        # rows would have hidden the alarm.
+        Write-AuditLog -LogPath $cfg.logPath -EventName 'RISK_FOUND' -Device $device `
+            -Details ($device.riskReasons -join '; ')
+        $riskDevices.Add($device)
     }
 }
 
