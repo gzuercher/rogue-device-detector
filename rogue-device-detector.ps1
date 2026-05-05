@@ -116,7 +116,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.3.9'
+$SCRIPT_VERSION       = '1.4.0'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 3
@@ -986,9 +986,15 @@ function Save-State {
 function Send-RogueAlert {
     <#
     .SYNOPSIS
-        Sends an SMTP email listing newly discovered rogue devices.
-    .PARAMETER Devices Array of rogue device PSCustomObjects.
-    .PARAMETER SmtpConfig Hashtable with SMTP connection settings from config.
+        Sends an HTML alert email summarising rogue devices, risk findings,
+        and absent devices. The audit CSV is attached when available.
+    .PARAMETER Devices             Rogue (unknown-MAC) devices.
+    .PARAMETER SmtpConfig          Hashtable with SMTP connection settings.
+    .PARAMETER RiskDevices         Known devices with HIGH/CRITICAL risk findings.
+    .PARAMETER AbsentDevices       Known devices not seen for >= absentDays.
+    .PARAMETER IdentityChangeCount Count of hostname-change events this scan.
+    .PARAMETER Subnet              Scanned subnet (for the email header).
+    .PARAMETER AuditLogPath        Path to audit CSV; attached if it exists.
     #>
     # Password is read from a plain-text config file; SecureString conversion at this
     # boundary is unavoidable without a full credential-store integration.
@@ -1000,7 +1006,10 @@ function Send-RogueAlert {
         [Parameter(Mandatory)][array]$Devices,
         [Parameter(Mandatory)][hashtable]$SmtpConfig,
         [array]$RiskDevices = @(),
-        [array]$AbsentDevices = @()
+        [array]$AbsentDevices = @(),
+        [int]$IdentityChangeCount = 0,
+        [string]$Subnet = '',
+        [string]$AuditLogPath = ''
     )
 
     if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
@@ -1008,75 +1017,240 @@ function Send-RogueAlert {
         return
     }
 
+    if (($Devices.Count + $RiskDevices.Count + $AbsentDevices.Count) -eq 0) {
+        # Defensive: caller already gates this; nothing to report.
+        return
+    }
+
     $scriptPath = $PSCommandPath
+    $hostname   = $env:COMPUTERNAME
+    $timestamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
-    $rogueLines = ($Devices | ForEach-Object {
-        $d     = $_
-        $lines = [System.Collections.Generic.List[string]]::new()
-        $lines.Add("  MAC:      $($d.mac)")
-        $lines.Add("  IP:       $($d.ip)")
-        $lines.Add("  Hostname: $($d.hostname)")
-        $lines.Add("  Vendor:   $($d.vendor)")
-        if ($d.openPorts -and $d.openPorts.Count -gt 0) {
-            $labels = $d.openPorts | ForEach-Object {
-                $def = $SECURITY_PORTS | Where-Object { $_.Port -eq $_ } | Select-Object -First 1
-                if ($def) { "$_/$($def.Label)" } else { "$_" }
-            }
-            $lines.Add("  Ports:    $($labels -join ', ')")
+    $esc = {
+        param($t)
+        if ($null -eq $t) { return '' }
+        [System.Net.WebUtility]::HtmlEncode([string]$t)
+    }
+
+    $riskBadge = {
+        param($Level)
+        $bg = switch ($Level) {
+            'CRITICAL' { '#dc2626' }
+            'HIGH'     { '#ea580c' }
+            'MEDIUM'   { '#d97706' }
+            'LOW'      { '#ca8a04' }
+            default    { '#718096' }
         }
-        if ($d.riskLevel -and $d.riskLevel -ne 'NONE') {
-            $lines.Add("  RISK:     [$($d.riskLevel)] $($d.riskReasons -join '; ')")
-        }
-        if ($d.osGuess)    { $lines.Add("  OS:       $($d.osGuess)") }
-        if ($d.httpBanner) { $lines.Add("  Banner:   $($d.httpBanner)") }
-        if ($d.upnpInfo)   { $lines.Add("  UPnP:     $($d.upnpInfo)") }
-        $lines.Add('')
-        $lines.Add("  -> If AUTHORIZED, run on $($env:COMPUTERNAME):")
-        $lines.Add("     & `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<device description>`"")
-        $lines.Add('  -> If UNAUTHORIZED: isolate/remove from network immediately.')
-        $lines -join "`n"
-    }) -join "`n`n---`n`n"
+        $safe = & $esc $Level
+        "<span style=`"display:inline-block;padding:2px 8px;background:$bg;color:#fff;border-radius:3px;font-size:11px;font-weight:600;`">$safe</span>"
+    }
 
-    $riskLines = ($RiskDevices | ForEach-Object {
-        $d = $_
-        @(
-            "  MAC:      $($d.mac)"
-            "  IP:       $($d.ip)"
-            "  Hostname: $($d.hostname)"
-            "  RISK:     [$($d.riskLevel)] $($d.riskReasons -join '; ')"
-        ) -join "`n"
-    }) -join "`n`n---`n`n"
+    $codeBlock = {
+        param($Code)
+        $safe = & $esc $Code
+        "<pre style=`"background:#1a202c;color:#cbd5e0;padding:10px 12px;margin:0;font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;`">$safe</pre>"
+    }
 
-    $absentLines = ($AbsentDevices | ForEach-Object {
-        $d = $_
-        $label = if ($d.label) { " ($($d.label))" } else { '' }
-        "  $($d.mac)$label  Last seen: $($d.lastSeen)"
-    }) -join "`n"
+    $thStyle = 'padding:10px;font-weight:600;color:#4a5568;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;background:#edf2f7;border-bottom:2px solid #cbd5e0;'
+    $tdStyle = 'padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:13px;'
+    $tdMono  = "$tdStyle font-family:Consolas,Monaco,monospace;font-size:12px;"
+    $actionTd = 'padding:0 10px 12px;border-bottom:1px solid #e2e8f0;background:#fafafa;'
 
-    $sections = [System.Collections.Generic.List[string]]::new()
+    $criticalCount = @($RiskDevices | Where-Object { $_.riskLevel -eq 'CRITICAL' }).Count
+    $highCount     = @($RiskDevices | Where-Object { $_.riskLevel -eq 'HIGH' }).Count
+
+    # ---- Summary badges ----
+    $summaryBadges = [System.Collections.Generic.List[string]]::new()
+    $badgeStyle = 'display:inline-block;padding:6px 12px;border-radius:4px;font-weight:600;font-size:13px;margin:0 6px 6px 0;'
     if ($Devices.Count -gt 0) {
-        $sections.Add("== ROGUE DEVICES ($($Devices.Count)) ==`n`n$rogueLines")
+        $summaryBadges.Add("<span style=`"$badgeStyle background:#fed7d7;color:#c53030;`">$($Devices.Count) rogue</span>")
     }
     if ($RiskDevices.Count -gt 0) {
-        $sections.Add("== RISK FINDINGS ON KNOWN DEVICES ($($RiskDevices.Count)) ==`n`n$riskLines")
+        $detail = if ($criticalCount -gt 0 -or $highCount -gt 0) { " ($criticalCount critical, $highCount high)" } else { '' }
+        $summaryBadges.Add("<span style=`"$badgeStyle background:#feebc8;color:#9c4221;`">$($RiskDevices.Count) risk$detail</span>")
     }
     if ($AbsentDevices.Count -gt 0) {
-        $sections.Add("== ABSENT DEVICES ($($AbsentDevices.Count)) ==`n`n$absentLines")
+        $summaryBadges.Add("<span style=`"$badgeStyle background:#e2e8f0;color:#4a5568;`">$($AbsentDevices.Count) absent</span>")
+    }
+    if ($IdentityChangeCount -gt 0) {
+        $summaryBadges.Add("<span style=`"$badgeStyle background:#bee3f8;color:#2c5282;`">$IdentityChangeCount hostname change(s)</span>")
     }
 
+    # ---- Rogue section ----
+    $rogueSection = ''
+    if ($Devices.Count -gt 0) {
+        $rows = ($Devices | ForEach-Object {
+            $d         = $_
+            $macCell   = & $esc $d.mac
+            $ipCell    = & $esc $d.ip
+            $hostCell  = & $esc $d.hostname
+            $vendor    = & $esc $d.vendor
+            $os        = & $esc $d.osGuess
+            $portsTxt  = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '<span style="color:#a0aec0;">-</span>' }
+            $riskHtml  = if ($d.riskLevel -and $d.riskLevel -ne 'NONE') { & $riskBadge $d.riskLevel } else { '<span style="color:#a0aec0;">-</span>' }
+            $cmd       = "& `"$scriptPath`" -ApproveDevice `"$($d.mac)`" -Label `"<device description>`""
+            $cmdHtml   = & $codeBlock $cmd
+            @"
+<tr>
+<td style="$tdMono white-space:nowrap;">$macCell</td>
+<td style="$tdMono">$ipCell</td>
+<td style="$tdStyle">$hostCell</td>
+<td style="$tdStyle color:#4a5568;">$vendor</td>
+<td style="$tdStyle color:#4a5568;">$os</td>
+<td style="$tdMono">$portsTxt</td>
+<td style="$tdStyle text-align:center;">$riskHtml</td>
+</tr>
+<tr>
+<td colspan="7" style="$actionTd">
+<div style="font-size:11px;color:#718096;margin:6px 0 4px;">If authorized, approve on $(& $esc $hostname):</div>
+$cmdHtml
+</td>
+</tr>
+"@
+        }) -join "`n"
+
+        $rogueSection = @"
+<h2 style="font-size:15px;margin:24px 24px 12px;color:#1a202c;font-weight:600;border-left:4px solid #dc2626;padding-left:10px;">Rogue Devices ($($Devices.Count))</h2>
+<table cellpadding="0" cellspacing="0" style="width:auto;min-width:100%;margin:0 24px 16px;border-collapse:collapse;border:1px solid #e2e8f0;">
+<thead>
+<tr>
+<th align="left" style="$thStyle">MAC</th>
+<th align="left" style="$thStyle">IP</th>
+<th align="left" style="$thStyle">Hostname</th>
+<th align="left" style="$thStyle">Vendor</th>
+<th align="left" style="$thStyle">OS</th>
+<th align="left" style="$thStyle">Ports</th>
+<th align="center" style="$thStyle">Risk</th>
+</tr>
+</thead>
+<tbody>
+$rows
+</tbody>
+</table>
+"@
+    }
+
+    # ---- Risk section ----
+    $riskSection = ''
+    if ($RiskDevices.Count -gt 0) {
+        $rows = ($RiskDevices | ForEach-Object {
+            $d        = $_
+            $macCell  = & $esc $d.mac
+            $ipCell   = & $esc $d.ip
+            $hostCell = & $esc $d.hostname
+            $reasons  = if ($d.riskReasons) { & $esc ($d.riskReasons -join '; ') } else { '' }
+            $portsTxt = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '-' }
+            $riskHtml = & $riskBadge $d.riskLevel
+            $cmd      = "& `"$scriptPath`" -AllowPort <port> -On `"$($d.mac)`""
+            $cmdHtml  = & $codeBlock $cmd
+            @"
+<tr>
+<td style="$tdMono white-space:nowrap;">$macCell</td>
+<td style="$tdMono">$ipCell</td>
+<td style="$tdStyle">$hostCell</td>
+<td style="$tdStyle text-align:center;">$riskHtml</td>
+<td style="$tdStyle color:#4a5568;">$reasons</td>
+<td style="$tdMono">$portsTxt</td>
+</tr>
+<tr>
+<td colspan="6" style="$actionTd">
+<div style="font-size:11px;color:#718096;margin:6px 0 4px;">If a port is intentional, allow it (replace &lt;port&gt;):</div>
+$cmdHtml
+</td>
+</tr>
+"@
+        }) -join "`n"
+
+        $riskSection = @"
+<h2 style="font-size:15px;margin:24px 24px 12px;color:#1a202c;font-weight:600;border-left:4px solid #ea580c;padding-left:10px;">Risk Findings on Known Devices ($($RiskDevices.Count))</h2>
+<table cellpadding="0" cellspacing="0" style="width:auto;min-width:100%;margin:0 24px 16px;border-collapse:collapse;border:1px solid #e2e8f0;">
+<thead>
+<tr>
+<th align="left" style="$thStyle">MAC</th>
+<th align="left" style="$thStyle">IP</th>
+<th align="left" style="$thStyle">Hostname</th>
+<th align="center" style="$thStyle">Level</th>
+<th align="left" style="$thStyle">Reasons</th>
+<th align="left" style="$thStyle">Open Ports</th>
+</tr>
+</thead>
+<tbody>
+$rows
+</tbody>
+</table>
+"@
+    }
+
+    # ---- Absent section ----
+    $absentSection = ''
+    if ($AbsentDevices.Count -gt 0) {
+        $rows = ($AbsentDevices | ForEach-Object {
+            $d        = $_
+            $macCell  = & $esc $d.mac
+            $label    = if ($d.label) { & $esc $d.label } else { '<span style="color:#a0aec0;">-</span>' }
+            $lastSeen = & $esc $d.lastSeen
+            "<tr><td style=`"$tdMono white-space:nowrap;`">$macCell</td><td style=`"$tdStyle`">$label</td><td style=`"$tdMono`">$lastSeen</td></tr>"
+        }) -join "`n"
+
+        $absentSection = @"
+<h2 style="font-size:15px;margin:24px 24px 12px;color:#1a202c;font-weight:600;border-left:4px solid #718096;padding-left:10px;">Absent Devices ($($AbsentDevices.Count))</h2>
+<table cellpadding="0" cellspacing="0" style="width:auto;min-width:100%;margin:0 24px 16px;border-collapse:collapse;border:1px solid #e2e8f0;">
+<thead>
+<tr>
+<th align="left" style="$thStyle">MAC</th>
+<th align="left" style="$thStyle">Label</th>
+<th align="left" style="$thStyle">Last Seen</th>
+</tr>
+</thead>
+<tbody>
+$rows
+</tbody>
+</table>
+"@
+    }
+
+    # ---- Footer ----
+    $auditNote = if ($AuditLogPath -and (Test-Path $AuditLogPath)) {
+        "Full audit log attached as <code style=`"background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;`">$(& $esc (Split-Path $AuditLogPath -Leaf))</code>."
+    } else { '' }
+    $listCmd = & $esc "& `"$scriptPath`" -ListDevices"
+
+    # ---- Assemble ----
+    $subnetDisplay = if ($Subnet) { " &middot; subnet $(& $esc $Subnet)" } else { '' }
     $body = @"
-Rogue Device Detector - Alert
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Rogue Device Detector</title></head>
+<body style="font-family:'Segoe UI',Arial,sans-serif;color:#1a202c;background:#f7fafc;margin:0;padding:20px;">
+<div style="max-width:960px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:6px;overflow:hidden;">
 
-$($sections -join "`n`n")
+<div style="background:#1a202c;color:#fff;padding:18px 24px;">
+<div style="font-size:18px;font-weight:600;letter-spacing:0.3px;">Rogue Device Detector</div>
+<div style="font-size:13px;color:#a0aec0;margin-top:4px;">$(& $esc $hostname) &middot; $(& $esc $timestamp)$subnetDisplay</div>
+</div>
 
----
-Scan time : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-Scanner   : $env:COMPUTERNAME
+<div style="padding:18px 24px;background:#f7fafc;border-bottom:1px solid #e2e8f0;">
+<div style="font-size:11px;color:#718096;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Scan summary</div>
+<div style="margin-top:10px;">
+$($summaryBadges -join "`n")
+</div>
+</div>
 
-To review the full baseline:
-  & "$scriptPath" -List
+$rogueSection
+$riskSection
+$absentSection
+
+<div style="padding:14px 24px;background:#f7fafc;font-size:12px;color:#718096;border-top:1px solid #e2e8f0;line-height:1.6;">
+$auditNote<br>
+Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:12px;">$listCmd</code> for the full baseline.
+</div>
+
+</div>
+</body>
+</html>
 "@
 
+    # ---- Subject ----
     $subjectParts = [System.Collections.Generic.List[string]]::new()
     if ($Devices.Count -gt 0)       { $subjectParts.Add("$($Devices.Count) rogue") }
     if ($RiskDevices.Count -gt 0)   { $subjectParts.Add("$($RiskDevices.Count) risk") }
@@ -1089,15 +1263,20 @@ To review the full baseline:
     $mailParams = @{
         From       = $SmtpConfig.from
         To         = $SmtpConfig.to
-        Subject    = "[$env:COMPUTERNAME] $($subjectParts -join ', ') - $(Get-Date -Format 'yyyy-MM-dd')"
+        Subject    = "[$hostname] $($subjectParts -join ', ') - $(Get-Date -Format 'yyyy-MM-dd')"
         Body       = $body
+        BodyAsHtml = $true
         SmtpServer = $SmtpConfig.host
         Port       = [int]$SmtpConfig.port
         UseSsl     = $useSsl
     }
 
+    if ($AuditLogPath -and (Test-Path $AuditLogPath)) {
+        $mailParams.Attachments = $AuditLogPath
+    }
+
     if ($SmtpConfig.user) {
-        $securePass        = ConvertTo-SecureString -String $SmtpConfig.password -AsPlainText -Force
+        $securePass            = ConvertTo-SecureString -String $SmtpConfig.password -AsPlainText -Force
         $mailParams.Credential = New-Object System.Management.Automation.PSCredential($SmtpConfig.user, $securePass)
     }
 
@@ -1871,6 +2050,9 @@ if ($cfg.summaryReport) {
         Send-RogueAlert -Devices $rogueDevices.ToArray() `
             -RiskDevices $riskDevices.ToArray() `
             -AbsentDevices $absentDevices `
+            -IdentityChangeCount $identityChanges.Count `
+            -Subnet $targetSubnet `
+            -AuditLogPath $cfg.logPath `
             -SmtpConfig $cfg.smtp
     } else {
         Write-RddLog 'Scan complete - all devices are known.'
