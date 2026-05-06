@@ -32,6 +32,13 @@
     Human-readable name for the device being approved (e.g. "John's laptop").
     Only used together with -ApproveDevice.
 
+.PARAMETER AliasOf
+    MAC address of an existing primary device. When set, -ApproveDevice attaches
+    the new MAC as an alias of that device instead of creating a separate entry.
+    Use this for hardware with multiple network interfaces (e.g. a notebook's
+    wired and WiFi MACs - same logical device).
+    Only used together with -ApproveDevice.
+
 .PARAMETER RemoveDevice
     MAC address to remove from the baseline (e.g. "AA:BB:CC:DD:EE:FF").
     Use this to un-approve a device that was added by mistake or left the network.
@@ -139,6 +146,9 @@ param(
     [Parameter(ParameterSetName = 'ApproveDevice')]
     [string]$Label = '',
 
+    [Parameter(ParameterSetName = 'ApproveDevice')]
+    [string]$AliasOf = '',
+
     [Parameter(Mandatory, ParameterSetName = 'RemoveDevice')]
     [ValidateNotNullOrEmpty()]
     [string]$RemoveDevice,
@@ -162,10 +172,10 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.5.5'
+$SCRIPT_VERSION       = '1.6.0'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
-$STATE_SCHEMA_VERSION = 4
+$STATE_SCHEMA_VERSION = 5
 
 $SECURITY_PORTS = @(
     [PSCustomObject]@{ Port = 21;   Label = 'FTP';        Risk = 'HIGH';     Reason = 'Unencrypted file transfer' },
@@ -611,6 +621,200 @@ function Get-ArpEntry {
     return $entries.ToArray()
 }
 
+function Invoke-MulticastDnsPtrQuery {
+    <#
+    .SYNOPSIS
+        Sends a DNS reverse-PTR query to a multicast group and parses the first
+        PTR answer. Used for both mDNS (224.0.0.251:5353) and LLMNR
+        (224.0.0.252:5355) — the wire format is identical.
+    .PARAMETER IP        Target IPv4 address.
+    .PARAMETER Group     Multicast group (string).
+    .PARAMETER Port      Multicast destination port.
+    .PARAMETER TimeoutMs Per-receive timeout in milliseconds.
+    .PARAMETER UnicastResponseBit
+                         Set the QU (high) bit in QCLASS. Required for one-shot
+                         mDNS queries per RFC 6762; not used for LLMNR.
+    .RETURNS Hostname string or empty string if no PTR answer arrived in time.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [Parameter(Mandatory)][string]$Group,
+        [Parameter(Mandatory)][int]$Port,
+        [int]$TimeoutMs = 1500,
+        [switch]$UnicastResponseBit
+    )
+
+    $client = $null
+    try {
+        $octets = $IP.Split('.')
+        if (@($octets).Count -ne 4) { return '' }
+        $labels = @($octets[3], $octets[2], $octets[1], $octets[0], 'in-addr', 'arpa')
+
+        $msg = [System.Collections.Generic.List[byte]]::new()
+        $rng = [System.Random]::new()
+        $msg.Add([byte]$rng.Next(0, 256)); $msg.Add([byte]$rng.Next(0, 256))   # ID
+        $msg.AddRange([byte[]](0x00, 0x00))                                    # Flags: standard query
+        $msg.AddRange([byte[]](0x00, 0x01))                                    # QDCOUNT = 1
+        $msg.AddRange([byte[]](0x00, 0x00, 0x00, 0x00, 0x00, 0x00))            # AN/NS/AR = 0
+        foreach ($label in $labels) {
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($label)
+            $msg.Add([byte]$bytes.Length)
+            $msg.AddRange($bytes)
+        }
+        $msg.Add([byte]0x00)                                                   # QNAME terminator
+        $msg.AddRange([byte[]](0x00, 0x0C))                                    # QTYPE = PTR
+        $qclassHi = if ($UnicastResponseBit) { 0x80 } else { 0x00 }
+        $msg.AddRange([byte[]]($qclassHi, 0x01))                               # QCLASS = IN (+QU)
+
+        $client = [System.Net.Sockets.UdpClient]::new()
+        $client.Client.ReceiveTimeout = $TimeoutMs
+        # Bind to any local port; OS picks ephemeral. Multicast TTL=1 keeps it on-LAN.
+        $client.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IP,
+            [System.Net.Sockets.SocketOptionName]::MulticastTimeToLive, 1)
+
+        $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Group), $Port)
+        $packet = $msg.ToArray()
+        [void]$client.Send($packet, $packet.Length, $ep)
+
+        # Read until we either see a PTR answer or the timeout fires.
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            try {
+                $remote   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+                $response = $client.Receive([ref]$remote)
+            } catch {
+                break  # timeout
+            }
+            $name = ConvertFrom-DnsPtrAnswer -Bytes $response
+            if ($name) { return $name }
+        }
+    } catch {
+        $null = $_
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { $null = $_ } }
+    }
+    return ''
+}
+
+function ConvertFrom-DnsPtrAnswer {
+    <#
+    .SYNOPSIS
+        Parses a DNS response message and returns the first PTR-record name.
+        Handles DNS name compression (0xC0 pointers).
+    .PARAMETER Bytes Raw DNS response bytes.
+    .RETURNS Hostname string (without trailing dot) or empty string.
+    #>
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    if ($Bytes.Length -lt 12) { return '' }
+    $anCount = ($Bytes[6] -shl 8) -bor $Bytes[7]
+    if ($anCount -lt 1) { return '' }
+
+    # Skip the question section: walk the QNAME labels, then 4 bytes (QTYPE+QCLASS).
+    $offset = 12
+    while ($offset -lt $Bytes.Length -and $Bytes[$offset] -ne 0) {
+        if (($Bytes[$offset] -band 0xC0) -eq 0xC0) { $offset += 2; break }
+        $offset += 1 + $Bytes[$offset]
+    }
+    if ($offset -lt $Bytes.Length -and $Bytes[$offset] -eq 0) { $offset++ }
+    $offset += 4
+
+    for ($i = 0; $i -lt $anCount -and $offset -lt $Bytes.Length; $i++) {
+        # Skip the answer NAME field (compressed or labels).
+        if (($Bytes[$offset] -band 0xC0) -eq 0xC0) {
+            $offset += 2
+        } else {
+            while ($offset -lt $Bytes.Length -and $Bytes[$offset] -ne 0) {
+                $offset += 1 + $Bytes[$offset]
+            }
+            $offset++
+        }
+        if ($offset + 10 -gt $Bytes.Length) { return '' }
+        $type    = ($Bytes[$offset] -shl 8) -bor $Bytes[$offset + 1]
+        $rdlen   = ($Bytes[$offset + 8] -shl 8) -bor $Bytes[$offset + 9]
+        $rdStart = $offset + 10
+        if ($type -eq 0x000C) {
+            return Read-DnsName -Bytes $Bytes -Offset $rdStart
+        }
+        $offset = $rdStart + $rdlen
+    }
+    return ''
+}
+
+function Read-DnsName {
+    <#
+    .SYNOPSIS
+        Reads a (possibly compressed) DNS name from a message.
+    .PARAMETER Bytes  Full DNS message bytes (needed to follow 0xC0 pointers).
+    .PARAMETER Offset Starting offset of the name.
+    .RETURNS Dotted hostname string, empty on malformed input.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][int]$Offset
+    )
+
+    $labels = [System.Collections.Generic.List[string]]::new()
+    $hops   = 0
+    $cursor = $Offset
+    while ($cursor -lt $Bytes.Length) {
+        $len = $Bytes[$cursor]
+        if ($len -eq 0) { break }
+        if (($len -band 0xC0) -eq 0xC0) {
+            if ($cursor + 1 -ge $Bytes.Length) { return '' }
+            $cursor = (($len -band 0x3F) -shl 8) -bor $Bytes[$cursor + 1]
+            $hops++
+            if ($hops -gt 16) { return '' }   # guard against pointer loops
+            continue
+        }
+        if ($cursor + 1 + $len -gt $Bytes.Length) { return '' }
+        $labels.Add([System.Text.Encoding]::ASCII.GetString($Bytes, $cursor + 1, $len))
+        $cursor += 1 + $len
+    }
+    return ($labels -join '.')
+}
+
+function Resolve-HostnameMdns {
+    <#
+    .SYNOPSIS
+        Resolves a hostname via mDNS (RFC 6762) reverse-PTR query against
+        Multicast 224.0.0.251:5353. Returns .local names (Apple/Linux/IoT).
+    .PARAMETER IP         Target IPv4 address.
+    .PARAMETER TimeoutMs  Receive timeout in milliseconds.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Mdns is a proper acronym, not plural.'
+    )]
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$TimeoutMs = 1500
+    )
+    return Invoke-MulticastDnsPtrQuery -IP $IP -Group '224.0.0.251' -Port 5353 `
+        -TimeoutMs $TimeoutMs -UnicastResponseBit
+}
+
+function Resolve-HostnameLlmnr {
+    <#
+    .SYNOPSIS
+        Resolves a hostname via LLMNR (RFC 4795) reverse-PTR query against
+        Multicast 224.0.0.252:5355. Covers modern Windows hosts that no
+        longer have NetBIOS over TCP/IP enabled.
+    .PARAMETER IP         Target IPv4 address.
+    .PARAMETER TimeoutMs  Receive timeout in milliseconds.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Llmnr is a proper acronym, not plural.'
+    )]
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$TimeoutMs = 1500
+    )
+    return Invoke-MulticastDnsPtrQuery -IP $IP -Group '224.0.0.252' -Port 5355 `
+        -TimeoutMs $TimeoutMs
+}
+
 function Resolve-HostnameNetBios {
     <#
     .SYNOPSIS
@@ -679,9 +883,11 @@ function Resolve-HostnameNetBios {
 function Resolve-Hostname {
     <#
     .SYNOPSIS
-        Resolves hostnames for an array of devices concurrently via async DNS.
-        All requests are fired simultaneously with a 2-second timeout.
-        Falls back to NetBIOS name resolution for unresolved devices.
+        Resolves hostnames for an array of devices in a layered cascade:
+        DNS (async, concurrent) → mDNS → LLMNR → NetBIOS. Each fallback runs
+        only against devices still unresolved by the previous step.
+        UPnP friendlyName is applied later, in the enrichment phase, since
+        UPnP discovery is a separate pipeline stage.
         Updates the hostname property of each device object in place.
     .PARAMETER Devices Array of PSCustomObjects with an 'ip' property.
     #>
@@ -727,9 +933,33 @@ function Resolve-Hostname {
         $unresolved.Add($t.Device)
     }
 
-    # NetBIOS fallback for unresolved devices
-    if ($unresolved.Count -gt 0) {
-        Write-RddLog "Trying NetBIOS fallback for $($unresolved.Count) unresolved device(s)..."
+    # mDNS fallback (Apple/Linux/IoT with Bonjour/avahi)
+    if (@($unresolved).Count -gt 0) {
+        Write-RddLog "Trying mDNS fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($d in $unresolved) {
+            $mName = Resolve-HostnameMdns -IP $d.ip
+            if ($mName) { $d.hostname = $mName; $resolved++ }
+            else        { $stillUnresolved.Add($d) }
+        }
+        $unresolved = $stillUnresolved
+    }
+
+    # LLMNR fallback (modern Windows without NetBIOS over TCP/IP)
+    if (@($unresolved).Count -gt 0) {
+        Write-RddLog "Trying LLMNR fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($d in $unresolved) {
+            $lName = Resolve-HostnameLlmnr -IP $d.ip
+            if ($lName) { $d.hostname = $lName; $resolved++ }
+            else        { $stillUnresolved.Add($d) }
+        }
+        $unresolved = $stillUnresolved
+    }
+
+    # NetBIOS fallback (legacy Windows / SMB devices)
+    if (@($unresolved).Count -gt 0) {
+        Write-RddLog "Trying NetBIOS fallback for $(@($unresolved).Count) unresolved device(s)..."
         foreach ($d in $unresolved) {
             $nbName = Resolve-HostnameNetBios -IP $d.ip
             if ($nbName) {
@@ -846,13 +1076,22 @@ function Get-HttpBanner {
 function Invoke-UpnpDiscovery {
     <#
     .SYNOPSIS
-        Sends a UPnP/SSDP M-SEARCH broadcast and collects device responses.
-    .PARAMETER ListenSeconds How long to listen for responses.
-    .RETURNS Hashtable of IP address -> SERVER string.
+        Sends a UPnP/SSDP M-SEARCH broadcast, collects device responses, and
+        for each unique LOCATION URL fetches the device description XML to
+        extract the friendlyName.
+    .PARAMETER ListenSeconds How long to listen for SSDP responses.
+    .PARAMETER FetchTimeoutSec Per-LOCATION HTTP timeout for description XML.
+    .RETURNS Hashtable of IP address -> PSCustomObject{ Server, FriendlyName }.
+             Either field may be empty; FriendlyName is left empty when the
+             LOCATION URL cannot be reached or contains no <friendlyName>.
     #>
-    param([int]$ListenSeconds = 3)
+    param(
+        [int]$ListenSeconds   = 3,
+        [int]$FetchTimeoutSec = 2
+    )
 
-    $results = @{}
+    $results   = @{}
+    $locations = @{}   # ip -> LOCATION URL (only the first response per IP is kept)
     try {
         $client = [System.Net.Sockets.UdpClient]::new()
         $client.Client.ReceiveTimeout = 500
@@ -868,10 +1107,16 @@ function Invoke-UpnpDiscovery {
                 $data     = $client.Receive([ref]$remote)
                 $response = [System.Text.Encoding]::ASCII.GetString($data)
                 $ip       = $remote.Address.ToString()
+                if (-not $results.ContainsKey($ip)) {
+                    $results[$ip] = [PSCustomObject]@{ Server = ''; FriendlyName = '' }
+                }
                 if ($response -match '(?i)SERVER:\s*(.+)') {
-                    $results[$ip] = $Matches[1].Trim()
-                } elseif (-not $results.ContainsKey($ip)) {
-                    $results[$ip] = 'UPnP device'
+                    $results[$ip].Server = $Matches[1].Trim()
+                } elseif (-not $results[$ip].Server) {
+                    $results[$ip].Server = 'UPnP device'
+                }
+                if (-not $locations.ContainsKey($ip) -and $response -match '(?im)^LOCATION:\s*(\S+)') {
+                    $locations[$ip] = $Matches[1].Trim()
                 }
             } catch { $null = $_ }
         }
@@ -880,7 +1125,37 @@ function Invoke-UpnpDiscovery {
         Write-RddLog "UPnP discovery failed: $_" -Level WARN
     }
 
+    foreach ($ip in $locations.Keys) {
+        $name = Get-UpnpFriendlyName -Url $locations[$ip] -TimeoutSec $FetchTimeoutSec
+        if ($name) { $results[$ip].FriendlyName = $name }
+    }
+
     return $results
+}
+
+function Get-UpnpFriendlyName {
+    <#
+    .SYNOPSIS
+        Fetches a UPnP device description XML from a LOCATION URL and returns
+        the <friendlyName> value. Errors (timeout, non-200, malformed XML)
+        return empty string — UPnP advertisers are not always reachable.
+    .PARAMETER Url        The LOCATION URL from an SSDP response.
+    .PARAMETER TimeoutSec HTTP timeout in seconds.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [int]$TimeoutSec = 2
+    )
+
+    try {
+        $resp = Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+        if ($resp.Content -match '(?is)<friendlyName>\s*([^<]+?)\s*</friendlyName>') {
+            return $Matches[1].Trim()
+        }
+    } catch {
+        $null = $_
+    }
+    return ''
 }
 
 function Get-DeviceRisk {
@@ -959,7 +1234,18 @@ function Invoke-DeviceEnrichment {
         $d.httpBanner   = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
         $d.sshBanner    = if (22 -in $d.openPorts) { Get-SshBanner    -IP $d.ip } else { '' }
         $d.telnetBanner = if (23 -in $d.openPorts) { Get-TelnetBanner -IP $d.ip } else { '' }
-        $d.upnpInfo     = if ($upnpMap.ContainsKey($d.ip)) { $upnpMap[$d.ip] } else { '' }
+        if ($upnpMap.ContainsKey($d.ip)) {
+            $u = $upnpMap[$d.ip]
+            $d.upnpInfo = (@($u.FriendlyName, $u.Server) | Where-Object { $_ } | Select-Object -Unique) -join ' / '
+            # Final hostname-cascade step: if all DNS-style resolvers struck out,
+            # use the UPnP friendlyName so the alert shows something operator-readable
+            # (e.g. "Living Room Sonos") instead of just the IP.
+            if ($u.FriendlyName -and (-not $d.hostname -or $d.hostname -eq $d.ip)) {
+                $d.hostname = $u.FriendlyName
+            }
+        } else {
+            $d.upnpInfo = ''
+        }
         $d.osLabel      = Get-OsLabel -TtlGuess $d.osGuess `
                                        -HttpBanner $d.httpBanner `
                                        -SshBanner  $d.sshBanner `
@@ -1113,6 +1399,40 @@ function Get-MacVendor {
 
 # ── State ──────────────────────────────────────────────────────────────────────
 
+function Find-KnownDevice {
+    <#
+    .SYNOPSIS
+        Looks up a known device by MAC, matching either the primary `mac`
+        field or any entry in `aliases`. Returns a result object describing
+        which kind of match was found.
+    .PARAMETER State PSCustomObject loaded from state.json (must have knownDevices).
+    .PARAMETER Mac   MAC address to find (case-insensitive).
+    .RETURNS PSCustomObject{ Device, MatchType } where MatchType is
+             'primary', 'alias', or 'none'. Device is $null when MatchType='none'.
+    #>
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$State,
+        [Parameter(Mandatory)][string]$Mac
+    )
+
+    $needle = $Mac.ToUpperInvariant()
+    foreach ($d in @($State.knownDevices)) {
+        if ($d.mac.ToUpperInvariant() -eq $needle) {
+            return [PSCustomObject]@{ Device = $d; MatchType = 'primary' }
+        }
+    }
+    foreach ($d in @($State.knownDevices)) {
+        if ($d.PSObject.Properties['aliases']) {
+            foreach ($a in @($d.aliases)) {
+                if ($a -and ([string]$a).ToUpperInvariant() -eq $needle) {
+                    return [PSCustomObject]@{ Device = $d; MatchType = 'alias' }
+                }
+            }
+        }
+    }
+    return [PSCustomObject]@{ Device = $null; MatchType = 'none' }
+}
+
 function Get-State {
     <#
     .SYNOPSIS
@@ -1163,6 +1483,13 @@ function Get-State {
             # normalise to a real empty array so downstream code can iterate safely.
             if (-not $d.PSObject.Properties['allowedPorts'] -or $null -eq $d.allowedPorts) {
                 $d | Add-Member -NotePropertyName 'allowedPorts' -NotePropertyValue @() -Force
+            }
+            # v4 -> v5: aliases lets one logical device own multiple MACs (e.g. a
+            # notebook's wired + WiFi adapters). Missing/null becomes empty array.
+            if (-not $d.PSObject.Properties['aliases'] -or $null -eq $d.aliases) {
+                $d | Add-Member -NotePropertyName 'aliases' -NotePropertyValue ([object[]]@()) -Force
+            } else {
+                $d.aliases = @($d.aliases | ForEach-Object { if ($_) { [string]$_ } })
             }
             # Canonicalise each allowedPorts entry to PSCustomObject with .port (int).
             # Tolerates legacy/manually-edited baselines using bare ints/strings.
@@ -1227,6 +1554,68 @@ function Save-State {
 
 # ── Alert ──────────────────────────────────────────────────────────────────────
 
+function Get-NormalisedHostname {
+    <#
+    .SYNOPSIS
+        Strips DNS suffixes and lowercases a hostname for cross-source matching.
+        "FILESERVER.local" / "fileserver.corp.example.com" / "FILESERVER" all
+        normalise to "fileserver".
+    .PARAMETER Hostname Hostname or FQDN to normalise. Returns '' for IPs/empty.
+    #>
+    param([string]$Hostname)
+    if (-not $Hostname) { return '' }
+    if ($Hostname -match '^\d{1,3}(\.\d{1,3}){3}$') { return '' }   # bare IP
+    $first = $Hostname.Split('.')[0]
+    return $first.ToLowerInvariant()
+}
+
+function Get-AliasMatchCandidates {
+    <#
+    .SYNOPSIS
+        Returns up to N baseline devices whose hostname is most similar to
+        the rogue device's hostname. Used to suggest alias links in the
+        alert email when a notebook's second NIC shows up as a rogue.
+    .PARAMETER Rogue        The rogue device PSCustomObject (uses .hostname).
+    .PARAMETER KnownDevices Array of baseline devices to match against.
+    .PARAMETER Top          Maximum number of candidates to return.
+    .RETURNS Array of PSCustomObject{ Device, Score, IsExact } sorted by Score
+             descending. Empty when the rogue has no resolvable hostname or
+             no candidate scores above zero.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseSingularNouns', '',
+        Justification = 'Function returns a collection of candidates; plural is intentional.')]
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$Rogue,
+        [array]$KnownDevices = @(),
+        [int]$Top = 3
+    )
+
+    $needle = Get-NormalisedHostname -Hostname $Rogue.hostname
+    if (-not $needle) { return @() }
+
+    $scored = foreach ($d in $KnownDevices) {
+        $h = Get-NormalisedHostname -Hostname $d.hostname
+        if (-not $h) { continue }
+
+        if ($h -eq $needle) {
+            [PSCustomObject]@{ Device = $d; Score = 1000; IsExact = $true }
+        } else {
+            # Common-prefix length is a primitive but cheap proxy for the
+            # "NB-LAPTOP-01 / NB-LAPTOP-02" naming-scheme case. Only count
+            # candidates whose prefix-overlap is at least 3 chars to avoid
+            # noise from generic single-letter matches.
+            $max = [Math]::Min($h.Length, $needle.Length)
+            $i = 0
+            while ($i -lt $max -and $h[$i] -eq $needle[$i]) { $i++ }
+            if ($i -ge 3) {
+                [PSCustomObject]@{ Device = $d; Score = $i; IsExact = $false }
+            }
+        }
+    }
+
+    return @($scored | Sort-Object -Property Score -Descending | Select-Object -First $Top)
+}
+
 function Invoke-SmtpTest {
     <#
     .SYNOPSIS
@@ -1287,6 +1676,8 @@ function Send-RogueAlert {
     .PARAMETER Subnet              Scanned subnet (for the email header).
     .PARAMETER SeenRogues          State.seenRogues list (for "first seen" age in
                                    the rogue table).
+    .PARAMETER KnownDevices        Baseline (state.knownDevices) used to suggest
+                                   alias-link candidates for each rogue.
     #>
     # Password is read from a plain-text config file; SecureString conversion at this
     # boundary is unavoidable without a full credential-store integration.
@@ -1305,7 +1696,8 @@ function Send-RogueAlert {
         [array]$AbsentDevices = @(),
         [int]$IdentityChangeCount = 0,
         [string]$Subnet = '',
-        [array]$SeenRogues = @()
+        [array]$SeenRogues = @(),
+        [array]$KnownDevices = @()
     )
 
     if (-not $SmtpConfig.host -or -not $SmtpConfig.to -or -not $SmtpConfig.from) {
@@ -1319,7 +1711,7 @@ function Send-RogueAlert {
     }
 
     $scriptPath = $PSCommandPath
-    $hostname   = $env:COMPUTERNAME
+    $hostname   = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
     $timestamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
     # Build a copy-paste-safe path token. Outlook can mangle '& "..."' on
@@ -1425,6 +1817,26 @@ function Send-RogueAlert {
             $os        = & $esc $osText
             $firstSeen = & $firstSeenCell $d.mac
             $details   = & $detailsCell  $d
+
+            $aliasHintRow = ''
+            $candidates = @(Get-AliasMatchCandidates -Rogue $d -KnownDevices $KnownDevices -Top 3)
+            if (@($candidates).Count -gt 0) {
+                $candLines = foreach ($c in $candidates) {
+                    $tag = if ($c.IsExact) { ' <span style="color:#9c4221;">[exact hostname match]</span>' } else { '' }
+                    $primaryMac = & $esc $c.Device.mac
+                    $candHost   = & $esc (if ($c.Device.hostname) { $c.Device.hostname } else { '-' })
+                    $candLabel  = if ($c.Device.label) { ' &middot; ' + (& $esc $c.Device.label) } else { '' }
+                    $snippet    = & $esc "$invokeToken -ApproveDevice '$($d.mac)' -AliasOf '$($c.Device.mac)'"
+                    "<div style=`"margin:2px 0;`"><code style=`"font-family:Consolas,monospace;font-size:12px;`">$candHost &middot; $primaryMac$candLabel</code>$tag<br><code style=`"display:inline-block;margin-top:1px;padding:1px 4px;background:#edf2f7;font-family:Consolas,monospace;font-size:11px;color:#2d3748;`">$snippet</code></div>"
+                }
+                $aliasHintRow = @"
+<tr><td colspan="7" style="padding:6px 8px 12px 8px;border-bottom:1px solid #e2e8f0;background:#f7fafc;">
+<div style="font-size:11px;color:#718096;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">Possibly the same device as:</div>
+$($candLines -join "`n")
+</td></tr>
+"@
+            }
+
             @"
 <tr>
 <td style="$tdMono white-space:nowrap;">$macCell</td>
@@ -1435,6 +1847,7 @@ function Send-RogueAlert {
 <td style="$tdStyle color:#4a5568;font-size:12px;">$firstSeen</td>
 <td style="$tdStyle color:#4a5568;font-size:12px;line-height:1.4;">$details</td>
 </tr>
+$aliasHintRow
 "@
         }) -join "`n"
 
@@ -1588,12 +2001,6 @@ Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:
 </html>
 "@
 
-    # ---- Subject ----
-    $subjectParts = [System.Collections.Generic.List[string]]::new()
-    if ($Devices.Count -gt 0)       { $subjectParts.Add("$($Devices.Count) rogue") }
-    if ($RiskDevices.Count -gt 0)   { $subjectParts.Add("$($RiskDevices.Count) risk") }
-    if ($AbsentDevices.Count -gt 0) { $subjectParts.Add("$($AbsentDevices.Count) absent") }
-
     $useSsl = if ($SmtpConfig.ContainsKey('useSsl') -and $null -ne $SmtpConfig.useSsl) {
         [bool]$SmtpConfig.useSsl
     } else { $true }
@@ -1601,7 +2008,7 @@ Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:
     $mailParams = @{
         From       = $SmtpConfig.from
         To         = $SmtpConfig.to
-        Subject    = "[$hostname] $($subjectParts -join ', ') - $(Get-Date -Format 'yyyy-MM-dd')"
+        Subject    = "Rogue Device Detector - Report - $hostname, $(Get-Date -Format 'yyyy-MM-dd')"
         Body       = $body
         BodyAsHtml = $true
         SmtpServer = $SmtpConfig.host
@@ -1628,81 +2035,139 @@ function Invoke-ApproveDevice {
     <#
     .SYNOPSIS
         Adds or updates a device in the baseline without running a scan.
-    .PARAMETER Mac     MAC address to approve (normalized to uppercase AA:BB:CC:DD:EE:FF).
-    .PARAMETER Label   Optional human-readable device name.
-    .PARAMETER State   State object loaded from state.json.
-    .PARAMETER Now     ISO timestamp string for approvedAt / lastSeen.
+        With -AliasOf, attaches the MAC as an alias of an existing primary
+        device (use this for a notebook's second NIC: same logical device,
+        different MAC) instead of creating a new entry.
+    .PARAMETER Mac      MAC address to approve.
+    .PARAMETER Label    Optional human-readable device name (ignored when -AliasOf is set).
+    .PARAMETER AliasOf  Optional primary MAC. If set, $Mac is attached as an alias
+                        of that primary device.
+    .PARAMETER State    State object loaded from state.json.
+    .PARAMETER Now      ISO timestamp string for approvedAt / lastSeen.
     #>
     param(
         [Parameter(Mandatory)][string]$Mac,
         [string]$Label = '',
+        [string]$AliasOf = '',
         [Parameter(Mandatory)][PSCustomObject]$State,
         [Parameter(Mandatory)][string]$Now
     )
 
-    # Normalize MAC to uppercase colon-separated
-    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
-    $mac = $mac.ToUpper()
+    $mac = ConvertTo-NormalisedMac -Raw $Mac
     if ($mac.Length -ne 17) {
         throw "Invalid MAC address format: '$Mac'. Expected AA:BB:CC:DD:EE:FF."
     }
 
-    $existing = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
-    if ($existing) {
-        if ($Label) { $existing.label = $Label }
-        $existing.approvedBy = "$env:USERDOMAIN\$env:USERNAME"
-        $existing.approvedAt = $Now
-        Write-RddLog "Updated existing device $mac in baseline$(if ($Label) { " (label: '$Label')" } else { '' })."
-    } else {
-        $State.knownDevices += [PSCustomObject]@{
-            mac        = $mac
-            ip         = ''
-            hostname   = ''
-            vendor     = ''
-            label      = $Label
-            firstSeen  = $Now
-            lastSeen   = $Now
-            approvedBy = "$env:USERDOMAIN\$env:USERNAME"
-            approvedAt = $Now
-            allowedPorts = @()
+    if ($AliasOf) {
+        $primaryMac = ConvertTo-NormalisedMac -Raw $AliasOf
+        if ($primaryMac.Length -ne 17) {
+            throw "Invalid -AliasOf MAC format: '$AliasOf'. Expected AA:BB:CC:DD:EE:FF."
         }
-        Write-RddLog "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
+        if ($primaryMac -eq $mac) {
+            throw "A device cannot be an alias of itself ($mac)."
+        }
+
+        $primary = (Find-KnownDevice -State $State -Mac $primaryMac).Device
+        if (-not $primary) {
+            throw "Primary device $primaryMac not found in baseline. Approve it first."
+        }
+
+        # Refuse to attach a MAC that is already a primary entry — would create
+        # a split-brain identity. The operator must remove the duplicate first.
+        $conflict = Find-KnownDevice -State $State -Mac $mac
+        if ($conflict.Device -and $conflict.MatchType -eq 'primary') {
+            throw "MAC $mac is already a primary device. Remove it first if you want to fold it into $primaryMac."
+        }
+        if ($conflict.Device -and $conflict.MatchType -eq 'alias' -and $conflict.Device.mac -ne $primary.mac) {
+            throw "MAC $mac is already an alias of $($conflict.Device.mac)."
+        }
+
+        if (-not $primary.PSObject.Properties['aliases'] -or $null -eq $primary.aliases) {
+            $primary | Add-Member -NotePropertyName 'aliases' -NotePropertyValue ([object[]]@()) -Force
+        }
+        if ($mac -notin @($primary.aliases)) {
+            $primary.aliases = @($primary.aliases) + @($mac)
+            Write-RddLog "Linked $mac as alias of $primaryMac (label: '$($primary.label)')."
+        } else {
+            Write-RddLog "$mac is already an alias of $primaryMac - no change."
+        }
+    } else {
+        $existing = (Find-KnownDevice -State $State -Mac $mac).Device
+        if ($existing) {
+            if ($Label) { $existing.label = $Label }
+            $existing.approvedBy = "$env:USERDOMAIN\$env:USERNAME"
+            $existing.approvedAt = $Now
+            Write-RddLog "Updated existing device $mac in baseline$(if ($Label) { " (label: '$Label')" } else { '' })."
+        } else {
+            $State.knownDevices += [PSCustomObject]@{
+                mac          = $mac
+                ip           = ''
+                hostname     = ''
+                vendor       = ''
+                label        = $Label
+                firstSeen    = $Now
+                lastSeen     = $Now
+                approvedBy   = "$env:USERDOMAIN\$env:USERNAME"
+                approvedAt   = $Now
+                allowedPorts = @()
+                aliases      = @()
+            }
+            Write-RddLog "Approved new device $mac$(if ($Label) { " (label: '$Label')" } else { '' }) - added to baseline."
+        }
     }
 
-    # An approved MAC is no longer a rogue; clean it out of seenRogues.
+    # An approved MAC (primary or alias) is no longer a rogue; clear it.
     if ($State.PSObject.Properties['seenRogues']) {
         $State.seenRogues = @(@($State.seenRogues) | Where-Object { $_.mac -ne $mac })
     }
 }
 
+function ConvertTo-NormalisedMac {
+    <#
+    .SYNOPSIS
+        Strips non-hex chars from a MAC string and reformats as AA:BB:CC:DD:EE:FF.
+    #>
+    param([Parameter(Mandatory)][string]$Raw)
+    $clean = ($Raw -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
+    return $clean.ToUpper()
+}
+
 function Invoke-RemoveDevice {
     <#
     .SYNOPSIS
-        Removes a device from the baseline by MAC address.
+        Removes a device from the baseline by MAC. If the MAC matches an
+        alias rather than a primary, only that alias is detached — the
+        logical device (and its other MACs) stays. Removing the primary
+        MAC drops the entire entry, including all aliases.
     .PARAMETER Mac   MAC address to remove.
     .PARAMETER State State object loaded from state.json.
-    .RETURNS $true if removed, $false if not found.
+    .RETURNS $true if something was removed, $false if not found.
     #>
     param(
         [Parameter(Mandatory)][string]$Mac,
         [Parameter(Mandatory)][PSCustomObject]$State
     )
 
-    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
-    $mac = $mac.ToUpper()
+    $mac = ConvertTo-NormalisedMac -Raw $Mac
+    $match = Find-KnownDevice -State $State -Mac $mac
 
-    # Determine removal before modifying; avoids relying on Count after PSCustomObject
-    # property re-assignment, which can behave unexpectedly with empty arrays in strict mode.
-    $removed = $null -ne (@($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1)
-    # @() around the pipeline ensures an array even when nothing passes the filter.
-    $State.knownDevices = [object[]]@($State.knownDevices | Where-Object { $_.mac -ne $mac })
-
-    if ($removed) {
-        Write-RddLog "Removed device $mac from baseline."
-    } else {
+    if (-not $match.Device) {
         Write-RddLog "Device $mac not found in baseline." -Level WARN
+        return $false
     }
-    return $removed
+
+    if ($match.MatchType -eq 'alias') {
+        $primary = $match.Device
+        $primary.aliases = @(@($primary.aliases) | Where-Object {
+            $_ -and ([string]$_).ToUpperInvariant() -ne $mac
+        })
+        Write-RddLog "Removed alias $mac from $($primary.mac) (logical device kept)."
+    } else {
+        # @() around the pipeline ensures an array even when nothing passes the filter.
+        $State.knownDevices = [object[]]@($State.knownDevices | Where-Object { $_.mac -ne $mac })
+        Write-RddLog "Removed device $mac from baseline."
+    }
+    return $true
 }
 
 function Invoke-AllowPort {
@@ -1721,10 +2186,9 @@ function Invoke-AllowPort {
         [Parameter(Mandatory)][string]$Now
     )
 
-    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
-    $mac = $mac.ToUpper()
+    $mac = ConvertTo-NormalisedMac -Raw $Mac
 
-    $device = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
+    $device = (Find-KnownDevice -State $State -Mac $mac).Device
     if (-not $device) {
         throw "Device $mac not found in baseline. Use -ApproveDevice first."
     }
@@ -1738,14 +2202,14 @@ function Invoke-AllowPort {
         if ($existing) {
             $existing.allowedAt = $Now
             $existing.allowedBy = "$env:USERDOMAIN\$env:USERNAME"
-            Write-RddLog "Updated port $port allowance on $mac."
+            Write-RddLog "Updated port $port allowance on $($device.mac)."
         } else {
             $device.allowedPorts = @($device.allowedPorts) + @([PSCustomObject]@{
                 port      = $port
                 allowedBy = "$env:USERDOMAIN\$env:USERNAME"
                 allowedAt = $Now
             })
-            Write-RddLog "Allowed port $port on $mac."
+            Write-RddLog "Allowed port $port on $($device.mac)."
         }
     }
 }
@@ -1764,17 +2228,16 @@ function Invoke-BlockPort {
         [Parameter(Mandatory)][PSCustomObject]$State
     )
 
-    $mac = ($Mac -replace '[^0-9A-Fa-f]', '') -replace '(.{2})(?!$)', '$1:'
-    $mac = $mac.ToUpper()
+    $mac = ConvertTo-NormalisedMac -Raw $Mac
 
-    $device = @($State.knownDevices) | Where-Object { $_.mac -eq $mac } | Select-Object -First 1
+    $device = (Find-KnownDevice -State $State -Mac $mac).Device
     if (-not $device) {
         Write-RddLog "Device $mac not found in baseline." -Level WARN
         return
     }
 
     if (-not $device.PSObject.Properties['allowedPorts'] -or $null -eq $device.allowedPorts) {
-        Write-RddLog "Device $mac has no allowed ports." -Level WARN
+        Write-RddLog "Device $($device.mac) has no allowed ports." -Level WARN
         return
     }
 
@@ -1784,9 +2247,9 @@ function Invoke-BlockPort {
     $removed = $before - $after
 
     if ($removed -gt 0) {
-        Write-RddLog "Blocked $removed port(s) on ${mac}: $($Ports -join ', ')"
+        Write-RddLog "Blocked $removed port(s) on $($device.mac): $($Ports -join ', ')"
     } else {
-        Write-RddLog "Port(s) $($Ports -join ', ') not in allowed list for $mac." -Level WARN
+        Write-RddLog "Port(s) $($Ports -join ', ') not in allowed list for $($device.mac)." -Level WARN
     }
 }
 
@@ -1826,6 +2289,11 @@ function Show-Baseline {
                 " | Allowed ports: $((@($d.allowedPorts) | ForEach-Object { $_.port }) -join ', ')"
             } else { '' }
             Write-Host "  $($d.mac)  IP: $(($d.ip).PadRight(15))$hostname$vendor$osGuess$label$lastSeen$approvedBy$approvedAt$allowedPortsStr"
+            if ($d.PSObject.Properties['aliases'] -and @($d.aliases).Count -gt 0) {
+                foreach ($a in @($d.aliases)) {
+                    Write-Host "    └─ alias: $a"
+                }
+            }
         }
     }
 
@@ -2140,10 +2608,11 @@ if ($ListDevices) {
 if ($ApproveDevice) {
     $state = Get-State -StatePath $cfg.statePath
     $now   = (Get-Date).ToUniversalTime().ToString('o')
-    Invoke-ApproveDevice -Mac $ApproveDevice -Label $Label -State $state -Now $now
+    Invoke-ApproveDevice -Mac $ApproveDevice -Label $Label -AliasOf $AliasOf -State $state -Now $now
     Save-State -State $state -StatePath $cfg.statePath
-    Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_APPROVED' `
-        -Details "mac=$ApproveDevice label=$Label approvedBy=$env:USERDOMAIN\$env:USERNAME"
+    $auditEvent = if ($AliasOf) { 'DEVICE_ALIASED' } else { 'DEVICE_APPROVED' }
+    Write-AuditLog -LogPath $cfg.logPath -EventName $auditEvent `
+        -Details "mac=$ApproveDevice label=$Label aliasOf=$AliasOf approvedBy=$env:USERDOMAIN\$env:USERNAME"
     exit 0
 }
 
@@ -2188,8 +2657,15 @@ try {
 
 # Resolve target subnet
 $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
-Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$(if ($LearningMode) { 'learning' } else { 'normal' })"
+$scanMode = if ($LearningMode) { 'learning' } elseif ($ApproveAllRogues) { 'approve-all' } else { 'normal' }
+Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$scanMode"
 Write-RddLog "Target subnet: $targetSubnet"
+if ($LearningMode) {
+    Write-RddLog '-LearningMode: running a full scan first - every device detected will be added to the baseline (no alerts will be sent).'
+}
+if ($ApproveAllRogues) {
+    Write-RddLog '-ApproveAllRogues: running a full scan first - every device detected will be added to the baseline.'
+}
 $subnetInfo = Get-SubnetInfo -Cidr $targetSubnet
 
 # Load OUI vendor database
@@ -2251,8 +2727,9 @@ if ($LearningMode -or -not $stateFileExists) {
     $newDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($device in $foundDevices) {
-        $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
-        if ($known) {
+        $match = Find-KnownDevice -State $state -Mac $device.mac
+        if ($match.Device) {
+            $known = $match.Device
             $previousHost = Test-IdentityChange -KnownDevice $known -FoundDevice $device
             if ($previousHost) {
                 Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_CHANGED' -Device $device `
@@ -2265,17 +2742,18 @@ if ($LearningMode -or -not $stateFileExists) {
         } else {
             $newDevices.Add($device)
             $state.knownDevices += [PSCustomObject]@{
-                mac        = $device.mac
-                ip         = $device.ip
-                hostname   = $device.hostname
-                vendor     = $device.vendor
-                osGuess    = $device.osGuess
-                label      = ''
-                firstSeen  = $now
-                lastSeen   = $now
-                approvedBy = "$env:USERDOMAIN\$env:USERNAME"
-                approvedAt = $now
+                mac          = $device.mac
+                ip           = $device.ip
+                hostname     = $device.hostname
+                vendor       = $device.vendor
+                osGuess      = $device.osGuess
+                label        = ''
+                firstSeen    = $now
+                lastSeen     = $now
+                approvedBy   = "$env:USERDOMAIN\$env:USERNAME"
+                approvedAt   = $now
                 allowedPorts = @()
+                aliases      = @()
             }
         }
     }
@@ -2322,8 +2800,9 @@ $rogueDevices    = [System.Collections.Generic.List[PSCustomObject]]::new()
 $identityChanges = [System.Collections.Generic.List[hashtable]]::new()
 
 foreach ($device in $foundDevices) {
-    $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
-    if ($known) {
+    $match = Find-KnownDevice -State $state -Mac $device.mac
+    if ($match.Device) {
+        $known = $match.Device
         $previousHost = Test-IdentityChange -KnownDevice $known -FoundDevice $device
         if ($previousHost) {
             Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_CHANGED' -Device $device `
@@ -2385,6 +2864,7 @@ if ($ApproveAllRogues) {
             approvedBy   = $approver
             approvedAt   = $now
             allowedPorts = @()
+            aliases      = @()
         }
         $riskTag = if ($d.riskLevel -and $d.riskLevel -ne 'NONE') { " [$($d.riskLevel)]" } else { '' }
         if ($d.riskLevel -and $RISK_ORDER[$d.riskLevel] -ge $RISK_ORDER['HIGH']) { $highRiskApproved++ }
@@ -2409,8 +2889,8 @@ if ($ApproveAllRogues) {
 # Filter allowed ports and log risk findings for known devices
 $riskDevices = [System.Collections.Generic.List[PSCustomObject]]::new()
 foreach ($device in $foundDevices) {
-    # Look up baseline entry for allowed ports
-    $known = @($state.knownDevices) | Where-Object { $_.mac -eq $device.mac } | Select-Object -First 1
+    # Look up baseline entry (primary or alias) for allowed ports
+    $known = (Find-KnownDevice -State $state -Mac $device.mac).Device
     $allowedPorts = if ($known -and $known.PSObject.Properties['allowedPorts']) {
         @($known.allowedPorts)
     } else { @() }
@@ -2485,6 +2965,7 @@ if ($cfg.summaryReport) {
                 -IdentityChangeCount $identityChanges.Count `
                 -Subnet $targetSubnet `
                 -SeenRogues @($state.seenRogues) `
+                -KnownDevices @($state.knownDevices) `
                 -SmtpConfig $cfg.smtp
         }
     } else {

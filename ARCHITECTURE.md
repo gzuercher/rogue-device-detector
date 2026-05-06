@@ -42,15 +42,46 @@ Scheduled execution (any scheduler, recommended: weekly)
                 └─ Exit with bitmask code for RMM integration
 ```
 
+## Detection Rules
+
+Four independent detection categories. A single device can land in more than one (a rogue device can also have risk findings; a known device can be both at risk and absent on a future scan).
+
+### Rogue
+
+A device is rogue when its **MAC address** matches neither a primary `mac` nor any entry in any device's `aliases` list. Match is MAC-only and case-insensitive — IP, hostname, vendor, and OS are ignored for the rogue/known decision (they appear in the alert as context).
+
+- Recurring rogue MACs are tracked in `state.seenRogues` so the alert can show how long the device has been seen, not just "today".
+- Approving a MAC (`-ApproveDevice` / `-ApproveAllRogues`) removes it from `seenRogues`.
+- For each rogue, the alert shows up to 3 baseline candidates with similar hostnames (normalised, case-insensitive, ranked by common-prefix length) plus a copy-paste `-AliasOf` snippet — the typical case being a notebook's second NIC showing up under a different MAC.
+
+### Risk
+
+Computed from open TCP ports against the hardcoded port table (see [Security Ports Monitored](#security-ports-monitored)). Independent of rogue/known status.
+
+1. `Get-DeviceRisk` walks the device's open ports and records every port whose definition has a non-`NONE` risk.
+2. The device's effective level is the **maximum** across all matching ports (`NONE < LOW < MEDIUM < HIGH < CRITICAL`).
+3. `Get-FilteredRisk` then strips ports listed in the device's `allowedPorts` and recomputes the level from the remaining ports.
+4. The device is reported in the Risk-Findings table only if its effective level is **at or above** `config.alertRiskLevel` (default `HIGH`; `NONE` disables the entire risk section).
+
+A rogue device's risk findings are evaluated identically — rogue and risk are two lenses on the same device, not mutually exclusive.
+
+### Identity Change
+
+A known MAC whose hostname differs from the previously stored hostname triggers a `DEVICE_CHANGED` event. To avoid noise from transient DNS failures, the change is **suppressed** when the previously stored hostname looks like an IPv4 address (i.e. DNS was failing before and recovered now). See `Test-IdentityChange` in the script.
+
+### Absent
+
+A known device is flagged absent when `now - lastSeen > config.absentDays` (default `21`). Absent devices stay in the baseline; they are reported in the Absent table until they reappear or are removed via `-RemoveDevice`.
+
 ## State File
 
 Local JSON file (`state.json`). Path configurable. Can be moved to another device to migrate state. Includes a `schemaVersion` field for automatic migration of older state files.
 
-### Schema Version 3 (current)
+### Schema Version 5 (current)
 
 ```json
 {
-  "schemaVersion": 3,
+  "schemaVersion": 5,
   "lastScan": "2026-03-23T08:00:00Z",
   "knownDevices": [
     {
@@ -67,16 +98,26 @@ Local JSON file (`state.json`). Path configurable. Can be moved to another devic
       "allowedPorts": [
         { "port": 3389, "allowedBy": "DOMAIN\\admin", "allowedAt": "2026-03-23T10:00:00Z" },
         { "port": 22, "allowedBy": "DOMAIN\\admin", "allowedAt": "2026-03-23T10:00:00Z" }
-      ]
+      ],
+      "aliases": ["AA:BB:CC:DD:EE:F0"]
     }
+  ],
+  "seenRogues": [
+    { "mac": "11:22:33:44:55:66", "firstSeen": "2026-03-20T08:00:00Z", "lastSeen": "2026-03-23T08:00:00Z" }
   ]
 }
 ```
+
+`seenRogues` tracks unapproved-but-recurring MACs across scans so the alert email can show "first seen N days ago" instead of always "today". Entries are removed when the MAC is approved (via `-ApproveDevice` or `-ApproveAllRogues`).
+
+`aliases` lets one logical device own multiple MACs (e.g. a notebook's wired and WiFi adapters). The `mac` field is the primary identity; aliases are additional MACs that resolve to the same baseline entry. Lookup goes through `Find-KnownDevice`, which checks the primary first and then walks each device's alias list.
 
 **Schema history:**
 - v1: No `schemaVersion` field
 - v2: Added `schemaVersion`, `osGuess`, auto-migration on load
 - v3: Added `allowedPorts` per device. Backward compatible — devices without `allowedPorts` are treated as having an empty list.
+- v4: Added top-level `seenRogues`. Backward compatible — missing field is initialised to an empty list on load.
+- v5: Added `aliases` per device. Backward compatible — missing field is initialised to an empty list on load.
 
 Enrichment data (ports, banner, risk) is not persisted — it is re-evaluated on every scan. The `osGuess` field is persisted so absent device reports can include the OS.
 

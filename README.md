@@ -96,6 +96,7 @@ log are left untouched.
 |-----------|------|-------------|
 | `-ApproveDevice "MAC"` | String | Add a device to the baseline by MAC address. Combine with `-Label` for a human-readable name. |
 | `-Label "name"` | String | Human-readable name for the device (only with `-ApproveDevice`). |
+| `-AliasOf "MAC"` | String | Attach the MAC being approved as an alias of an existing baseline device (only with `-ApproveDevice`). Use this for hardware with multiple network interfaces (e.g. a notebook's wired and WiFi MACs — same logical device, different MACs). The alert email suggests likely alias candidates for each rogue based on hostname similarity. |
 | `-RemoveDevice "MAC"` | String | Remove a device from the baseline. |
 | `-ListDevices` | Switch | Show all approved devices and exit. No scan is performed. |
 | `-ApproveAllRogues` | Switch | Run a full scan and add every detected rogue to the baseline at once. Risk findings are NOT auto-allowed — risky open ports on the approved devices will be reported as RISK on the next scan. Use after acknowledging a batch of expected new devices. |

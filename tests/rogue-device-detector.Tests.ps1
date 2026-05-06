@@ -1042,20 +1042,22 @@ Describe 'Invoke-BlockPort' {
     }
 }
 
-# ── State Schema v4 ────────────────────────────────────────────────────────────
+# ── State Schema v5 ────────────────────────────────────────────────────────────
 
-Describe 'State Schema v4' {
+Describe 'State Schema v5' {
 
-    It 'uses schema version 4' {
-        $STATE_SCHEMA_VERSION | Should -Be 4
+    It 'uses schema version 5' {
+        $STATE_SCHEMA_VERSION | Should -Be 5
     }
 
-    It 'new devices from Invoke-ApproveDevice include allowedPorts field' {
-        $state = [PSCustomObject]@{ schemaVersion = 4; knownDevices = @(); seenRogues = @(); lastScan = '' }
+    It 'new devices from Invoke-ApproveDevice include allowedPorts and aliases fields' {
+        $state = [PSCustomObject]@{ schemaVersion = 5; knownDevices = @(); seenRogues = @(); lastScan = '' }
         Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:FF' -State $state -Now '2026-03-23T00:00:00Z'
         $device = $state.knownDevices[0]
         $device.PSObject.Properties.Name | Should -Contain 'allowedPorts'
+        $device.PSObject.Properties.Name | Should -Contain 'aliases'
         @($device.allowedPorts) | Should -HaveCount 0
+        @($device.aliases)      | Should -HaveCount 0
     }
 
     It 'Get-State migrates a v3 file by adding seenRogues' {
@@ -1073,7 +1075,7 @@ Describe 'State Schema v4' {
 
     It 'Invoke-ApproveDevice removes the MAC from seenRogues' {
         $state = [PSCustomObject]@{
-            schemaVersion = 4
+            schemaVersion = 5
             knownDevices  = @()
             seenRogues    = @(
                 [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:FF'; firstSeen='2026-04-01'; lastSeen='2026-05-01' }
@@ -1084,6 +1086,209 @@ Describe 'State Schema v4' {
         Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:FF' -State $state -Now '2026-05-05T00:00:00Z'
         @($state.seenRogues).Count | Should -Be 1
         @($state.seenRogues)[0].mac | Should -Be '11:22:33:44:55:66'
+    }
+
+    It 'Get-State migrates a v4 file by adding empty aliases per device' {
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "rdd-state-v4-$([guid]::NewGuid()).json"
+        try {
+            $v4 = @{
+                schemaVersion = 4
+                lastScan      = ''
+                knownDevices  = @(@{ mac='AA:BB:CC:DD:EE:FF'; ip=''; hostname=''; vendor=''; label=''; firstSeen=''; lastSeen=''; approvedBy=''; approvedAt=''; allowedPorts=@() })
+                seenRogues    = @()
+            } | ConvertTo-Json -Depth 6
+            Set-Content $tmp -Value $v4 -Encoding UTF8
+            $state = Get-State -StatePath $tmp
+            $state.knownDevices[0].PSObject.Properties.Name | Should -Contain 'aliases'
+            @($state.knownDevices[0].aliases) | Should -HaveCount 0
+        } finally {
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ── Aliases ────────────────────────────────────────────────────────────────────
+
+Describe 'Find-KnownDevice' {
+
+    BeforeEach {
+        $script:state = [PSCustomObject]@{
+            schemaVersion = 5
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac = 'AA:BB:CC:DD:EE:01'; ip='192.168.1.10'; hostname='nb-laptop-01'; vendor=''
+                    label='Notebook 01'; firstSeen=''; lastSeen=''; approvedBy=''; approvedAt=''
+                    allowedPorts=@(); aliases=@('AA:BB:CC:DD:EE:02')
+                }
+            )
+            seenRogues = @()
+            lastScan   = ''
+        }
+    }
+
+    It 'matches the primary MAC' {
+        $r = Find-KnownDevice -State $script:state -Mac 'AA:BB:CC:DD:EE:01'
+        $r.MatchType | Should -Be 'primary'
+        $r.Device.mac | Should -Be 'AA:BB:CC:DD:EE:01'
+    }
+
+    It 'matches an alias MAC and returns the same logical device' {
+        $r = Find-KnownDevice -State $script:state -Mac 'AA:BB:CC:DD:EE:02'
+        $r.MatchType | Should -Be 'alias'
+        $r.Device.mac | Should -Be 'AA:BB:CC:DD:EE:01'
+    }
+
+    It 'is case-insensitive on the MAC' {
+        (Find-KnownDevice -State $script:state -Mac 'aa:bb:cc:dd:ee:02').MatchType | Should -Be 'alias'
+    }
+
+    It 'returns MatchType=none when nothing matches' {
+        (Find-KnownDevice -State $script:state -Mac 'FF:FF:FF:FF:FF:FF').MatchType | Should -Be 'none'
+    }
+}
+
+Describe 'Invoke-ApproveDevice -AliasOf' {
+
+    BeforeEach {
+        $script:state = [PSCustomObject]@{
+            schemaVersion = 5
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac = 'AA:BB:CC:DD:EE:01'; ip=''; hostname='nb-laptop-01'; vendor=''
+                    label='Notebook 01'; firstSeen=''; lastSeen=''; approvedBy=''; approvedAt=''
+                    allowedPorts=@(); aliases=@()
+                }
+            )
+            seenRogues = @()
+            lastScan   = ''
+        }
+    }
+
+    It 'attaches the new MAC as alias of the primary' {
+        Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:02' -AliasOf 'AA:BB:CC:DD:EE:01' `
+            -State $script:state -Now '2026-05-06T00:00:00Z'
+        @($script:state.knownDevices).Count | Should -Be 1
+        @($script:state.knownDevices[0].aliases) | Should -Contain 'AA:BB:CC:DD:EE:02'
+    }
+
+    It 'is idempotent — re-aliasing the same MAC does not duplicate' {
+        Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:02' -AliasOf 'AA:BB:CC:DD:EE:01' `
+            -State $script:state -Now '2026-05-06T00:00:00Z'
+        Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:02' -AliasOf 'AA:BB:CC:DD:EE:01' `
+            -State $script:state -Now '2026-05-06T00:00:00Z'
+        @($script:state.knownDevices[0].aliases) | Should -HaveCount 1
+    }
+
+    It 'throws when the primary MAC is unknown' {
+        { Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:02' -AliasOf 'FF:FF:FF:FF:FF:FF' `
+            -State $script:state -Now '2026-05-06T00:00:00Z' } | Should -Throw
+    }
+
+    It 'throws when MAC is already a primary device' {
+        $script:state.knownDevices += [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:99'; ip=''; hostname=''; vendor=''; label=''
+            firstSeen=''; lastSeen=''; approvedBy=''; approvedAt=''
+            allowedPorts=@(); aliases=@()
+        }
+        { Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:99' -AliasOf 'AA:BB:CC:DD:EE:01' `
+            -State $script:state -Now '2026-05-06T00:00:00Z' } | Should -Throw
+    }
+
+    It 'throws when alias would point to itself' {
+        { Invoke-ApproveDevice -Mac 'AA:BB:CC:DD:EE:01' -AliasOf 'AA:BB:CC:DD:EE:01' `
+            -State $script:state -Now '2026-05-06T00:00:00Z' } | Should -Throw
+    }
+}
+
+Describe 'Invoke-RemoveDevice with alias' {
+
+    BeforeEach {
+        $script:state = [PSCustomObject]@{
+            schemaVersion = 5
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac='AA:BB:CC:DD:EE:01'; ip=''; hostname='nb-laptop-01'; vendor=''
+                    label=''; firstSeen=''; lastSeen=''; approvedBy=''; approvedAt=''
+                    allowedPorts=@(); aliases=@('AA:BB:CC:DD:EE:02')
+                }
+            )
+            seenRogues = @()
+            lastScan   = ''
+        }
+    }
+
+    It 'removing an alias MAC keeps the primary device' {
+        $removed = Invoke-RemoveDevice -Mac 'AA:BB:CC:DD:EE:02' -State $script:state
+        $removed | Should -BeTrue
+        @($script:state.knownDevices).Count | Should -Be 1
+        @($script:state.knownDevices[0].aliases) | Should -HaveCount 0
+    }
+
+    It 'removing the primary MAC drops the entire entry incl. aliases' {
+        $removed = Invoke-RemoveDevice -Mac 'AA:BB:CC:DD:EE:01' -State $script:state
+        $removed | Should -BeTrue
+        @($script:state.knownDevices) | Should -HaveCount 0
+    }
+}
+
+Describe 'Invoke-AllowPort by alias MAC' {
+
+    It 'looks up the device via alias and adds the port' {
+        $state = [PSCustomObject]@{
+            schemaVersion = 5
+            knownDevices  = @(
+                [PSCustomObject]@{
+                    mac='AA:BB:CC:DD:EE:01'; ip=''; hostname=''; vendor=''; label=''
+                    firstSeen=''; lastSeen=''; approvedBy=''; approvedAt=''
+                    allowedPorts=@(); aliases=@('AA:BB:CC:DD:EE:02')
+                }
+            )
+            seenRogues=@(); lastScan=''
+        }
+        Invoke-AllowPort -Ports @(3389) -Mac 'AA:BB:CC:DD:EE:02' `
+            -State $state -Now '2026-05-06T00:00:00Z'
+        @($state.knownDevices[0].allowedPorts) | Should -HaveCount 1
+        $state.knownDevices[0].allowedPorts[0].port | Should -Be 3389
+    }
+}
+
+Describe 'Get-AliasMatchCandidates' {
+
+    It 'flags an exact normalised hostname match' {
+        $rogue = [PSCustomObject]@{ mac='ZZ:ZZ:ZZ:ZZ:ZZ:ZZ'; hostname='NB-LAPTOP-01.local' }
+        $known = @(
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:01'; hostname='nb-laptop-01'; label='' }
+            [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:02'; hostname='printer';      label='' }
+        )
+        $cands = @(Get-AliasMatchCandidates -Rogue $rogue -KnownDevices $known)
+        $cands | Should -HaveCount 1
+        $cands[0].IsExact   | Should -BeTrue
+        $cands[0].Device.mac | Should -Be 'AA:BB:CC:DD:EE:01'
+    }
+
+    It 'returns prefix-similar candidates ranked by common-prefix length' {
+        $rogue = [PSCustomObject]@{ mac='ZZ:ZZ:ZZ:ZZ:ZZ:ZZ'; hostname='nb-laptop-99' }
+        $known = @(
+            [PSCustomObject]@{ mac='M:01'; hostname='nb-laptop-01'; label='' }
+            [PSCustomObject]@{ mac='M:02'; hostname='nb-server-02'; label='' }
+            [PSCustomObject]@{ mac='M:03'; hostname='printer';      label='' }
+        )
+        $cands = @(Get-AliasMatchCandidates -Rogue $rogue -KnownDevices $known -Top 3)
+        $cands | Should -HaveCount 2
+        $cands[0].Device.mac | Should -Be 'M:01'   # longer common prefix wins
+        $cands[1].Device.mac | Should -Be 'M:02'
+    }
+
+    It 'returns nothing when rogue has no resolvable hostname (just an IP)' {
+        $rogue = [PSCustomObject]@{ mac='ZZ:ZZ:ZZ:ZZ:ZZ:ZZ'; hostname='192.168.1.50' }
+        $known = @([PSCustomObject]@{ mac='AA'; hostname='nb-laptop-01'; label='' })
+        @(Get-AliasMatchCandidates -Rogue $rogue -KnownDevices $known) | Should -HaveCount 0
+    }
+
+    It 'ignores common prefixes shorter than 3 characters' {
+        $rogue = [PSCustomObject]@{ mac='ZZ:ZZ:ZZ:ZZ:ZZ:ZZ'; hostname='ab-thing' }
+        $known = @([PSCustomObject]@{ mac='AA'; hostname='ax-other'; label='' })
+        @(Get-AliasMatchCandidates -Rogue $rogue -KnownDevices $known) | Should -HaveCount 0
     }
 }
 
