@@ -611,6 +611,200 @@ function Get-ArpEntry {
     return $entries.ToArray()
 }
 
+function Invoke-MulticastDnsPtrQuery {
+    <#
+    .SYNOPSIS
+        Sends a DNS reverse-PTR query to a multicast group and parses the first
+        PTR answer. Used for both mDNS (224.0.0.251:5353) and LLMNR
+        (224.0.0.252:5355) — the wire format is identical.
+    .PARAMETER IP        Target IPv4 address.
+    .PARAMETER Group     Multicast group (string).
+    .PARAMETER Port      Multicast destination port.
+    .PARAMETER TimeoutMs Per-receive timeout in milliseconds.
+    .PARAMETER UnicastResponseBit
+                         Set the QU (high) bit in QCLASS. Required for one-shot
+                         mDNS queries per RFC 6762; not used for LLMNR.
+    .RETURNS Hostname string or empty string if no PTR answer arrived in time.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [Parameter(Mandatory)][string]$Group,
+        [Parameter(Mandatory)][int]$Port,
+        [int]$TimeoutMs = 1500,
+        [switch]$UnicastResponseBit
+    )
+
+    $client = $null
+    try {
+        $octets = $IP.Split('.')
+        if (@($octets).Count -ne 4) { return '' }
+        $labels = @($octets[3], $octets[2], $octets[1], $octets[0], 'in-addr', 'arpa')
+
+        $msg = [System.Collections.Generic.List[byte]]::new()
+        $rng = [System.Random]::new()
+        $msg.Add([byte]$rng.Next(0, 256)); $msg.Add([byte]$rng.Next(0, 256))   # ID
+        $msg.AddRange([byte[]](0x00, 0x00))                                    # Flags: standard query
+        $msg.AddRange([byte[]](0x00, 0x01))                                    # QDCOUNT = 1
+        $msg.AddRange([byte[]](0x00, 0x00, 0x00, 0x00, 0x00, 0x00))            # AN/NS/AR = 0
+        foreach ($label in $labels) {
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($label)
+            $msg.Add([byte]$bytes.Length)
+            $msg.AddRange($bytes)
+        }
+        $msg.Add([byte]0x00)                                                   # QNAME terminator
+        $msg.AddRange([byte[]](0x00, 0x0C))                                    # QTYPE = PTR
+        $qclassHi = if ($UnicastResponseBit) { 0x80 } else { 0x00 }
+        $msg.AddRange([byte[]]($qclassHi, 0x01))                               # QCLASS = IN (+QU)
+
+        $client = [System.Net.Sockets.UdpClient]::new()
+        $client.Client.ReceiveTimeout = $TimeoutMs
+        # Bind to any local port; OS picks ephemeral. Multicast TTL=1 keeps it on-LAN.
+        $client.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IP,
+            [System.Net.Sockets.SocketOptionName]::MulticastTimeToLive, 1)
+
+        $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Group), $Port)
+        $packet = $msg.ToArray()
+        [void]$client.Send($packet, $packet.Length, $ep)
+
+        # Read until we either see a PTR answer or the timeout fires.
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            try {
+                $remote   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+                $response = $client.Receive([ref]$remote)
+            } catch {
+                break  # timeout
+            }
+            $name = ConvertFrom-DnsPtrAnswer -Bytes $response
+            if ($name) { return $name }
+        }
+    } catch {
+        $null = $_
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { $null = $_ } }
+    }
+    return ''
+}
+
+function ConvertFrom-DnsPtrAnswer {
+    <#
+    .SYNOPSIS
+        Parses a DNS response message and returns the first PTR-record name.
+        Handles DNS name compression (0xC0 pointers).
+    .PARAMETER Bytes Raw DNS response bytes.
+    .RETURNS Hostname string (without trailing dot) or empty string.
+    #>
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    if ($Bytes.Length -lt 12) { return '' }
+    $anCount = ($Bytes[6] -shl 8) -bor $Bytes[7]
+    if ($anCount -lt 1) { return '' }
+
+    # Skip the question section: walk the QNAME labels, then 4 bytes (QTYPE+QCLASS).
+    $offset = 12
+    while ($offset -lt $Bytes.Length -and $Bytes[$offset] -ne 0) {
+        if (($Bytes[$offset] -band 0xC0) -eq 0xC0) { $offset += 2; break }
+        $offset += 1 + $Bytes[$offset]
+    }
+    if ($offset -lt $Bytes.Length -and $Bytes[$offset] -eq 0) { $offset++ }
+    $offset += 4
+
+    for ($i = 0; $i -lt $anCount -and $offset -lt $Bytes.Length; $i++) {
+        # Skip the answer NAME field (compressed or labels).
+        if (($Bytes[$offset] -band 0xC0) -eq 0xC0) {
+            $offset += 2
+        } else {
+            while ($offset -lt $Bytes.Length -and $Bytes[$offset] -ne 0) {
+                $offset += 1 + $Bytes[$offset]
+            }
+            $offset++
+        }
+        if ($offset + 10 -gt $Bytes.Length) { return '' }
+        $type    = ($Bytes[$offset] -shl 8) -bor $Bytes[$offset + 1]
+        $rdlen   = ($Bytes[$offset + 8] -shl 8) -bor $Bytes[$offset + 9]
+        $rdStart = $offset + 10
+        if ($type -eq 0x000C) {
+            return Read-DnsName -Bytes $Bytes -Offset $rdStart
+        }
+        $offset = $rdStart + $rdlen
+    }
+    return ''
+}
+
+function Read-DnsName {
+    <#
+    .SYNOPSIS
+        Reads a (possibly compressed) DNS name from a message.
+    .PARAMETER Bytes  Full DNS message bytes (needed to follow 0xC0 pointers).
+    .PARAMETER Offset Starting offset of the name.
+    .RETURNS Dotted hostname string, empty on malformed input.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][int]$Offset
+    )
+
+    $labels = [System.Collections.Generic.List[string]]::new()
+    $hops   = 0
+    $cursor = $Offset
+    while ($cursor -lt $Bytes.Length) {
+        $len = $Bytes[$cursor]
+        if ($len -eq 0) { break }
+        if (($len -band 0xC0) -eq 0xC0) {
+            if ($cursor + 1 -ge $Bytes.Length) { return '' }
+            $cursor = (($len -band 0x3F) -shl 8) -bor $Bytes[$cursor + 1]
+            $hops++
+            if ($hops -gt 16) { return '' }   # guard against pointer loops
+            continue
+        }
+        if ($cursor + 1 + $len -gt $Bytes.Length) { return '' }
+        $labels.Add([System.Text.Encoding]::ASCII.GetString($Bytes, $cursor + 1, $len))
+        $cursor += 1 + $len
+    }
+    return ($labels -join '.')
+}
+
+function Resolve-HostnameMdns {
+    <#
+    .SYNOPSIS
+        Resolves a hostname via mDNS (RFC 6762) reverse-PTR query against
+        Multicast 224.0.0.251:5353. Returns .local names (Apple/Linux/IoT).
+    .PARAMETER IP         Target IPv4 address.
+    .PARAMETER TimeoutMs  Receive timeout in milliseconds.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Mdns is a proper acronym, not plural.'
+    )]
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$TimeoutMs = 1500
+    )
+    return Invoke-MulticastDnsPtrQuery -IP $IP -Group '224.0.0.251' -Port 5353 `
+        -TimeoutMs $TimeoutMs -UnicastResponseBit
+}
+
+function Resolve-HostnameLlmnr {
+    <#
+    .SYNOPSIS
+        Resolves a hostname via LLMNR (RFC 4795) reverse-PTR query against
+        Multicast 224.0.0.252:5355. Covers modern Windows hosts that no
+        longer have NetBIOS over TCP/IP enabled.
+    .PARAMETER IP         Target IPv4 address.
+    .PARAMETER TimeoutMs  Receive timeout in milliseconds.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Llmnr is a proper acronym, not plural.'
+    )]
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [int]$TimeoutMs = 1500
+    )
+    return Invoke-MulticastDnsPtrQuery -IP $IP -Group '224.0.0.252' -Port 5355 `
+        -TimeoutMs $TimeoutMs
+}
+
 function Resolve-HostnameNetBios {
     <#
     .SYNOPSIS
@@ -679,9 +873,11 @@ function Resolve-HostnameNetBios {
 function Resolve-Hostname {
     <#
     .SYNOPSIS
-        Resolves hostnames for an array of devices concurrently via async DNS.
-        All requests are fired simultaneously with a 2-second timeout.
-        Falls back to NetBIOS name resolution for unresolved devices.
+        Resolves hostnames for an array of devices in a layered cascade:
+        DNS (async, concurrent) → mDNS → LLMNR → NetBIOS. Each fallback runs
+        only against devices still unresolved by the previous step.
+        UPnP friendlyName is applied later, in the enrichment phase, since
+        UPnP discovery is a separate pipeline stage.
         Updates the hostname property of each device object in place.
     .PARAMETER Devices Array of PSCustomObjects with an 'ip' property.
     #>
@@ -727,9 +923,33 @@ function Resolve-Hostname {
         $unresolved.Add($t.Device)
     }
 
-    # NetBIOS fallback for unresolved devices
-    if ($unresolved.Count -gt 0) {
-        Write-RddLog "Trying NetBIOS fallback for $($unresolved.Count) unresolved device(s)..."
+    # mDNS fallback (Apple/Linux/IoT with Bonjour/avahi)
+    if (@($unresolved).Count -gt 0) {
+        Write-RddLog "Trying mDNS fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($d in $unresolved) {
+            $mName = Resolve-HostnameMdns -IP $d.ip
+            if ($mName) { $d.hostname = $mName; $resolved++ }
+            else        { $stillUnresolved.Add($d) }
+        }
+        $unresolved = $stillUnresolved
+    }
+
+    # LLMNR fallback (modern Windows without NetBIOS over TCP/IP)
+    if (@($unresolved).Count -gt 0) {
+        Write-RddLog "Trying LLMNR fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($d in $unresolved) {
+            $lName = Resolve-HostnameLlmnr -IP $d.ip
+            if ($lName) { $d.hostname = $lName; $resolved++ }
+            else        { $stillUnresolved.Add($d) }
+        }
+        $unresolved = $stillUnresolved
+    }
+
+    # NetBIOS fallback (legacy Windows / SMB devices)
+    if (@($unresolved).Count -gt 0) {
+        Write-RddLog "Trying NetBIOS fallback for $(@($unresolved).Count) unresolved device(s)..."
         foreach ($d in $unresolved) {
             $nbName = Resolve-HostnameNetBios -IP $d.ip
             if ($nbName) {
@@ -846,13 +1066,22 @@ function Get-HttpBanner {
 function Invoke-UpnpDiscovery {
     <#
     .SYNOPSIS
-        Sends a UPnP/SSDP M-SEARCH broadcast and collects device responses.
-    .PARAMETER ListenSeconds How long to listen for responses.
-    .RETURNS Hashtable of IP address -> SERVER string.
+        Sends a UPnP/SSDP M-SEARCH broadcast, collects device responses, and
+        for each unique LOCATION URL fetches the device description XML to
+        extract the friendlyName.
+    .PARAMETER ListenSeconds How long to listen for SSDP responses.
+    .PARAMETER FetchTimeoutSec Per-LOCATION HTTP timeout for description XML.
+    .RETURNS Hashtable of IP address -> PSCustomObject{ Server, FriendlyName }.
+             Either field may be empty; FriendlyName is left empty when the
+             LOCATION URL cannot be reached or contains no <friendlyName>.
     #>
-    param([int]$ListenSeconds = 3)
+    param(
+        [int]$ListenSeconds   = 3,
+        [int]$FetchTimeoutSec = 2
+    )
 
-    $results = @{}
+    $results   = @{}
+    $locations = @{}   # ip -> LOCATION URL (only the first response per IP is kept)
     try {
         $client = [System.Net.Sockets.UdpClient]::new()
         $client.Client.ReceiveTimeout = 500
@@ -868,10 +1097,16 @@ function Invoke-UpnpDiscovery {
                 $data     = $client.Receive([ref]$remote)
                 $response = [System.Text.Encoding]::ASCII.GetString($data)
                 $ip       = $remote.Address.ToString()
+                if (-not $results.ContainsKey($ip)) {
+                    $results[$ip] = [PSCustomObject]@{ Server = ''; FriendlyName = '' }
+                }
                 if ($response -match '(?i)SERVER:\s*(.+)') {
-                    $results[$ip] = $Matches[1].Trim()
-                } elseif (-not $results.ContainsKey($ip)) {
-                    $results[$ip] = 'UPnP device'
+                    $results[$ip].Server = $Matches[1].Trim()
+                } elseif (-not $results[$ip].Server) {
+                    $results[$ip].Server = 'UPnP device'
+                }
+                if (-not $locations.ContainsKey($ip) -and $response -match '(?im)^LOCATION:\s*(\S+)') {
+                    $locations[$ip] = $Matches[1].Trim()
                 }
             } catch { $null = $_ }
         }
@@ -880,7 +1115,37 @@ function Invoke-UpnpDiscovery {
         Write-RddLog "UPnP discovery failed: $_" -Level WARN
     }
 
+    foreach ($ip in $locations.Keys) {
+        $name = Get-UpnpFriendlyName -Url $locations[$ip] -TimeoutSec $FetchTimeoutSec
+        if ($name) { $results[$ip].FriendlyName = $name }
+    }
+
     return $results
+}
+
+function Get-UpnpFriendlyName {
+    <#
+    .SYNOPSIS
+        Fetches a UPnP device description XML from a LOCATION URL and returns
+        the <friendlyName> value. Errors (timeout, non-200, malformed XML)
+        return empty string — UPnP advertisers are not always reachable.
+    .PARAMETER Url        The LOCATION URL from an SSDP response.
+    .PARAMETER TimeoutSec HTTP timeout in seconds.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [int]$TimeoutSec = 2
+    )
+
+    try {
+        $resp = Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+        if ($resp.Content -match '(?is)<friendlyName>\s*([^<]+?)\s*</friendlyName>') {
+            return $Matches[1].Trim()
+        }
+    } catch {
+        $null = $_
+    }
+    return ''
 }
 
 function Get-DeviceRisk {
@@ -959,7 +1224,18 @@ function Invoke-DeviceEnrichment {
         $d.httpBanner   = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
         $d.sshBanner    = if (22 -in $d.openPorts) { Get-SshBanner    -IP $d.ip } else { '' }
         $d.telnetBanner = if (23 -in $d.openPorts) { Get-TelnetBanner -IP $d.ip } else { '' }
-        $d.upnpInfo     = if ($upnpMap.ContainsKey($d.ip)) { $upnpMap[$d.ip] } else { '' }
+        if ($upnpMap.ContainsKey($d.ip)) {
+            $u = $upnpMap[$d.ip]
+            $d.upnpInfo = (@($u.FriendlyName, $u.Server) | Where-Object { $_ } | Select-Object -Unique) -join ' / '
+            # Final hostname-cascade step: if all DNS-style resolvers struck out,
+            # use the UPnP friendlyName so the alert shows something operator-readable
+            # (e.g. "Living Room Sonos") instead of just the IP.
+            if ($u.FriendlyName -and (-not $d.hostname -or $d.hostname -eq $d.ip)) {
+                $d.hostname = $u.FriendlyName
+            }
+        } else {
+            $d.upnpInfo = ''
+        }
         $d.osLabel      = Get-OsLabel -TtlGuess $d.osGuess `
                                        -HttpBanner $d.httpBanner `
                                        -SshBanner  $d.sshBanner `
