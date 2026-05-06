@@ -109,10 +109,10 @@ Describe 'Send-RogueAlert HTML body' {
         $body | Should -Match '&#39;&lt;MAC&gt;&#39;'
     }
 
-    It 'subject lists each non-zero category' {
+    It 'subject follows the "Rogue Device Detector - Report - HOST, DATE" format' {
         $absent = [PSCustomObject]@{ mac='AA:BB:CC:DD:EE:07'; label='old'; lastSeen='2026-04-01' }
         Send-RogueAlert -Devices @($script:rogueDevice) -AbsentDevices @($absent) -SmtpConfig $script:smtp
-        $global:RDDTestCapture.Subject | Should -Match '1 rogue, 1 absent'
+        $global:RDDTestCapture.Subject | Should -Match '^Rogue Device Detector - Report - .+, \d{4}-\d{2}-\d{2}$'
     }
 
     It 'honours smtp.useSsl from config' {

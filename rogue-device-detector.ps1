@@ -1319,7 +1319,7 @@ function Send-RogueAlert {
     }
 
     $scriptPath = $PSCommandPath
-    $hostname   = $env:COMPUTERNAME
+    $hostname   = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
     $timestamp  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
     # Build a copy-paste-safe path token. Outlook can mangle '& "..."' on
@@ -1588,12 +1588,6 @@ Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:
 </html>
 "@
 
-    # ---- Subject ----
-    $subjectParts = [System.Collections.Generic.List[string]]::new()
-    if ($Devices.Count -gt 0)       { $subjectParts.Add("$($Devices.Count) rogue") }
-    if ($RiskDevices.Count -gt 0)   { $subjectParts.Add("$($RiskDevices.Count) risk") }
-    if ($AbsentDevices.Count -gt 0) { $subjectParts.Add("$($AbsentDevices.Count) absent") }
-
     $useSsl = if ($SmtpConfig.ContainsKey('useSsl') -and $null -ne $SmtpConfig.useSsl) {
         [bool]$SmtpConfig.useSsl
     } else { $true }
@@ -1601,7 +1595,7 @@ Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:
     $mailParams = @{
         From       = $SmtpConfig.from
         To         = $SmtpConfig.to
-        Subject    = "[$hostname] $($subjectParts -join ', ') - $(Get-Date -Format 'yyyy-MM-dd')"
+        Subject    = "Rogue Device Detector - Report - $hostname, $(Get-Date -Format 'yyyy-MM-dd')"
         Body       = $body
         BodyAsHtml = $true
         SmtpServer = $SmtpConfig.host
