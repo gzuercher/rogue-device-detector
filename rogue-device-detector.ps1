@@ -172,7 +172,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.0'
+$SCRIPT_VERSION       = '1.6.1'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
@@ -621,14 +621,68 @@ function Get-ArpEntry {
     return $entries.ToArray()
 }
 
+function Format-DisplayHostname {
+    <#
+    .SYNOPSIS
+        Strips a trailing .local (mDNS suffix) so the alert and console show
+        plain "fileserver" instead of "fileserver.local". Case-insensitive,
+        also tolerates the trailing FQDN dot. No-op for hostnames that don't
+        end in .local.
+    #>
+    param([string]$Hostname)
+    if (-not $Hostname) { return '' }
+    return ($Hostname -replace '(?i)\.local\.?$', '')
+}
+
+function New-DnsPtrQueryPacket {
+    <#
+    .SYNOPSIS
+        Builds a DNS reverse-PTR query packet for an IPv4 address.
+        Wire format is identical for mDNS (RFC 6762) and LLMNR (RFC 4795)
+        — only the QU (unicast-response) bit differs.
+    .PARAMETER IP                  Target IPv4 address.
+    .PARAMETER UnicastResponseBit  Sets the high bit on QCLASS (QU).
+    .RETURNS Byte array, or $null if the IP is malformed.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Pure constructor — returns a byte array, no system state mutated.'
+    )]
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [switch]$UnicastResponseBit
+    )
+
+    $octets = $IP.Split('.')
+    if (@($octets).Count -ne 4) { return $null }
+    $labels = @($octets[3], $octets[2], $octets[1], $octets[0], 'in-addr', 'arpa')
+
+    $msg = [System.Collections.Generic.List[byte]]::new()
+    $rng = [System.Random]::new()
+    $msg.Add([byte]$rng.Next(0, 256)); $msg.Add([byte]$rng.Next(0, 256))   # ID
+    $msg.AddRange([byte[]](0x00, 0x00))                                    # Flags: standard query
+    $msg.AddRange([byte[]](0x00, 0x01))                                    # QDCOUNT = 1
+    $msg.AddRange([byte[]](0x00, 0x00, 0x00, 0x00, 0x00, 0x00))            # AN/NS/AR = 0
+    foreach ($label in $labels) {
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($label)
+        $msg.Add([byte]$bytes.Length)
+        $msg.AddRange($bytes)
+    }
+    $msg.Add([byte]0x00)                                                   # QNAME terminator
+    $msg.AddRange([byte[]](0x00, 0x0C))                                    # QTYPE = PTR
+    $qclassHi = if ($UnicastResponseBit) { 0x80 } else { 0x00 }
+    $msg.AddRange([byte[]]($qclassHi, 0x01))                               # QCLASS = IN (+QU)
+    return $msg.ToArray()
+}
+
 function Invoke-MulticastDnsPtrQuery {
     <#
     .SYNOPSIS
-        Sends a DNS reverse-PTR query to a multicast group and parses the first
-        PTR answer. Used for both mDNS (224.0.0.251:5353) and LLMNR
-        (224.0.0.252:5355) — the wire format is identical.
+        One-shot reverse-PTR query against a multicast group, returns the
+        first PTR answer. Single-host wrapper kept for unit testing and for
+        manual debug; production scans use the batch variants below.
     .PARAMETER IP        Target IPv4 address.
-    .PARAMETER Group     Multicast group (string).
+    .PARAMETER Group     Multicast group.
     .PARAMETER Port      Multicast destination port.
     .PARAMETER TimeoutMs Per-receive timeout in milliseconds.
     .PARAMETER UnicastResponseBit
@@ -644,28 +698,11 @@ function Invoke-MulticastDnsPtrQuery {
         [switch]$UnicastResponseBit
     )
 
+    $packet = New-DnsPtrQueryPacket -IP $IP -UnicastResponseBit:$UnicastResponseBit
+    if (-not $packet) { return '' }
+
     $client = $null
     try {
-        $octets = $IP.Split('.')
-        if (@($octets).Count -ne 4) { return '' }
-        $labels = @($octets[3], $octets[2], $octets[1], $octets[0], 'in-addr', 'arpa')
-
-        $msg = [System.Collections.Generic.List[byte]]::new()
-        $rng = [System.Random]::new()
-        $msg.Add([byte]$rng.Next(0, 256)); $msg.Add([byte]$rng.Next(0, 256))   # ID
-        $msg.AddRange([byte[]](0x00, 0x00))                                    # Flags: standard query
-        $msg.AddRange([byte[]](0x00, 0x01))                                    # QDCOUNT = 1
-        $msg.AddRange([byte[]](0x00, 0x00, 0x00, 0x00, 0x00, 0x00))            # AN/NS/AR = 0
-        foreach ($label in $labels) {
-            $bytes = [System.Text.Encoding]::ASCII.GetBytes($label)
-            $msg.Add([byte]$bytes.Length)
-            $msg.AddRange($bytes)
-        }
-        $msg.Add([byte]0x00)                                                   # QNAME terminator
-        $msg.AddRange([byte[]](0x00, 0x0C))                                    # QTYPE = PTR
-        $qclassHi = if ($UnicastResponseBit) { 0x80 } else { 0x00 }
-        $msg.AddRange([byte[]]($qclassHi, 0x01))                               # QCLASS = IN (+QU)
-
         $client = [System.Net.Sockets.UdpClient]::new()
         $client.Client.ReceiveTimeout = $TimeoutMs
         # Bind to any local port; OS picks ephemeral. Multicast TTL=1 keeps it on-LAN.
@@ -673,7 +710,6 @@ function Invoke-MulticastDnsPtrQuery {
             [System.Net.Sockets.SocketOptionName]::MulticastTimeToLive, 1)
 
         $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Group), $Port)
-        $packet = $msg.ToArray()
         [void]$client.Send($packet, $packet.Length, $ep)
 
         # Read until we either see a PTR answer or the timeout fires.
@@ -694,6 +730,82 @@ function Invoke-MulticastDnsPtrQuery {
         if ($client) { try { $client.Dispose() } catch { $null = $_ } }
     }
     return ''
+}
+
+function Invoke-MulticastDnsPtrBatch {
+    <#
+    .SYNOPSIS
+        Sends reverse-PTR queries for many IPs at once into a multicast group,
+        then collects answers passively for ListenMs milliseconds. Drops the
+        old per-host blocking pattern: scan time is now O(1) (one listen
+        window) instead of O(N) (one timeout per device).
+        Used by both mDNS (224.0.0.251:5353) and LLMNR (224.0.0.252:5355).
+    .PARAMETER Ips                  IPv4 addresses to query.
+    .PARAMETER Group                Multicast group.
+    .PARAMETER Port                 Multicast destination port.
+    .PARAMETER ListenMs             How long to keep the receive socket open
+                                    after the burst send.
+    .PARAMETER UnicastResponseBit   Sets the QU bit (mDNS only).
+    .RETURNS Hashtable IP -> hostname for everyone who replied with a PTR
+             record. IPs with no answer are simply absent from the map.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Batch resolves many devices; plural is intentional.'
+    )]
+    param(
+        [Parameter(Mandatory)][string[]]$Ips,
+        [Parameter(Mandatory)][string]$Group,
+        [Parameter(Mandatory)][int]$Port,
+        [int]$ListenMs = 3000,
+        [switch]$UnicastResponseBit
+    )
+
+    $results = @{}
+    if (@($Ips).Count -eq 0) { return $results }
+
+    $client = $null
+    try {
+        $client = [System.Net.Sockets.UdpClient]::new()
+        $client.Client.ReceiveTimeout = 250   # short inner-receive; outer loop bounds total time
+        $client.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::IP,
+            [System.Net.Sockets.SocketOptionName]::MulticastTimeToLive, 1)
+
+        $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Group), $Port)
+
+        $askedSet = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($ip in $Ips) {
+            $packet = New-DnsPtrQueryPacket -IP $ip -UnicastResponseBit:$UnicastResponseBit
+            if ($null -eq $packet) { continue }
+            try {
+                [void]$client.Send($packet, $packet.Length, $ep)
+                [void]$askedSet.Add($ip)
+            } catch {
+                $null = $_   # individual send failure shouldn't kill the batch
+            }
+        }
+
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($ListenMs)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            try {
+                $remote   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+                $response = $client.Receive([ref]$remote)
+            } catch {
+                continue   # short receive timeout fired; loop until our deadline
+            }
+            $responderIp = $remote.Address.ToString()
+            if (-not $askedSet.Contains($responderIp)) { continue }
+            if ($results.ContainsKey($responderIp))    { continue }   # already answered
+            $name = ConvertFrom-DnsPtrAnswer -Bytes $response
+            if ($name) { $results[$responderIp] = $name }
+        }
+    } catch {
+        Write-RddLog "Multicast PTR batch failed: $_" -Level WARN
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { $null = $_ } }
+    }
+
+    return $results
 }
 
 function ConvertFrom-DnsPtrAnswer {
@@ -924,7 +1036,8 @@ function Resolve-Hostname {
             if ($t.DnsTask.Status -eq 'RanToCompletion') {
                 $h = $t.DnsTask.Result.HostName
                 if ($h -and $h -ne $t.Device.ip) {
-                    $t.Device.hostname = $h
+                    $t.Device.hostname       = Format-DisplayHostname -Hostname $h
+                    $t.Device.hostnameSource = 'dns'
                     $resolved++
                     continue
                 }
@@ -933,26 +1046,42 @@ function Resolve-Hostname {
         $unresolved.Add($t.Device)
     }
 
-    # mDNS fallback (Apple/Linux/IoT with Bonjour/avahi)
+    # mDNS fallback — passive multicast: one query burst, one ~3s listen window,
+    # everyone who replies gets their hostname mapped. Drops what used to be
+    # ~1.5s × N devices (90 s on a /24) to a single bounded window.
     if (@($unresolved).Count -gt 0) {
+        $unresolvedIps = @($unresolved | ForEach-Object { $_.ip })
         Write-RddLog "Trying mDNS fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $mdnsMap = Invoke-MulticastDnsPtrBatch -Ips $unresolvedIps `
+            -Group '224.0.0.251' -Port 5353 -ListenMs 3000 -UnicastResponseBit
         $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
         foreach ($d in $unresolved) {
-            $mName = Resolve-HostnameMdns -IP $d.ip
-            if ($mName) { $d.hostname = $mName; $resolved++ }
-            else        { $stillUnresolved.Add($d) }
+            if ($mdnsMap.ContainsKey($d.ip)) {
+                $d.hostname       = Format-DisplayHostname -Hostname $mdnsMap[$d.ip]
+                $d.hostnameSource = 'mdns'
+                $resolved++
+            } else {
+                $stillUnresolved.Add($d)
+            }
         }
         $unresolved = $stillUnresolved
     }
 
-    # LLMNR fallback (modern Windows without NetBIOS over TCP/IP)
+    # LLMNR fallback — same pattern, different multicast group / port, no QU bit.
     if (@($unresolved).Count -gt 0) {
+        $unresolvedIps = @($unresolved | ForEach-Object { $_.ip })
         Write-RddLog "Trying LLMNR fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $llmnrMap = Invoke-MulticastDnsPtrBatch -Ips $unresolvedIps `
+            -Group '224.0.0.252' -Port 5355 -ListenMs 3000
         $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
         foreach ($d in $unresolved) {
-            $lName = Resolve-HostnameLlmnr -IP $d.ip
-            if ($lName) { $d.hostname = $lName; $resolved++ }
-            else        { $stillUnresolved.Add($d) }
+            if ($llmnrMap.ContainsKey($d.ip)) {
+                $d.hostname       = Format-DisplayHostname -Hostname $llmnrMap[$d.ip]
+                $d.hostnameSource = 'llmnr'
+                $resolved++
+            } else {
+                $stillUnresolved.Add($d)
+            }
         }
         $unresolved = $stillUnresolved
     }
@@ -963,7 +1092,8 @@ function Resolve-Hostname {
         foreach ($d in $unresolved) {
             $nbName = Resolve-HostnameNetBios -IP $d.ip
             if ($nbName) {
-                $d.hostname = $nbName
+                $d.hostname       = Format-DisplayHostname -Hostname $nbName
+                $d.hostnameSource = 'nbns'
                 $resolved++
             }
         }
@@ -1241,7 +1371,8 @@ function Invoke-DeviceEnrichment {
             # use the UPnP friendlyName so the alert shows something operator-readable
             # (e.g. "Living Room Sonos") instead of just the IP.
             if ($u.FriendlyName -and (-not $d.hostname -or $d.hostname -eq $d.ip)) {
-                $d.hostname = $u.FriendlyName
+                $d.hostname       = Format-DisplayHostname -Hostname $u.FriendlyName
+                $d.hostnameSource = 'upnp'
             }
         } else {
             $d.upnpInfo = ''
@@ -1746,6 +1877,22 @@ function Send-RogueAlert {
         "<pre style=`"background:#1a202c;color:#cbd5e0;padding:10px 12px;margin:0 24px 8px;font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;`">$safe</pre>"
     }
 
+    # Renders the hostname column. Appends a small grey '[src]' subscript when
+    # the resolver source is known (dns/mdns/llmnr/nbns/upnp), so the operator
+    # can judge name confidence at a glance — DNS is canonical, mDNS .local
+    # broadcasts are device-self-asserted, NetBIOS is legacy, etc.
+    $hostCell = {
+        param($Device)
+        if (-not $Device.hostname -or $Device.hostname -eq $Device.ip) {
+            return '<span style="color:#a0aec0;">-</span>'
+        }
+        $name = & $esc $Device.hostname
+        $src  = if ($Device.PSObject.Properties['hostnameSource'] -and $Device.hostnameSource) {
+            ' <span style="color:#a0aec0;font-size:10px;">[' + (& $esc $Device.hostnameSource) + ']</span>'
+        } else { '' }
+        return "$name$src"
+    }
+
     # Stack non-empty identifier hints for one device into a multi-line cell.
     # Defensive PSObject.Properties checks because some callers (e.g. Risk
     # devices in Send-SummaryReport, or hand-built test fixtures) may omit
@@ -1811,7 +1958,7 @@ function Send-RogueAlert {
             $d         = $_
             $macCell   = & $esc $d.mac
             $ipCell    = & $esc $d.ip
-            $hostCell  = if ($d.hostname -and $d.hostname -ne $d.ip) { & $esc $d.hostname } else { '<span style="color:#a0aec0;">-</span>' }
+            $hostCellHtml = & $hostCell $d
             $vendor    = & $esc $d.vendor
             $osText    = if ($d.PSObject.Properties['osLabel'] -and $d.osLabel) { $d.osLabel } else { $d.osGuess }
             $os        = & $esc $osText
@@ -1841,7 +1988,7 @@ $($candLines -join "`n")
 <tr>
 <td style="$tdMono white-space:nowrap;">$macCell</td>
 <td style="$tdMono">$ipCell</td>
-<td style="$tdStyle">$hostCell</td>
+<td style="$tdStyle">$hostCellHtml</td>
 <td style="$tdStyle color:#4a5568;">$vendor</td>
 <td style="$tdStyle color:#4a5568;">$os</td>
 <td style="$tdStyle color:#4a5568;font-size:12px;">$firstSeen</td>
@@ -1891,7 +2038,7 @@ $(& $codeBlock $approveCmds)
             $d        = $_
             $macCell  = & $esc $d.mac
             $ipCell   = & $esc $d.ip
-            $hostCell = if ($d.hostname -and $d.hostname -ne $d.ip) { & $esc $d.hostname } else { '<span style="color:#a0aec0;">-</span>' }
+            $hostCellHtml = & $hostCell $d
             $reasons  = if ($d.riskReasons) { & $esc ($d.riskReasons -join '; ') } else { '' }
             $portsTxt = if ($d.openPorts -and $d.openPorts.Count -gt 0) { & $esc ($d.openPorts -join ', ') } else { '-' }
             $riskHtml = & $riskBadge $d.riskLevel
@@ -1900,7 +2047,7 @@ $(& $codeBlock $approveCmds)
 <tr>
 <td style="$tdMono white-space:nowrap;">$macCell</td>
 <td style="$tdMono">$ipCell</td>
-<td style="$tdStyle">$hostCell</td>
+<td style="$tdStyle">$hostCellHtml</td>
 <td style="$tdStyle text-align:center;">$riskHtml</td>
 <td style="$tdStyle color:#4a5568;">$reasons</td>
 <td style="$tdMono">$portsTxt</td>
@@ -2685,19 +2832,20 @@ if ($arpEntries.Count -eq 0) {
 $foundDevices = @($arpEntries | ForEach-Object {
     $osGuess = if ($ttlMap.ContainsKey($_.IP)) { Get-OsGuess -Ttl $ttlMap[$_.IP] } else { '' }
     [PSCustomObject]@{
-        mac           = $_.MAC
-        ip            = $_.IP
-        hostname      = $_.IP   # placeholder, overwritten by Resolve-Hostname
-        vendor        = ''
-        osGuess       = $osGuess
-        osLabel       = $osGuess  # refined later by Get-OsLabel using banners
-        openPorts     = @()
-        httpBanner    = ''
-        sshBanner     = ''
-        telnetBanner  = ''
-        upnpInfo      = ''
-        riskLevel     = 'NONE'
-        riskReasons   = @()
+        mac            = $_.MAC
+        ip             = $_.IP
+        hostname       = $_.IP   # placeholder, overwritten by Resolve-Hostname
+        hostnameSource = ''      # which resolver answered: dns/mdns/llmnr/nbns/upnp
+        vendor         = ''
+        osGuess        = $osGuess
+        osLabel        = $osGuess  # refined later by Get-OsLabel using banners
+        openPorts      = @()
+        httpBanner     = ''
+        sshBanner      = ''
+        telnetBanner   = ''
+        upnpInfo       = ''
+        riskLevel      = 'NONE'
+        riskReasons    = @()
     }
 })
 
@@ -2764,14 +2912,27 @@ if ($LearningMode -or -not $stateFileExists) {
 
     if ($newDevices.Count -gt 0) {
         Write-RddLog "--- SIMULATED ALERT: $($newDevices.Count) new device(s) added to baseline ---"
+        $alreadyListed = [System.Collections.Generic.List[PSCustomObject]]::new()
         foreach ($d in $newDevices) {
             $riskTag = if ($d.riskLevel -ne 'NONE') { " [$($d.riskLevel)]" } else { '' }
-            $hostStr = if ($d.hostname -and $d.hostname -ne $d.ip) { $d.hostname } else { '-' }
+            $srcTag  = if ($d.PSObject.Properties['hostnameSource'] -and $d.hostnameSource) { " [$($d.hostnameSource)]" } else { '' }
+            $hostStr = if ($d.hostname -and $d.hostname -ne $d.ip) { "$($d.hostname)$srcTag" } else { '-' }
             Write-RddLog "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $hostStr  Vendor: $($d.vendor)$riskTag"
             if ($d.riskReasons -and $d.riskReasons.Count -gt 0) {
                 Write-RddLog "       RISK: $($d.riskReasons -join '; ')" -Level WARN
             }
+            # Conservative alias hint: only when the normalised hostname is an
+            # exact match against a previously listed device on this run. The
+            # Notebook ↔ WiFi-MAC case is the target; prefix-similar names are
+            # too noisy in the LearningMode console (would flag NB-LAPTOP-01 vs
+            # NB-LAPTOP-02 as aliases when they're separate machines).
+            $cands = @(Get-AliasMatchCandidates -Rogue $d -KnownDevices $alreadyListed -Top 1)
+            if (@($cands).Count -gt 0 -and $cands[0].IsExact) {
+                Write-RddLog "       HINT: same hostname as $($cands[0].Device.mac) - likely the same device on a second NIC."
+                Write-RddLog "             Suggest: -ApproveDevice '$($d.mac)' -AliasOf '$($cands[0].Device.mac)'"
+            }
             Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_NEW' -Device $d -Details 'Added to baseline'
+            $alreadyListed.Add($d)
         }
         Write-RddLog '--- In normal scan mode these would trigger an alert email. ---'
     } else {
