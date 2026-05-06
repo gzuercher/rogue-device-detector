@@ -2191,6 +2191,9 @@ $targetSubnet = if ($cfg.subnet) { $cfg.subnet } else { Get-LocalSubnet }
 $scanMode = if ($LearningMode) { 'learning' } elseif ($ApproveAllRogues) { 'approve-all' } else { 'normal' }
 Write-AuditLog -LogPath $cfg.logPath -EventName 'SCAN_START' -Details "subnet=$targetSubnet mode=$scanMode"
 Write-RddLog "Target subnet: $targetSubnet"
+if ($LearningMode) {
+    Write-RddLog '-LearningMode: running a full scan first - every device detected will be added to the baseline (no alerts will be sent).'
+}
 if ($ApproveAllRogues) {
     Write-RddLog '-ApproveAllRogues: running a full scan first - every device detected will be added to the baseline.'
 }
