@@ -1429,6 +1429,10 @@ Describe 'ConvertFrom-DnsAxfrMessage' {
             # Helper to assemble a valid DNS AXFR-style message in one shot:
             # transaction id 0x1234, response (QR=1) + authoritative, no error.
             # Provide the question section and answer records as raw byte arrays.
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test fixture builder — returns a byte array, no system state mutated.'
+            )]
             param(
                 [byte[]]$Question = @(),
                 [int]$QdCount = 0,
@@ -1453,6 +1457,10 @@ Describe 'ConvertFrom-DnsAxfrMessage' {
         }
 
         function New-AxfrARecord {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test fixture builder — returns a byte array, no system state mutated.'
+            )]
             param(
                 [Parameter(Mandatory)][string]$Name,
                 [Parameter(Mandatory)][string]$Ip
@@ -1472,6 +1480,11 @@ Describe 'ConvertFrom-DnsAxfrMessage' {
         }
 
         function New-AxfrSoaRecord {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test fixture builder — returns a byte array, no system state mutated.'
+            )]
+            param()
             $rdata = [byte[]](0..21)
             $bytes = [System.Collections.Generic.List[byte]]::new()
             $bytes.Add(0x00)
