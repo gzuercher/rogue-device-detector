@@ -184,6 +184,15 @@ function Write-RddConfigFile {
             # Risk-Findings threshold. NONE disables the section entirely;
             # otherwise the lowest level to include (LOW | MEDIUM | HIGH | CRITICAL).
             alertRiskLevel = 'HIGH'
+            # AXFR (DNS zone transfer) hostname pre-fill. Default-on: AXFR is
+            # denied by most DNS servers out of the box, so an unauthorised
+            # attempt just logs a single skip line. Set server/zone explicitly
+            # if auto-discovery (active-NIC DNS + USERDNSDOMAIN) picks wrong.
+            dnsZoneTransfer = [ordered]@{
+                enabled = $true
+                server  = ''
+                zone    = ''
+            }
             smtp          = [ordered]@{
                 host     = $SmtpHost
                 port     = $SmtpPort

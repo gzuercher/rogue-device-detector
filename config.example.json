@@ -8,6 +8,11 @@
   "summaryReport": false,
   "configured": true,
   "alertRiskLevel": "HIGH",
+  "dnsZoneTransfer": {
+    "enabled": true,
+    "server": "",
+    "zone": ""
+  },
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,

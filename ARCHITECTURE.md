@@ -18,7 +18,7 @@ Scheduled execution (any scheduler, recommended: weekly)
        ├─ 2b. Acquire scan lock (exclusive lock file prevents concurrent scans)
        ├─ 3. Ping sweep → populate ARP cache (async, ~500ms for /24)
        ├─ 4. Read ARP table → list of MACs + IPs (broadcast/network addr filtered)
-       ├─ 5. Resolve hostnames (concurrent DNS via Task.WaitAll + NetBIOS fallback)
+       ├─ 5. Resolve hostnames (cascade: AXFR pre-fill → DNS → mDNS → LLMNR → NetBIOS)
        ├─ 6. Lookup MAC vendor (OUI database, offline)
        ├─ 7. OS fingerprint via TTL (Windows / Linux/macOS / Network device)
        ├─ 8. Enrichment (if enabled):
@@ -41,6 +41,19 @@ Scheduled execution (any scheduler, recommended: weekly)
                 ├─ Write audit log entries
                 └─ Exit with bitmask code for RMM integration
 ```
+
+## Hostname Resolution
+
+A layered cascade. Each stage runs only against IPs still unresolved by the previous one. Every device's `hostnameSource` field records which stage answered (`axfr` / `dns` / `mdns` / `llmnr` / `nbns` / `upnp`); this is rendered as a small `[src]` subscript in the alert and console output.
+
+1. **AXFR (DNS zone transfer)** — opt-in, default-on. One TCP/53 query per scan to a configured (or auto-discovered) DNS server for the forward zone (`config.dnsZoneTransfer.{enabled, server, zone}`). On success, the entire zone's A records are pre-loaded as an IP→hostname map; every matching IP is fully resolved before any network probing happens. On failure (REFUSED rcode, unreachable, malformed) one WARN line is logged and the cascade continues — designed so that an unauthorised attempt costs nothing more than a few hundred milliseconds. Auto-discovery uses `$env:USERDNSDOMAIN` plus the active interface's first DNS server / DnsSuffix when `server`/`zone` are empty.
+2. **DNS reverse-PTR** — `[System.Net.Dns]::GetHostEntryAsync` fired in parallel for all remaining IPs, joined via `Task.WhenAny` with a 2 s per-host timeout.
+3. **mDNS** — single multicast burst into `224.0.0.251:5353` (RFC 6762, QU bit set), 3 s passive listen window, responder-IP filter. O(1) regardless of subnet size. Returns `.local` names from Apple/Linux/IoT.
+4. **LLMNR** — same pattern against `224.0.0.252:5355` (RFC 4795, no QU bit). Covers modern Windows hosts that no longer have NetBIOS over TCP/IP enabled.
+5. **NetBIOS** — UDP/137 unicast per host, sequential. Legacy Windows / SMB devices.
+6. **UPnP `friendlyName`** (in the enrichment phase, not the hostname pass) — fallback for devices that only advertise themselves over SSDP. Final entry in the chain.
+
+Trailing `.local` is stripped from every result via `Format-DisplayHostname` so the column shows `fileserver` rather than `fileserver.local`.
 
 ## Detection Rules
 
