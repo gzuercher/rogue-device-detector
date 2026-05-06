@@ -172,7 +172,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.1'
+$SCRIPT_VERSION       = '1.6.2'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
