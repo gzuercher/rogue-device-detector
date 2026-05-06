@@ -1333,3 +1333,61 @@ Describe 'Get-FilteredRisk' {
         @($filtered.Reasons) | Should -HaveCount 2
     }
 }
+
+# ── Hostname display polish ───────────────────────────────────────────────────
+
+Describe 'Format-DisplayHostname' {
+
+    It 'strips a trailing .local suffix' {
+        Format-DisplayHostname -Hostname 'getafix.local' | Should -Be 'getafix'
+    }
+
+    It 'strips .LOCAL case-insensitively' {
+        Format-DisplayHostname -Hostname 'PRINTER.LOCAL' | Should -Be 'PRINTER'
+    }
+
+    It 'tolerates a trailing FQDN dot' {
+        Format-DisplayHostname -Hostname 'host.local.' | Should -Be 'host'
+    }
+
+    It 'leaves non-mDNS hostnames untouched' {
+        Format-DisplayHostname -Hostname 'fileserver'           | Should -Be 'fileserver'
+        Format-DisplayHostname -Hostname 'host.corp.example.com' | Should -Be 'host.corp.example.com'
+    }
+
+    It 'returns empty string for empty input' {
+        Format-DisplayHostname -Hostname '' | Should -Be ''
+    }
+}
+
+# ── Passive multicast resolver — packet builder ──────────────────────────────
+
+Describe 'New-DnsPtrQueryPacket' {
+
+    It 'produces a 12-byte header + reversed in-addr.arpa QNAME + PTR/IN footer' {
+        $bytes = New-DnsPtrQueryPacket -IP '192.168.1.42'
+        $bytes | Should -Not -BeNullOrEmpty
+        # Header: 12 bytes; Question section: each label length-prefixed,
+        # null-terminator, then 2 bytes QTYPE + 2 bytes QCLASS.
+        # Labels: "42","1","168","192","in-addr","arpa" = 2+1+3+3+7+4 = 20 chars
+        # plus 6 length bytes + 1 null + 4 type/class = 31 bytes after header.
+        $bytes.Length | Should -Be 43
+
+        # QTYPE = PTR (0x000C) at the end-4
+        $bytes[-4] | Should -Be 0x00
+        $bytes[-3] | Should -Be 0x0C
+        # Without -UnicastResponseBit, QCLASS high byte is 0x00
+        $bytes[-2] | Should -Be 0x00
+        $bytes[-1] | Should -Be 0x01
+    }
+
+    It 'sets the QU bit when -UnicastResponseBit is given' {
+        $bytes = New-DnsPtrQueryPacket -IP '10.0.0.5' -UnicastResponseBit
+        $bytes[-2] | Should -Be 0x80
+        $bytes[-1] | Should -Be 0x01
+    }
+
+    It 'returns $null for a malformed IP' {
+        New-DnsPtrQueryPacket -IP 'not-an-ip' | Should -BeNullOrEmpty
+    }
+}
