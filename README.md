@@ -177,6 +177,11 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
   "summaryReport": false,
   "configured": true,
   "alertRiskLevel": "HIGH",
+  "dnsZoneTransfer": {
+    "enabled": true,
+    "server": "",
+    "zone": ""
+  },
   "smtp": {
     "host": "smtp.example.com",
     "port": 587,
@@ -200,6 +205,9 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
 | `summaryReport` | `false` | Send a full network health report after every scan (not just rogue alerts). |
 | `configured` | `true` | Safety gate. The unattended installer writes `false`; normal scan mode refuses to run until you flip it to `true` after reviewing this file. `-LearningMode` and admin modes (`-ListDevices`, `-ApproveDevice`, …) bypass the gate. |
 | `alertRiskLevel` | `HIGH` | Threshold for the Risk-Findings table / mail. `NONE` disables the section entirely; `LOW`/`MEDIUM`/`HIGH`/`CRITICAL` is the lowest level reported. See [Risk-alert threshold](#risk-alert-threshold-alertrisklevel) below. |
+| `dnsZoneTransfer.enabled` | `true` | If true, RDD attempts an AXFR (DNS zone transfer) at the start of every scan and uses the result as a hostname pre-fill — see [AXFR pre-fill](#axfr-pre-fill-dnszonetransfer) below. AXFR is denied by most DNS servers out of the box, so an unauthorised attempt costs only one WARN log line. |
+| `dnsZoneTransfer.server` | auto-detect | DNS server to query (the authoritative server for the zone). Empty = first IPv4 DNS server of the active network adapter. |
+| `dnsZoneTransfer.zone` | auto-detect | Forward zone to transfer (e.g. `corp.example.com`). Empty = `$env:USERDNSDOMAIN` (Windows AD), then DnsSuffix from the active interface. |
 | `smtp.host` | – | SMTP server hostname. |
 | `smtp.port` | `587` | SMTP port. |
 | `smtp.user` | – | SMTP username. Optional; alerts skip silently if blank. |
@@ -211,6 +219,33 @@ Copy `config.example.json` to `config.json` and adjust. The config file is exclu
 All path values must include the full filename. Backslashes must be escaped as `\\` in JSON.
 
 `state.json`, `oui.csv`, and `rdd-audit.csv` are also excluded from git.
+
+### AXFR pre-fill (`dnsZoneTransfer`)
+
+When enabled, RDD asks the configured (or auto-discovered) DNS server for the entire forward zone via AXFR at the start of every scan. Every A record returned becomes part of an in-memory IP→hostname map; matching IPs in the current ARP scan get their hostname set immediately and skip every later resolver stage. On a domain with hundreds of statically-assigned devices that don't speak mDNS/LLMNR/NetBIOS (switches, USVs, IoT with manual DNS records), this is by far the most effective hostname source.
+
+AXFR is denied by default on every modern DNS server — that's intentional. To allow RDD's host:
+
+**Windows DNS Server** (PowerShell, run as Administrator on the DNS server):
+
+```powershell
+# Allow only the RDD host(s) to transfer the zone
+Set-DnsServerPrimaryZone -Name "corp.example.com" `
+    -SecureSecondaries TransferToSecureServers `
+    -SecondaryServers "192.168.1.50"
+```
+
+**BIND** (`named.conf`):
+
+```
+zone "corp.example.com" {
+    type master;
+    file "corp.example.com.zone";
+    allow-transfer { 192.168.1.50; };   # RDD host(s)
+};
+```
+
+If AXFR is denied, refused, or the server is unreachable, RDD logs a single WARN line (`AXFR for '<zone>' from <server> skipped (refused: REFUSED).`) and the hostname cascade falls through to DNS reverse / mDNS / LLMNR / NetBIOS exactly as before. Setting `dnsZoneTransfer.enabled` to `false` skips the attempt entirely.
 
 ### Risk-alert threshold (`alertRiskLevel`)
 

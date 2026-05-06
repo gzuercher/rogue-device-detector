@@ -1391,3 +1391,181 @@ Describe 'New-DnsPtrQueryPacket' {
         New-DnsPtrQueryPacket -IP 'not-an-ip' | Should -BeNullOrEmpty
     }
 }
+
+# ── AXFR helpers ──────────────────────────────────────────────────────────────
+
+Describe 'New-DnsAxfrQueryPacket' {
+
+    It 'builds a query for "corp.example.com" with QTYPE=AXFR and QCLASS=IN' {
+        $bytes = New-DnsAxfrQueryPacket -Zone 'corp.example.com'
+        $bytes | Should -Not -BeNullOrEmpty
+        # Header (12) + labels: 4+7+3 chars + 3 length bytes + null + QTYPE + QCLASS
+        # Labels: "corp"(4)+"example"(7)+"com"(3) = 14 chars + 3 length bytes + 1 null = 18
+        # Plus 4 trailing (QTYPE+QCLASS) = 22 after header.
+        $bytes.Length | Should -Be 34
+        # QTYPE = 0x00FC (AXFR)
+        $bytes[-4] | Should -Be 0x00
+        $bytes[-3] | Should -Be 0xFC
+        # QCLASS = 0x0001 (IN)
+        $bytes[-2] | Should -Be 0x00
+        $bytes[-1] | Should -Be 0x01
+    }
+
+    It 'tolerates a trailing dot on the zone' {
+        $a = New-DnsAxfrQueryPacket -Zone 'corp.example.com'
+        $b = New-DnsAxfrQueryPacket -Zone 'corp.example.com.'
+        $a.Length | Should -Be $b.Length
+    }
+
+    It 'returns $null for empty zone' {
+        New-DnsAxfrQueryPacket -Zone '' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'ConvertFrom-DnsAxfrMessage' {
+
+    BeforeAll {
+        function New-AxfrMessage {
+            # Helper to assemble a valid DNS AXFR-style message in one shot:
+            # transaction id 0x1234, response (QR=1) + authoritative, no error.
+            # Provide the question section and answer records as raw byte arrays.
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test fixture builder — returns a byte array, no system state mutated.'
+            )]
+            param(
+                [byte[]]$Question = @(),
+                [int]$QdCount = 0,
+                [byte[]]$Answers = @(),
+                [int]$AnCount = 0,
+                [int]$Rcode   = 0
+            )
+            $flagsHi = 0x84    # QR=1, AA=1
+            $flagsLo = $Rcode -band 0x0F
+            $qdHi = ($QdCount -shr 8) -band 0xFF
+            $qdLo = $QdCount -band 0xFF
+            $anHi = ($AnCount -shr 8) -band 0xFF
+            $anLo = $AnCount -band 0xFF
+            $hdr = @(
+                0x12, 0x34,
+                $flagsHi, $flagsLo,
+                $qdHi, $qdLo,
+                $anHi, $anLo,
+                0x00, 0x00, 0x00, 0x00
+            )
+            return ([byte[]]($hdr + $Question + $Answers))
+        }
+
+        function New-AxfrARecord {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test fixture builder — returns a byte array, no system state mutated.'
+            )]
+            param(
+                [Parameter(Mandatory)][string]$Name,
+                [Parameter(Mandatory)][string]$Ip
+            )
+            $bytes = [System.Collections.Generic.List[byte]]::new()
+            foreach ($lbl in $Name.Split('.')) {
+                $b = [System.Text.Encoding]::ASCII.GetBytes($lbl)
+                $bytes.Add([byte]$b.Length); $bytes.AddRange($b)
+            }
+            $bytes.Add(0x00)
+            $bytes.AddRange([byte[]](0x00, 0x01))                   # type=A
+            $bytes.AddRange([byte[]](0x00, 0x01))                   # class=IN
+            $bytes.AddRange([byte[]](0x00, 0x00, 0x01, 0x2C))       # ttl=300
+            $bytes.AddRange([byte[]](0x00, 0x04))                   # rdlength=4
+            foreach ($oct in $Ip.Split('.')) { $bytes.Add([byte][int]$oct) }
+            return $bytes.ToArray()
+        }
+
+        function New-AxfrSoaRecord {
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSUseShouldProcessForStateChangingFunctions', '',
+                Justification = 'Test fixture builder — returns a byte array, no system state mutated.'
+            )]
+            param()
+            $rdata = [byte[]](0..21)
+            $bytes = [System.Collections.Generic.List[byte]]::new()
+            $bytes.Add(0x00)
+            $bytes.AddRange([byte[]](0x00, 0x06))                   # type=SOA
+            $bytes.AddRange([byte[]](0x00, 0x01))                   # class=IN
+            $bytes.AddRange([byte[]](0x00, 0x00, 0x0E, 0x10))       # ttl=3600
+            $rdLenHi = ($rdata.Length -shr 8) -band 0xFF
+            $rdLenLo = $rdata.Length -band 0xFF
+            $bytes.AddRange([byte[]]($rdLenHi, $rdLenLo))
+            $bytes.AddRange($rdata)
+            return $bytes.ToArray()
+        }
+    }
+
+    It 'extracts an A record from a one-shot AXFR message' {
+        $a   = New-AxfrARecord -Name 'host1.corp.example.com' -Ip '192.168.1.10'
+        $msg = New-AxfrMessage -AnCount 1 -Answers $a
+        $r   = ConvertFrom-DnsAxfrMessage -Bytes $msg
+        $r.Rcode | Should -Be 0
+        $r.SoaCount | Should -Be 0
+        @($r.ARecords).Count | Should -Be 1
+        $r.ARecords[0].Name | Should -Be 'host1.corp.example.com'
+        $r.ARecords[0].IP   | Should -Be '192.168.1.10'
+    }
+
+    It 'counts SOA records (start + end markers of an AXFR stream)' {
+        $soa  = New-AxfrSoaRecord
+        $a    = New-AxfrARecord -Name 'h.corp.example.com' -Ip '10.0.0.1'
+        $body = $soa + $a + $soa
+        $msg  = New-AxfrMessage -AnCount 3 -Answers $body
+        $r = ConvertFrom-DnsAxfrMessage -Bytes $msg
+        $r.SoaCount | Should -Be 2
+        @($r.ARecords).Count | Should -Be 1
+    }
+
+    It 'reports a non-zero rcode (REFUSED) without throwing' {
+        $msg = New-AxfrMessage -Rcode 5
+        $r   = ConvertFrom-DnsAxfrMessage -Bytes $msg
+        $r.Rcode | Should -Be 5
+        @($r.ARecords).Count | Should -Be 0
+    }
+
+    It 'returns empty result on truncated input' {
+        $r = ConvertFrom-DnsAxfrMessage -Bytes ([byte[]](0,0,0))
+        $r.Rcode | Should -Be 0
+        @($r.ARecords).Count | Should -Be 0
+    }
+}
+
+Describe 'Get-DnsRcodeName' {
+
+    It 'maps known rcodes to mnemonics' {
+        Get-DnsRcodeName -Rcode 0 | Should -Be 'NOERROR'
+        Get-DnsRcodeName -Rcode 5 | Should -Be 'REFUSED'
+        Get-DnsRcodeName -Rcode 4 | Should -Be 'NOTIMP'
+    }
+
+    It 'falls back to a numeric label for unknown rcodes' {
+        Get-DnsRcodeName -Rcode 99 | Should -Match 'rcode=99'
+    }
+}
+
+Describe 'Test-ZtcEnabled / Get-ZtcField' {
+
+    It 'reads enabled=true from a hashtable' {
+        Test-ZtcEnabled -Config @{ enabled = $true; server = ''; zone = '' } | Should -BeTrue
+    }
+
+    It 'reads enabled=true from a PSCustomObject (JSON-style config)' {
+        Test-ZtcEnabled -Config ([PSCustomObject]@{ enabled = $true }) | Should -BeTrue
+    }
+
+    It 'returns $false when the block is $null or missing the field' {
+        Test-ZtcEnabled -Config $null              | Should -BeFalse
+        Test-ZtcEnabled -Config @{}                | Should -BeFalse
+        Test-ZtcEnabled -Config @{ enabled = $false } | Should -BeFalse
+    }
+
+    It 'Get-ZtcField returns the value for hashtable and PSCustomObject alike' {
+        Get-ZtcField -Config @{ server = '1.2.3.4' }                 -Name 'server' | Should -Be '1.2.3.4'
+        Get-ZtcField -Config ([PSCustomObject]@{ zone = 'corp.tld' }) -Name 'zone'   | Should -Be 'corp.tld'
+        Get-ZtcField -Config @{}                                      -Name 'server' | Should -BeNullOrEmpty
+    }
+}

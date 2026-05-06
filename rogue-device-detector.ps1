@@ -172,7 +172,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.1'
+$SCRIPT_VERSION       = '1.6.2'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
@@ -255,6 +255,16 @@ function Get-Configuration {
             to       = ''
             useSsl   = $true
         }
+        # AXFR pre-fill of hostnames. Default-on: AXFR is denied by most DNS
+        # servers out of the box, so an enabled-but-unauthorised attempt just
+        # logs a single skip line and moves on. Set server / zone explicitly
+        # when auto-discovery (active-NIC DNS server + USERDNSDOMAIN/DnsSuffix)
+        # picks the wrong values.
+        dnsZoneTransfer = @{
+            enabled = $true
+            server  = ''
+            zone    = ''
+        }
     }
 
     $useSslExplicit = $false
@@ -277,6 +287,14 @@ function Get-Configuration {
                 } else {
                     Write-RddLog "Invalid alertRiskLevel '$val' in config; falling back to '$($cfg.alertRiskLevel)'." -Level WARN
                 }
+            }
+            if ($p['dnsZoneTransfer'] -and $null -ne $file.dnsZoneTransfer) {
+                $dp = $file.dnsZoneTransfer.PSObject.Properties
+                if ($dp['enabled'] -and $null -ne $file.dnsZoneTransfer.enabled) {
+                    $cfg.dnsZoneTransfer.enabled = [bool]$file.dnsZoneTransfer.enabled
+                }
+                if ($dp['server']  -and $file.dnsZoneTransfer.server) { $cfg.dnsZoneTransfer.server = [string]$file.dnsZoneTransfer.server }
+                if ($dp['zone']    -and $file.dnsZoneTransfer.zone)   { $cfg.dnsZoneTransfer.zone   = [string]$file.dnsZoneTransfer.zone }
             }
             if ($p['smtp'] -and $null -ne $file.smtp) {
                 $sp = $file.smtp.PSObject.Properties
@@ -886,6 +904,371 @@ function Read-DnsName {
     return ($labels -join '.')
 }
 
+function Get-DnsNameWireLength {
+    <#
+    .SYNOPSIS
+        Counts the bytes a DNS NAME field occupies in the wire stream,
+        including label-length bytes, label bytes, and either the terminating
+        null or a 2-byte 0xC0 pointer. Caller uses this to advance past the
+        NAME without decompressing it. Returns 0 on malformed input.
+    .PARAMETER Bytes  Full message bytes.
+    .PARAMETER Offset Start of the NAME field.
+    #>
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][int]$Offset
+    )
+
+    $cursor = $Offset
+    while ($cursor -lt $Bytes.Length) {
+        $len = $Bytes[$cursor]
+        if ($len -eq 0) { return ($cursor - $Offset + 1) }
+        if (($len -band 0xC0) -eq 0xC0) {
+            if ($cursor + 1 -ge $Bytes.Length) { return 0 }
+            return ($cursor - $Offset + 2)
+        }
+        if ($cursor + 1 + $len -gt $Bytes.Length) { return 0 }
+        $cursor += 1 + $len
+    }
+    return 0
+}
+
+function New-DnsAxfrQueryPacket {
+    <#
+    .SYNOPSIS
+        Builds a DNS AXFR (zone transfer) query packet. Wire format identical
+        to a normal DNS query but QTYPE=0x00FC (AXFR). Caller is responsible
+        for the TCP 2-byte length prefix.
+    .PARAMETER Zone Zone name to transfer (e.g. 'corp.example.com').
+    .RETURNS Byte array, or $null if the zone string is empty.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Pure constructor — returns a byte array, no system state mutated.'
+    )]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Zone)
+
+    if (-not $Zone) { return $null }
+    $zoneTrimmed = $Zone.Trim('.')
+    if (-not $zoneTrimmed) { return $null }
+    $labels = $zoneTrimmed.Split('.')
+
+    $msg = [System.Collections.Generic.List[byte]]::new()
+    $rng = [System.Random]::new()
+    $msg.Add([byte]$rng.Next(0, 256)); $msg.Add([byte]$rng.Next(0, 256))   # ID
+    $msg.AddRange([byte[]](0x00, 0x00))                                    # Flags: standard query, RD=0
+    $msg.AddRange([byte[]](0x00, 0x01))                                    # QDCOUNT = 1
+    $msg.AddRange([byte[]](0x00, 0x00, 0x00, 0x00, 0x00, 0x00))            # AN/NS/AR = 0
+    foreach ($label in $labels) {
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($label)
+        if ($bytes.Length -gt 63) { return $null }   # DNS label limit
+        $msg.Add([byte]$bytes.Length)
+        $msg.AddRange($bytes)
+    }
+    $msg.Add([byte]0x00)                                                   # QNAME terminator
+    $msg.AddRange([byte[]](0x00, 0xFC))                                    # QTYPE = AXFR
+    $msg.AddRange([byte[]](0x00, 0x01))                                    # QCLASS = IN
+    return $msg.ToArray()
+}
+
+function ConvertFrom-DnsAxfrMessage {
+    <#
+    .SYNOPSIS
+        Parses one DNS message from an AXFR response stream. Returns the A
+        records found and the number of SOA records seen (the AXFR protocol
+        terminates after the second SOA — same record at start and end).
+        Tolerates name compression and unknown record types.
+    .PARAMETER Bytes One complete DNS message (without the TCP length prefix).
+    .RETURNS PSCustomObject with:
+             - ARecords: array of {Name; IP}
+             - SoaCount: int
+             - Rcode:    int (0 = NOERROR; non-zero means refused/error)
+    #>
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $empty = [PSCustomObject]@{ ARecords = @(); SoaCount = 0; Rcode = 0 }
+    if ($Bytes.Length -lt 12) { return $empty }
+
+    $rcode   = $Bytes[3] -band 0x0F
+    $qdCount = ($Bytes[4] -shl 8) -bor $Bytes[5]
+    $anCount = ($Bytes[6] -shl 8) -bor $Bytes[7]
+
+    if ($rcode -ne 0) {
+        return [PSCustomObject]@{ ARecords = @(); SoaCount = 0; Rcode = $rcode }
+    }
+
+    $offset = 12
+    # Skip question section. AXFR's first message echoes the question; later
+    # continuation messages typically have QDCOUNT=0.
+    for ($q = 0; $q -lt $qdCount; $q++) {
+        $consumed = Get-DnsNameWireLength -Bytes $Bytes -Offset $offset
+        if ($consumed -le 0) { return $empty }
+        $offset += $consumed + 4   # QNAME + QTYPE + QCLASS
+        if ($offset -gt $Bytes.Length) { return $empty }
+    }
+
+    $aRecords = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $soaCount = 0
+    for ($a = 0; $a -lt $anCount -and $offset -lt $Bytes.Length; $a++) {
+        $name      = Read-DnsName          -Bytes $Bytes -Offset $offset
+        $nameBytes = Get-DnsNameWireLength -Bytes $Bytes -Offset $offset
+        if ($nameBytes -le 0) { break }
+        $offset += $nameBytes
+        if ($offset + 10 -gt $Bytes.Length) { break }
+
+        $type    = ($Bytes[$offset] -shl 8) -bor $Bytes[$offset + 1]
+        $rdLen   = ($Bytes[$offset + 8] -shl 8) -bor $Bytes[$offset + 9]
+        $rdStart = $offset + 10
+        if ($rdStart + $rdLen -gt $Bytes.Length) { break }
+
+        if ($type -eq 0x0001 -and $rdLen -eq 4 -and $name) {
+            $ip = "$($Bytes[$rdStart]).$($Bytes[$rdStart + 1]).$($Bytes[$rdStart + 2]).$($Bytes[$rdStart + 3])"
+            $aRecords.Add([PSCustomObject]@{ Name = $name; IP = $ip })
+        } elseif ($type -eq 0x0006) {
+            $soaCount++
+        }
+        $offset = $rdStart + $rdLen
+    }
+
+    return [PSCustomObject]@{
+        ARecords = $aRecords.ToArray()
+        SoaCount = $soaCount
+        Rcode    = 0
+    }
+}
+
+function Invoke-DnsAxfr {
+    <#
+    .SYNOPSIS
+        Performs a DNS zone transfer (AXFR) over TCP/53 against the given
+        server, parsing the streamed response until the second SOA record
+        (AXFR end-of-zone marker) or a hard timeout, and returns an
+        IP -> hostname map of every A record encountered.
+    .PARAMETER Server          DNS server IP to transfer from.
+    .PARAMETER Zone            Zone to transfer (e.g. 'corp.example.com').
+    .PARAMETER Port            TCP port. Default 53.
+    .PARAMETER ConnectTimeoutMs Connect/handshake timeout.
+    .PARAMETER TotalTimeoutMs   Hard cap on the total transfer time.
+    .RETURNS PSCustomObject:
+             - Map:    hashtable IP -> hostname (empty on failure)
+             - Status: 'ok' | 'refused' | 'unreachable' | 'timeout' | 'malformed'
+             - Detail: short human-readable reason (rcode, exception class)
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Function name follows DNS protocol terminology.'
+    )]
+    param(
+        [Parameter(Mandatory)][string]$Server,
+        [Parameter(Mandatory)][string]$Zone,
+        [int]$Port             = 53,
+        [int]$ConnectTimeoutMs = 2000,
+        [int]$TotalTimeoutMs   = 5000
+    )
+
+    $result = [PSCustomObject]@{ Map = @{}; Status = 'unreachable'; Detail = '' }
+    $tcp    = $null
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new()
+        $connectTask = $tcp.ConnectAsync($Server, $Port)
+        if (-not $connectTask.Wait($ConnectTimeoutMs)) {
+            $result.Status = 'timeout'; $result.Detail = "connect ${ConnectTimeoutMs}ms"
+            return $result
+        }
+        $tcp.ReceiveTimeout = $TotalTimeoutMs
+        $tcp.SendTimeout    = $TotalTimeoutMs
+        $stream = $tcp.GetStream()
+
+        $packet = New-DnsAxfrQueryPacket -Zone $Zone
+        if ($null -eq $packet) {
+            $result.Status = 'malformed'; $result.Detail = "invalid zone '$Zone'"
+            return $result
+        }
+
+        # TCP DNS frames each message with a 2-byte big-endian length prefix.
+        $lenPrefix = [byte[]]@(($packet.Length -shr 8) -band 0xFF, $packet.Length -band 0xFF)
+        $stream.Write($lenPrefix, 0, 2)
+        $stream.Write($packet,    0, $packet.Length)
+        $stream.Flush()
+
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TotalTimeoutMs)
+        $soaCount = 0
+
+        while ($soaCount -lt 2 -and [DateTime]::UtcNow -lt $deadline) {
+            $lenBuf = New-Object 'byte[]' 2
+            $got = Read-StreamExact -Stream $stream -Buffer $lenBuf -Length 2 -Deadline $deadline
+            if ($got -lt 2) { break }
+            $msgLen = ($lenBuf[0] -shl 8) -bor $lenBuf[1]
+            if ($msgLen -le 0) { break }
+
+            $msgBuf = New-Object 'byte[]' $msgLen
+            $got = Read-StreamExact -Stream $stream -Buffer $msgBuf -Length $msgLen -Deadline $deadline
+            if ($got -lt $msgLen) { break }
+
+            $parsed = ConvertFrom-DnsAxfrMessage -Bytes $msgBuf
+            if ($parsed.Rcode -ne 0) {
+                $result.Status = 'refused'
+                $result.Detail = (Get-DnsRcodeName -Rcode $parsed.Rcode)
+                return $result
+            }
+            foreach ($r in $parsed.ARecords) {
+                if (-not $result.Map.ContainsKey($r.IP)) { $result.Map[$r.IP] = $r.Name }
+            }
+            $soaCount += $parsed.SoaCount
+        }
+
+        if ($soaCount -ge 2) {
+            $result.Status = 'ok'
+            $result.Detail = "$($result.Map.Count) host record(s)"
+        } else {
+            # Stream ended or timed out before the second SOA — partial data is
+            # still useful, but flag the truncation.
+            $result.Status = if ([DateTime]::UtcNow -ge $deadline) { 'timeout' } else { 'malformed' }
+            $result.Detail = "ended after $soaCount SOA record(s), $($result.Map.Count) A record(s)"
+        }
+    } catch [System.Net.Sockets.SocketException] {
+        $result.Status = 'unreachable'; $result.Detail = $_.Exception.SocketErrorCode.ToString()
+    } catch {
+        $result.Status = 'malformed';   $result.Detail = $_.Exception.GetType().Name
+    } finally {
+        if ($tcp) { try { $tcp.Close() } catch { $null = $_ } }
+    }
+    return $result
+}
+
+function Read-StreamExact {
+    <#
+    .SYNOPSIS
+        Reads exactly $Length bytes from a NetworkStream into $Buffer, looping
+        across partial reads until full or until the deadline elapses.
+        Returns the number of bytes actually read.
+    #>
+    param(
+        [Parameter(Mandatory)][System.IO.Stream]$Stream,
+        [Parameter(Mandatory)][byte[]]$Buffer,
+        [Parameter(Mandatory)][int]$Length,
+        [Parameter(Mandatory)][DateTime]$Deadline
+    )
+    $total = 0
+    while ($total -lt $Length -and [DateTime]::UtcNow -lt $Deadline) {
+        try {
+            $n = $Stream.Read($Buffer, $total, $Length - $total)
+        } catch {
+            break
+        }
+        if ($n -le 0) { break }
+        $total += $n
+    }
+    return $total
+}
+
+function Get-DnsRcodeName {
+    <#
+    .SYNOPSIS
+        Maps a DNS rcode (0-15) to its standard mnemonic for log output.
+    #>
+    param([Parameter(Mandatory)][int]$Rcode)
+    switch ($Rcode) {
+        0  { 'NOERROR' }
+        1  { 'FORMERR' }
+        2  { 'SERVFAIL' }
+        3  { 'NXDOMAIN' }
+        4  { 'NOTIMP' }
+        5  { 'REFUSED' }
+        9  { 'NOTAUTH' }
+        default { "rcode=$Rcode" }
+    }
+}
+
+function Get-LocalDnsServer {
+    <#
+    .SYNOPSIS
+        Returns the first IPv4 DNS server address from the first
+        non-loopback, operational network interface. Empty string if none.
+    .RETURNS String IPv4 address or ''.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Get-LocalDnsServer reads from the local DNS-server collection; conventional naming.'
+    )]
+    param()
+    try {
+        $ifaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object {
+                $_.OperationalStatus -eq 'Up' -and
+                $_.NetworkInterfaceType -ne 'Loopback'
+            }
+        foreach ($iface in $ifaces) {
+            $props = $iface.GetIPProperties()
+            foreach ($dns in @($props.DnsAddresses)) {
+                if ($dns.AddressFamily -eq 'InterNetwork') { return $dns.ToString() }
+            }
+        }
+    } catch {
+        $null = $_
+    }
+    return ''
+}
+
+function Get-LocalDnsSuffix {
+    <#
+    .SYNOPSIS
+        Returns the local DNS suffix used for forward-zone discovery:
+        $env:USERDNSDOMAIN first (Windows AD), otherwise the DnsSuffix from
+        the first operational interface that has one. Empty string if none.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseSingularNouns', '',
+        Justification = 'Returns a single suffix; conventional naming.'
+    )]
+    param()
+    if ($env:USERDNSDOMAIN) { return $env:USERDNSDOMAIN.ToLowerInvariant() }
+    try {
+        $ifaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object {
+                $_.OperationalStatus -eq 'Up' -and
+                $_.NetworkInterfaceType -ne 'Loopback'
+            }
+        foreach ($iface in $ifaces) {
+            $props = $iface.GetIPProperties()
+            if ($props.DnsSuffix) { return $props.DnsSuffix.ToLowerInvariant() }
+        }
+    } catch {
+        $null = $_
+    }
+    return ''
+}
+
+function Test-ZtcEnabled {
+    <#
+    .SYNOPSIS
+        Returns $true when the dnsZoneTransfer config block is enabled.
+        Tolerates both hashtable and PSCustomObject shapes (config values
+        come from JSON via ConvertFrom-Json as PSCustomObject; tests pass
+        hashtables). Missing block / missing key defaults to $false.
+    #>
+    param([object]$Config)
+    if ($null -eq $Config) { return $false }
+    return [bool](Get-ZtcField -Config $Config -Name 'enabled')
+}
+
+function Get-ZtcField {
+    <#
+    .SYNOPSIS
+        Reads a field from a config object that may be a hashtable or a
+        PSCustomObject. Returns $null when the field is absent.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ($Config -is [hashtable]) {
+        if ($Config.ContainsKey($Name)) { return $Config[$Name] } else { return $null }
+    }
+    if ($Config.PSObject.Properties[$Name]) { return $Config.$Name }
+    return $null
+}
+
 function Resolve-HostnameMdns {
     <#
     .SYNOPSIS
@@ -996,22 +1379,72 @@ function Resolve-Hostname {
     <#
     .SYNOPSIS
         Resolves hostnames for an array of devices in a layered cascade:
-        DNS (async, concurrent) → mDNS → LLMNR → NetBIOS. Each fallback runs
-        only against devices still unresolved by the previous step.
-        UPnP friendlyName is applied later, in the enrichment phase, since
-        UPnP discovery is a separate pipeline stage.
+        AXFR (zone transfer pre-fill) → DNS (async, concurrent) → mDNS →
+        LLMNR → NetBIOS. Each fallback runs only against devices still
+        unresolved by the previous step. UPnP friendlyName is applied
+        later, in the enrichment phase.
         Updates the hostname property of each device object in place.
-    .PARAMETER Devices Array of PSCustomObjects with an 'ip' property.
+    .PARAMETER Devices             Array of PSCustomObjects with an 'ip' property.
+    .PARAMETER ZoneTransferConfig  Optional hashtable / PSCustomObject:
+                                   { enabled, server, zone }. enabled=$true
+                                   triggers AXFR pre-fill before DNS reverse;
+                                   empty server / zone fall back to local
+                                   network-adapter discovery.
     #>
-    param([Parameter(Mandatory)][array]$Devices)
+    param(
+        [Parameter(Mandatory)][array]$Devices,
+        [object]$ZoneTransferConfig = $null
+    )
 
     $timeoutMs = 2000
     $total     = @($Devices).Count
+    $resolved  = 0
+    $remaining = [System.Collections.Generic.List[PSCustomObject]]::new()
+    foreach ($d in $Devices) { $remaining.Add($d) }
 
-    Write-RddLog "Resolving hostnames via DNS for $total device(s)..."
+    # AXFR pre-fill — opt-in (default enabled), skipped on any failure.
+    if ($ZoneTransferConfig -and (Test-ZtcEnabled -Config $ZoneTransferConfig)) {
+        $axfrServer = (Get-ZtcField -Config $ZoneTransferConfig -Name 'server')
+        $axfrZone   = (Get-ZtcField -Config $ZoneTransferConfig -Name 'zone')
+        if (-not $axfrServer) { $axfrServer = Get-LocalDnsServer }
+        if (-not $axfrZone)   { $axfrZone   = Get-LocalDnsSuffix }
+
+        if ($axfrServer -and $axfrZone) {
+            Write-RddLog "Trying AXFR for zone '$axfrZone' from $axfrServer ..."
+            $axfr = Invoke-DnsAxfr -Server $axfrServer -Zone $axfrZone
+            switch ($axfr.Status) {
+                'ok' {
+                    Write-RddLog "AXFR for '$axfrZone' from $axfrServer succeeded: $($axfr.Detail)."
+                    $stillRemaining = [System.Collections.Generic.List[PSCustomObject]]::new()
+                    foreach ($d in $remaining) {
+                        if ($axfr.Map.ContainsKey($d.ip)) {
+                            $d.hostname       = Format-DisplayHostname -Hostname $axfr.Map[$d.ip]
+                            $d.hostnameSource = 'axfr'
+                            $resolved++
+                        } else {
+                            $stillRemaining.Add($d)
+                        }
+                    }
+                    $remaining = $stillRemaining
+                }
+                default {
+                    Write-RddLog "AXFR for '$axfrZone' from $axfrServer skipped ($($axfr.Status): $($axfr.Detail))." -Level WARN
+                }
+            }
+        } else {
+            Write-RddLog 'AXFR enabled but DNS server/zone could not be auto-discovered; skipping. Set dnsZoneTransfer.server / .zone explicitly to override.' -Level WARN
+        }
+    }
+
+    if (@($remaining).Count -eq 0) {
+        Write-RddLog "Hostname resolution complete: $resolved/$total resolved."
+        return
+    }
+
+    Write-RddLog "Resolving hostnames via DNS for $(@($remaining).Count) device(s)..."
 
     # Fire all DNS requests concurrently before waiting for any
-    $tasks = $Devices | ForEach-Object {
+    $tasks = $remaining | ForEach-Object {
         [PSCustomObject]@{
             Device      = $_
             DnsTask     = [System.Net.Dns]::GetHostEntryAsync($_.ip)
@@ -1028,7 +1461,6 @@ function Resolve-Hostname {
     # Wait for all WhenAny tasks to complete (truly concurrent)
     [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($whenAnyTasks))
 
-    $resolved = 0
     $unresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     foreach ($t in $tasks) {
@@ -2849,7 +3281,8 @@ $foundDevices = @($arpEntries | ForEach-Object {
     }
 })
 
-Resolve-Hostname -Devices $foundDevices
+$ztcConfig = if ($cfg.ContainsKey('dnsZoneTransfer')) { $cfg.dnsZoneTransfer } else { $null }
+Resolve-Hostname -Devices $foundDevices -ZoneTransferConfig $ztcConfig
 
 foreach ($d in $foundDevices) {
     $d.vendor = Get-MacVendor -Mac $d.mac -OuiDb $ouiDb
