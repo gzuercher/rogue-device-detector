@@ -167,6 +167,33 @@ Describe 'Send-RogueAlert HTML body' {
         $global:RDDTestCapture.Body | Should -Match 'AA:BB:CC:DD:EE:30(?s).*?<span style="color:#a0aec0;">-</span>'
     }
 
+    It 'falls back to label with [label] tag when hostname is unresolved' {
+        $labelled = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:31'; ip='192.168.99.31'; hostname='192.168.99.31'
+            label='Server room UPS'
+            vendor='APC'; osGuess=''; httpBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+        Send-RogueAlert -Devices @($labelled) -SmtpConfig $script:smtp
+        # Hostname cell should now show the label plus the [label] source tag.
+        $global:RDDTestCapture.Body | Should -Match 'AA:BB:CC:DD:EE:31(?s).*?Server room UPS(?s).*?\[label\]'
+    }
+
+    It 'prefers a real resolved hostname over the label when both exist' {
+        $both = [PSCustomObject]@{
+            mac='AA:BB:CC:DD:EE:32'; ip='192.168.99.32'
+            hostname='realname'; hostnameSource='dns'
+            label='Operator label'
+            vendor='X'; osGuess=''; httpBanner=''; upnpInfo=''
+            openPorts=@(); riskLevel='NONE'; riskReasons=@()
+        }
+        Send-RogueAlert -Devices @($both) -SmtpConfig $script:smtp
+        $body = $global:RDDTestCapture.Body
+        $body | Should -Match 'AA:BB:CC:DD:EE:32(?s).*?realname(?s).*?\[dns\]'
+        # The label must NOT have hijacked the hostname cell.
+        $body | Should -Not -Match 'AA:BB:CC:DD:EE:32(?s).*?Operator label(?s).*?\[label\]'
+    }
+
     It 'no longer attaches anything (audit CSV removed from email)' {
         Send-RogueAlert -Devices @($script:rogueDevice) -SmtpConfig $script:smtp
         $global:RDDTestCapture.Attachments | Should -Be $null
