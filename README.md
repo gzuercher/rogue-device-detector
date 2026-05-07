@@ -247,6 +247,8 @@ zone "corp.example.com" {
 
 If AXFR is denied, refused, or the server is unreachable, RDD logs a single WARN line (`AXFR for '<zone>' from <server> skipped (refused: REFUSED).`) and the hostname cascade falls through to DNS reverse / mDNS / LLMNR / NetBIOS exactly as before. Setting `dnsZoneTransfer.enabled` to `false` skips the attempt entirely.
 
+To diagnose AXFR problems (transfer succeeds at the wire level but the alert still says `Map size: 0`, or a server replies with something unusual), run [`tools/Test-Axfr.ps1`](tools/Test-Axfr.ps1) — it prints the SOA result, raw response bytes, parser output, and the production-path call side-by-side.
+
 ### Risk-alert threshold (`alertRiskLevel`)
 
 Controls how chatty the Risk-Findings table in the email is. The level a
