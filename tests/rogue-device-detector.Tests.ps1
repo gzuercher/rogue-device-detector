@@ -1631,10 +1631,10 @@ Describe 'Static analysis: comma-band-array trap' {
         # comma is preceded by something containing -band on the same line.
         # The capture deliberately stops at the first comma, so subsequent
         # array elements don't matter.
-        $matches = [regex]::Matches($code, '\[byte\[\]\]@?\([^)\r\n]*-band[^,\r\n]*,')
-        if ($matches.Count -gt 0) {
-            $hits = ($matches | ForEach-Object { $_.Value }) -join "`n  "
-            throw "Found $($matches.Count) byte-array literal(s) with -band before the first comma — PowerShell will parse the comma first and crash with op_BitwiseAnd. Fix by computing each byte separately. Hits:`n  $hits"
+        $bandHits = [regex]::Matches($code, '\[byte\[\]\]@?\([^)\r\n]*-band[^,\r\n]*,')
+        if ($bandHits.Count -gt 0) {
+            $hits = ($bandHits | ForEach-Object { $_.Value }) -join "`n  "
+            throw "Found $($bandHits.Count) byte-array literal(s) with -band before the first comma — PowerShell will parse the comma first and crash with op_BitwiseAnd. Fix by computing each byte separately. Hits:`n  $hits"
         }
     }
 }
