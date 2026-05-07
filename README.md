@@ -273,21 +273,33 @@ check, so an explicitly-allowed RDP on a known terminal server stays out.
 
 ### Diagnosing scan problems
 
-When something does not behave as expected — AXFR refused, hostnames not resolving, SMTP not sending — re-run the scan with PowerShell's standard tracing switches:
+When something does not behave as expected — AXFR refused, hostnames not resolving, SMTP not sending — re-run the scan with PowerShell's standard tracing switches and pipe **all six streams** into a log file:
 
 ```powershell
 # Per-stage tracing: hostname stage hits/misses with timings, full
 # exception messages on every catch, AXFR send/receive trace, SMTP
 # connection params. Captures everything except the AXFR hex dump.
-.\rogue-device-detector.ps1 -Verbose 2>&1 | Tee-Object scan.log
+.\rogue-device-detector.ps1 -Verbose *>&1 | Tee-Object scan.log
 
 # Same as -Verbose plus a hex dump of the first 64 bytes of any AXFR
 # response. The hex dump is what you need when reporting an unparseable
 # AXFR reply.
-.\rogue-device-detector.ps1 -Debug 2>&1 | Tee-Object debug.log
+.\rogue-device-detector.ps1 -Debug *>&1 | Tee-Object debug.log
 ```
 
-The output of `-Debug` is what to attach to a bug report. For AXFR-specific issues, [`tools/Test-Axfr.ps1`](tools/Test-Axfr.ps1) gives a focused side-by-side view of the same wire-level steps.
+> **Important:** use `*>&1`, not `2>&1`. PowerShell has six output streams (Output / Error / Warning / Verbose / Debug / Information); `2>&1` only redirects errors, so `Tee-Object` would miss everything `Write-Verbose` and `Write-Debug` produce — exactly the diagnostic detail you wanted to capture. `*>&1` redirects all streams.
+
+The output of `-Debug` is what to attach to a bug report.
+
+For AXFR-specific issues, [`tools/Test-Axfr.ps1`](tools/Test-Axfr.ps1) gives a focused side-by-side view of the same wire-level steps. Download it next to `rogue-device-detector.ps1` and run:
+
+```powershell
+$url = 'https://raw.githubusercontent.com/gzuercher/rogue-device-detector/main/tools/Test-Axfr.ps1'
+Invoke-WebRequest $url -OutFile .\Test-Axfr.ps1 -UseBasicParsing
+.\Test-Axfr.ps1 -Verbose *>&1 | Tee-Object axfr.log
+```
+
+It dot-sources the main script for the same wire-format helpers, prints a colour-coded pass/fail per step (SOA, TCP/53, raw send + receive, parse, production-path), and ends with an actionable verdict line. With `-Verbose` it adds the full hex dump and exception stack — that's the form to attach when the production scan reports an AXFR error you can't pin down.
 
 ### Audit log rotation
 
