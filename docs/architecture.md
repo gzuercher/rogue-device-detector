@@ -1,4 +1,4 @@
-# ARCHITECTURE.md
+# Architecture
 
 Technical design and decisions for the rogue-device-detector. This document is for developers and contributors.
 

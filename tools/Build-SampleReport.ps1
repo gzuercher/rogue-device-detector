@@ -1,4 +1,4 @@
-# Build-SampleReport.ps1 - regenerates samples/sample-report.html from a
+# Build-SampleReport.ps1 - regenerates docs/samples/sample-report.html from a
 # fixed set of synthetic devices (RFC 5737 / RFC 1918 placeholders, no
 # real hostnames or MACs from any production network). Run from the repo
 # root after changes to Send-RogueAlert so the published sample stays
@@ -102,6 +102,6 @@ Send-RogueAlert -Devices $rogues `
 # Pull the captured body out of the global the mock writes into. The local
 # alias keeps the lint rule that hates top-level globals quiet.
 $capturedBody = (Get-Variable -Name 'cap' -Scope Global).Value.Body
-$capturedBody | Set-Content -Path samples/sample-report.html -Encoding UTF8
-$len = (Get-Item samples/sample-report.html).Length
+$capturedBody | Set-Content -Path docs/samples/sample-report.html -Encoding UTF8
+$len = (Get-Item docs/samples/sample-report.html).Length
 Write-Host "Sample report written: $len bytes"

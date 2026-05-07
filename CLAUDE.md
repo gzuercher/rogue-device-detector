@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Standalone PowerShell script that detects rogue/unauthorized devices on a network. Designed for MSP use but usable by anyone. No external dependencies, no cloud backend, no vendor lock-in.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for full technical design and data flow.
+See [docs/architecture.md](docs/architecture.md) for full technical design and data flow.
 
 ## Tech Stack
 
