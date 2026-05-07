@@ -1532,6 +1532,47 @@ Describe 'ConvertFrom-DnsAxfrMessage' {
         $r.Rcode | Should -Be 0
         @($r.ARecords).Count | Should -Be 0
     }
+
+    It 'parses ANCOUNT > 255 correctly (regression: byte-shift overflow)' {
+        # Regression for v1.6.2 bug: $byte -shl 8 truncates to 0 because
+        # PowerShell preserves the byte type. With ANCOUNT high-byte = 1
+        # the count must be 257, not 1.
+        $allBytes = [System.Collections.Generic.List[byte]]::new()
+        for ($i = 0; $i -lt 257; $i++) {
+            $rec = [byte[]](New-AxfrARecord -Name ('h{0}.corp.example.com' -f $i) `
+                -Ip "10.0.$([Math]::Floor($i/256)).$($i % 256)")
+            $allBytes.AddRange($rec)
+        }
+        $msg = New-AxfrMessage -AnCount 257 -Answers $allBytes.ToArray()
+        $r = ConvertFrom-DnsAxfrMessage -Bytes $msg
+        @($r.ARecords).Count | Should -Be 257
+    }
+
+    It 'parses RDLENGTH > 255 correctly (regression: byte-shift overflow)' {
+        # Build a fake answer record where RDLENGTH high-byte is non-zero
+        # (a real-world TXT or SOA can hit this). We don't care about the
+        # rdata, only that the parser advances by the full length.
+        $name = 'host.corp.example.com'
+        $bytes = [System.Collections.Generic.List[byte]]::new()
+        foreach ($lbl in $name.Split('.')) {
+            $b = [System.Text.Encoding]::ASCII.GetBytes($lbl)
+            $bytes.Add([byte]$b.Length); $bytes.AddRange($b)
+        }
+        $bytes.Add(0x00)
+        $bytes.AddRange([byte[]](0x00, 0x10))                   # type=TXT
+        $bytes.AddRange([byte[]](0x00, 0x01))                   # class=IN
+        $bytes.AddRange([byte[]](0x00, 0x00, 0x01, 0x2C))       # ttl=300
+        $bytes.AddRange([byte[]](0x01, 0x00))                   # rdlength=256 (high byte = 1!)
+        $bytes.AddRange((New-Object 'byte[]' 256))              # 256 bytes of rdata
+        # Append a real A record after, so the parser must skip the TXT correctly
+        $aRec = [byte[]](New-AxfrARecord -Name 'after.corp.example.com' -Ip '10.0.0.1')
+        $bytes.AddRange($aRec)
+
+        $msg = New-AxfrMessage -AnCount 2 -Answers $bytes.ToArray()
+        $r   = ConvertFrom-DnsAxfrMessage -Bytes $msg
+        @($r.ARecords).Count | Should -Be 1
+        $r.ARecords[0].Name | Should -Be 'after.corp.example.com'
+    }
 }
 
 Describe 'Get-DnsRcodeName' {
