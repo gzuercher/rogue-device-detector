@@ -172,7 +172,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.2'
+$SCRIPT_VERSION       = '1.6.3'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
@@ -837,7 +837,7 @@ function ConvertFrom-DnsPtrAnswer {
     param([Parameter(Mandatory)][byte[]]$Bytes)
 
     if ($Bytes.Length -lt 12) { return '' }
-    $anCount = ($Bytes[6] -shl 8) -bor $Bytes[7]
+    $anCount = ([int]$Bytes[6] -shl 8) -bor $Bytes[7]
     if ($anCount -lt 1) { return '' }
 
     # Skip the question section: walk the QNAME labels, then 4 bytes (QTYPE+QCLASS).
@@ -860,8 +860,8 @@ function ConvertFrom-DnsPtrAnswer {
             $offset++
         }
         if ($offset + 10 -gt $Bytes.Length) { return '' }
-        $type    = ($Bytes[$offset] -shl 8) -bor $Bytes[$offset + 1]
-        $rdlen   = ($Bytes[$offset + 8] -shl 8) -bor $Bytes[$offset + 9]
+        $type    = ([int]$Bytes[$offset] -shl 8) -bor $Bytes[$offset + 1]
+        $rdlen   = ([int]$Bytes[$offset + 8] -shl 8) -bor $Bytes[$offset + 9]
         $rdStart = $offset + 10
         if ($type -eq 0x000C) {
             return Read-DnsName -Bytes $Bytes -Offset $rdStart
@@ -892,7 +892,7 @@ function Read-DnsName {
         if ($len -eq 0) { break }
         if (($len -band 0xC0) -eq 0xC0) {
             if ($cursor + 1 -ge $Bytes.Length) { return '' }
-            $cursor = (($len -band 0x3F) -shl 8) -bor $Bytes[$cursor + 1]
+            $cursor = ([int]($len -band 0x3F) -shl 8) -bor $Bytes[$cursor + 1]
             $hops++
             if ($hops -gt 16) { return '' }   # guard against pointer loops
             continue
@@ -990,8 +990,8 @@ function ConvertFrom-DnsAxfrMessage {
     if ($Bytes.Length -lt 12) { return $empty }
 
     $rcode   = $Bytes[3] -band 0x0F
-    $qdCount = ($Bytes[4] -shl 8) -bor $Bytes[5]
-    $anCount = ($Bytes[6] -shl 8) -bor $Bytes[7]
+    $qdCount = ([int]$Bytes[4] -shl 8) -bor $Bytes[5]
+    $anCount = ([int]$Bytes[6] -shl 8) -bor $Bytes[7]
 
     if ($rcode -ne 0) {
         return [PSCustomObject]@{ ARecords = @(); SoaCount = 0; Rcode = $rcode }
@@ -1016,8 +1016,8 @@ function ConvertFrom-DnsAxfrMessage {
         $offset += $nameBytes
         if ($offset + 10 -gt $Bytes.Length) { break }
 
-        $type    = ($Bytes[$offset] -shl 8) -bor $Bytes[$offset + 1]
-        $rdLen   = ($Bytes[$offset + 8] -shl 8) -bor $Bytes[$offset + 9]
+        $type    = ([int]$Bytes[$offset] -shl 8) -bor $Bytes[$offset + 1]
+        $rdLen   = ([int]$Bytes[$offset + 8] -shl 8) -bor $Bytes[$offset + 9]
         $rdStart = $offset + 10
         if ($rdStart + $rdLen -gt $Bytes.Length) { break }
 
@@ -1098,7 +1098,7 @@ function Invoke-DnsAxfr {
             $lenBuf = New-Object 'byte[]' 2
             $got = Read-StreamExact -Stream $stream -Buffer $lenBuf -Length 2 -Deadline $deadline
             if ($got -lt 2) { break }
-            $msgLen = ($lenBuf[0] -shl 8) -bor $lenBuf[1]
+            $msgLen = ([int]$lenBuf[0] -shl 8) -bor $lenBuf[1]
             if ($msgLen -le 0) { break }
 
             $msgBuf = New-Object 'byte[]' $msgLen
