@@ -1610,3 +1610,31 @@ Describe 'Test-ZtcEnabled / Get-ZtcField' {
         Get-ZtcField -Config @{}                                      -Name 'server' | Should -BeNullOrEmpty
     }
 }
+
+# ── Static analysis: comma-binds-before-band trap ─────────────────────────────
+#
+# Regression for v1.6.4 production bug: PowerShell parses the comma operator
+# before -band, so an idiom like
+#     [byte[]]@(($x -shr 8) -band 0xFF, $x -band 0xFF)
+# is interpreted as
+#     ($x -shr 8) -band <Object[] of (0xFF, ($x -band 0xFF))>
+# and crashes at runtime with "op_BitwiseAnd not found on Object[]". The
+# defensive idiom is to compute each byte to a separate variable first.
+# This test scans the main script for the trap so it can't sneak back in.
+
+Describe 'Static analysis: comma-band-array trap' {
+
+    It 'main script has no `[byte[]]@(... -band ..., ...)` patterns' {
+        $scriptPath = "$PSScriptRoot/../rogue-device-detector.ps1"
+        $code = Get-Content $scriptPath -Raw
+        # Pattern: a [byte[]] cast wrapping an array literal whose first
+        # comma is preceded by something containing -band on the same line.
+        # The capture deliberately stops at the first comma, so subsequent
+        # array elements don't matter.
+        $matches = [regex]::Matches($code, '\[byte\[\]\]@?\([^)\r\n]*-band[^,\r\n]*,')
+        if ($matches.Count -gt 0) {
+            $hits = ($matches | ForEach-Object { $_.Value }) -join "`n  "
+            throw "Found $($matches.Count) byte-array literal(s) with -band before the first comma — PowerShell will parse the comma first and crash with op_BitwiseAnd. Fix by computing each byte separately. Hits:`n  $hits"
+        }
+    }
+}

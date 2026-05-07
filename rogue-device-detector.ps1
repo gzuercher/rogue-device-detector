@@ -1109,7 +1109,13 @@ function Invoke-DnsAxfr {
         }
 
         # TCP DNS frames each message with a 2-byte big-endian length prefix.
-        $lenPrefix = [byte[]]@(($packet.Length -shr 8) -band 0xFF, $packet.Length -band 0xFF)
+        # PowerShell parses the comma operator before -band, so naively writing
+        # `[byte[]]@(($x -shr 8) -band 0xFF, $x -band 0xFF)` is interpreted as
+        # `($x -shr 8) -band <array of 0xFF, ...>` and crashes with
+        # "op_BitwiseAnd not found on Object[]". Compute the bytes separately.
+        $lenHi = ($packet.Length -shr 8) -band 0xFF
+        $lenLo = $packet.Length -band 0xFF
+        $lenPrefix = [byte[]]@($lenHi, $lenLo)
         $stream.Write($lenPrefix, 0, 2)
         $stream.Write($packet,    0, $packet.Length)
         $stream.Flush()
