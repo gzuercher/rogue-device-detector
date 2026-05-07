@@ -170,9 +170,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# -Debug normally drops into an Inquire prompt at every Write-Debug; that
+# breaks unattended scans. With CmdletBinding active above, $PSBoundParameters
+# carries the operator's choice, so we promote it to plain 'Continue' streaming
+# output. -Verbose is handled automatically by PowerShell.
+if ($PSBoundParameters.ContainsKey('Debug') -and $PSBoundParameters['Debug']) {
+    $DebugPreference = 'Continue'
+}
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.3'
+$SCRIPT_VERSION       = '1.6.4'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
@@ -310,7 +318,8 @@ function Get-Configuration {
                 }
             }
         } catch {
-            Write-RddLog "Could not parse config file '$ConfigPath': $_" -Level WARN
+            Write-RddLog "Could not parse config file '$ConfigPath': $($_.Exception.Message)" -Level WARN
+            Write-Verbose "Get-Configuration: $($_.Exception | Out-String)"
         }
     } else {
         Write-RddLog "Config file not found at '$ConfigPath'. Using defaults." -Level WARN
@@ -323,6 +332,12 @@ function Get-Configuration {
     }
 
     if ($SubnetOverride) { $cfg.subnet = $SubnetOverride }
+
+    # Verbose dump of resolved config so a -Verbose log is self-contained.
+    Write-Verbose "Resolved config (subnet=$($cfg.subnet), enrichment=$($cfg.enrichment), absentDays=$($cfg.absentDays), alertRiskLevel=$($cfg.alertRiskLevel), summaryReport=$($cfg.summaryReport))"
+    Write-Verbose "Resolved paths (state=$($cfg.statePath), oui=$($cfg.ouiPath), log=$($cfg.logPath))"
+    Write-Verbose "Resolved smtp  (host=$($cfg.smtp.host), port=$($cfg.smtp.port), useSsl=$($cfg.smtp.useSsl), user='$(if ($cfg.smtp.user) { '***set***' } else { '' })', from=$($cfg.smtp.from), to=$($cfg.smtp.to))"
+    Write-Verbose "Resolved AXFR  (enabled=$($cfg.dnsZoneTransfer.enabled), server='$($cfg.dnsZoneTransfer.server)', zone='$($cfg.dnsZoneTransfer.zone)')"
     return $cfg
 }
 
@@ -407,6 +422,7 @@ function Invoke-PingSweep {
     }
 
     Write-RddLog "Pinging $($SubnetInfo.HostCount) host(s) in $($SubnetInfo.NetworkAddress)/$($SubnetInfo.PrefixLength)..."
+    $sweepSw = [System.Diagnostics.Stopwatch]::StartNew()
 
     $tasks = [System.Collections.Generic.List[hashtable]]::new()
 
@@ -421,6 +437,7 @@ function Invoke-PingSweep {
 
     $ttlMap = @{}
     $count  = 0
+    $errors = 0
     foreach ($t in $tasks) {
         try {
             $reply = $t.Task.GetAwaiter().GetResult()
@@ -431,12 +448,16 @@ function Invoke-PingSweep {
                 }
             }
         } catch {
-            Write-RddLog "Ping failed for $($t.IP): $_" -Level WARN
+            $errors++
+            Write-RddLog "Ping failed for $($t.IP): $($_.Exception.Message)" -Level WARN
+            Write-Verbose "Ping exception for $($t.IP): $($_.Exception | Out-String)"
         }
         finally { $t.Ping.Dispose() }
     }
+    $sweepSw.Stop()
 
     Write-RddLog "Ping sweep complete: $count host(s) responded."
+    Write-Verbose "Ping sweep finished in $($sweepSw.ElapsedMilliseconds)ms ($count replies, $errors errors out of $($SubnetInfo.HostCount) probes)"
     return $ttlMap
 }
 
@@ -743,7 +764,7 @@ function Invoke-MulticastDnsPtrQuery {
             if ($name) { return $name }
         }
     } catch {
-        $null = $_
+        Write-Verbose "Multicast PTR query failed for ${IP}: $($_.Exception.Message)"
     } finally {
         if ($client) { try { $client.Dispose() } catch { $null = $_ } }
     }
@@ -799,7 +820,8 @@ function Invoke-MulticastDnsPtrBatch {
                 [void]$client.Send($packet, $packet.Length, $ep)
                 [void]$askedSet.Add($ip)
             } catch {
-                $null = $_   # individual send failure shouldn't kill the batch
+                # Individual send failure shouldn't kill the batch.
+                Write-Verbose "Multicast PTR send failed for ${ip}: $($_.Exception.Message)"
             }
         }
 
@@ -1069,6 +1091,7 @@ function Invoke-DnsAxfr {
     $result = [PSCustomObject]@{ Map = @{}; Status = 'unreachable'; Detail = '' }
     $tcp    = $null
     try {
+        Write-Verbose "AXFR: connecting to ${Server}:${Port} (connect timeout ${ConnectTimeoutMs}ms)"
         $tcp = [System.Net.Sockets.TcpClient]::new()
         $connectTask = $tcp.ConnectAsync($Server, $Port)
         if (-not $connectTask.Wait($ConnectTimeoutMs)) {
@@ -1090,22 +1113,44 @@ function Invoke-DnsAxfr {
         $stream.Write($lenPrefix, 0, 2)
         $stream.Write($packet,    0, $packet.Length)
         $stream.Flush()
+        Write-Verbose "AXFR: sent $($packet.Length)-byte query (zone '$Zone')"
 
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TotalTimeoutMs)
         $soaCount = 0
+        $msgIndex = 0
 
         while ($soaCount -lt 2 -and [DateTime]::UtcNow -lt $deadline) {
             $lenBuf = New-Object 'byte[]' 2
             $got = Read-StreamExact -Stream $stream -Buffer $lenBuf -Length 2 -Deadline $deadline
-            if ($got -lt 2) { break }
+            if ($got -lt 2) {
+                Write-Verbose "AXFR: stream ended before next length prefix (got $got bytes)"
+                break
+            }
             $msgLen = ([int]$lenBuf[0] -shl 8) -bor $lenBuf[1]
-            if ($msgLen -le 0) { break }
+            if ($msgLen -le 0) {
+                Write-Verbose "AXFR: zero-length frame, stopping"
+                break
+            }
 
             $msgBuf = New-Object 'byte[]' $msgLen
             $got = Read-StreamExact -Stream $stream -Buffer $msgBuf -Length $msgLen -Deadline $deadline
-            if ($got -lt $msgLen) { break }
+            if ($got -lt $msgLen) {
+                Write-Verbose "AXFR: short message read (expected $msgLen, got $got)"
+                break
+            }
+            $msgIndex++
+            Write-Verbose "AXFR: received message #$msgIndex ($msgLen bytes)"
+
+            # First 64 bytes of the first frame as hex — useful when the parser
+            # later complains about the wire format.
+            if ($msgIndex -eq 1) {
+                $hexLen = [Math]::Min(64, $msgBuf.Length)
+                $hex = ($msgBuf[0..($hexLen - 1)] | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+                Write-Debug "AXFR first ${hexLen}-byte dump: $hex"
+            }
 
             $parsed = ConvertFrom-DnsAxfrMessage -Bytes $msgBuf
+            Write-Verbose "AXFR: parsed message #${msgIndex} (rcode=$($parsed.Rcode), soa=$($parsed.SoaCount), A=$(@($parsed.ARecords).Count))"
             if ($parsed.Rcode -ne 0) {
                 $result.Status = 'refused'
                 $result.Detail = (Get-DnsRcodeName -Rcode $parsed.Rcode)
@@ -1125,11 +1170,21 @@ function Invoke-DnsAxfr {
             # still useful, but flag the truncation.
             $result.Status = if ([DateTime]::UtcNow -ge $deadline) { 'timeout' } else { 'malformed' }
             $result.Detail = "ended after $soaCount SOA record(s), $($result.Map.Count) A record(s)"
+            Write-Verbose "AXFR: incomplete - $($result.Status) ($($result.Detail))"
         }
     } catch [System.Net.Sockets.SocketException] {
-        $result.Status = 'unreachable'; $result.Detail = $_.Exception.SocketErrorCode.ToString()
+        $result.Status = 'unreachable'
+        $result.Detail = "$($_.Exception.SocketErrorCode): $($_.Exception.Message)"
+        Write-Verbose "AXFR socket failure: $($_.Exception | Out-String)"
     } catch {
-        $result.Status = 'malformed';   $result.Detail = $_.Exception.GetType().Name
+        $result.Status = 'malformed'
+        # Surface the real exception message — 'RuntimeException' alone is useless.
+        $result.Detail = "$($_.Exception.Message) ($($_.Exception.GetType().Name))"
+        Write-Verbose "AXFR error stack: $($_.ScriptStackTrace)"
+        Write-Verbose "AXFR full exception: $($_.Exception | Out-String)"
+        if ($_.Exception.InnerException) {
+            Write-Verbose "AXFR inner exception: $($_.Exception.InnerException | Out-String)"
+        }
     } finally {
         if ($tcp) { try { $tcp.Close() } catch { $null = $_ } }
     }
@@ -1411,7 +1466,10 @@ function Resolve-Hostname {
 
         if ($axfrServer -and $axfrZone) {
             Write-RddLog "Trying AXFR for zone '$axfrZone' from $axfrServer ..."
+            $axfrSw = [System.Diagnostics.Stopwatch]::StartNew()
             $axfr = Invoke-DnsAxfr -Server $axfrServer -Zone $axfrZone
+            $axfrSw.Stop()
+            Write-Verbose "AXFR finished in $($axfrSw.ElapsedMilliseconds)ms (status=$($axfr.Status), map size=$($axfr.Map.Count))"
             switch ($axfr.Status) {
                 'ok' {
                     Write-RddLog "AXFR for '$axfrZone' from $axfrServer succeeded: $($axfr.Detail)."
@@ -1421,6 +1479,7 @@ function Resolve-Hostname {
                             $d.hostname       = Format-DisplayHostname -Hostname $axfr.Map[$d.ip]
                             $d.hostnameSource = 'axfr'
                             $resolved++
+                            Write-Verbose "AXFR resolved: $($d.ip) -> $($d.hostname)"
                         } else {
                             $stillRemaining.Add($d)
                         }
@@ -1442,6 +1501,7 @@ function Resolve-Hostname {
     }
 
     Write-RddLog "Resolving hostnames via DNS for $(@($remaining).Count) device(s)..."
+    $dnsSw = [System.Diagnostics.Stopwatch]::StartNew()
 
     # Fire all DNS requests concurrently before waiting for any
     $tasks = $remaining | ForEach-Object {
@@ -1462,6 +1522,7 @@ function Resolve-Hostname {
     [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($whenAnyTasks))
 
     $unresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $dnsHits = 0
 
     foreach ($t in $tasks) {
         try {
@@ -1471,12 +1532,20 @@ function Resolve-Hostname {
                     $t.Device.hostname       = Format-DisplayHostname -Hostname $h
                     $t.Device.hostnameSource = 'dns'
                     $resolved++
+                    $dnsHits++
+                    Write-Verbose "DNS resolved: $($t.Device.ip) -> $($t.Device.hostname)"
                     continue
                 }
+            } else {
+                Write-Verbose "DNS no answer for $($t.Device.ip) (task status: $($t.DnsTask.Status))"
             }
-        } catch { $null = $_ }
+        } catch {
+            Write-Verbose "DNS exception for $($t.Device.ip): $($_.Exception.Message)"
+        }
         $unresolved.Add($t.Device)
     }
+    $dnsSw.Stop()
+    Write-Verbose "DNS stage: $dnsHits/$(@($remaining).Count) resolved in $($dnsSw.ElapsedMilliseconds)ms"
 
     # mDNS fallback — passive multicast: one query burst, one ~3s listen window,
     # everyone who replies gets their hostname mapped. Drops what used to be
@@ -1484,18 +1553,24 @@ function Resolve-Hostname {
     if (@($unresolved).Count -gt 0) {
         $unresolvedIps = @($unresolved | ForEach-Object { $_.ip })
         Write-RddLog "Trying mDNS fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $stageSw = [System.Diagnostics.Stopwatch]::StartNew()
         $mdnsMap = Invoke-MulticastDnsPtrBatch -Ips $unresolvedIps `
             -Group '224.0.0.251' -Port 5353 -ListenMs 3000 -UnicastResponseBit
         $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $stageHits = 0
         foreach ($d in $unresolved) {
             if ($mdnsMap.ContainsKey($d.ip)) {
                 $d.hostname       = Format-DisplayHostname -Hostname $mdnsMap[$d.ip]
                 $d.hostnameSource = 'mdns'
                 $resolved++
+                $stageHits++
+                Write-Verbose "mDNS resolved: $($d.ip) -> $($d.hostname)"
             } else {
                 $stillUnresolved.Add($d)
             }
         }
+        $stageSw.Stop()
+        Write-Verbose "mDNS stage: $stageHits/$($unresolvedIps.Count) resolved in $($stageSw.ElapsedMilliseconds)ms"
         $unresolved = $stillUnresolved
     }
 
@@ -1503,32 +1578,45 @@ function Resolve-Hostname {
     if (@($unresolved).Count -gt 0) {
         $unresolvedIps = @($unresolved | ForEach-Object { $_.ip })
         Write-RddLog "Trying LLMNR fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $stageSw = [System.Diagnostics.Stopwatch]::StartNew()
         $llmnrMap = Invoke-MulticastDnsPtrBatch -Ips $unresolvedIps `
             -Group '224.0.0.252' -Port 5355 -ListenMs 3000
         $stillUnresolved = [System.Collections.Generic.List[PSCustomObject]]::new()
+        $stageHits = 0
         foreach ($d in $unresolved) {
             if ($llmnrMap.ContainsKey($d.ip)) {
                 $d.hostname       = Format-DisplayHostname -Hostname $llmnrMap[$d.ip]
                 $d.hostnameSource = 'llmnr'
                 $resolved++
+                $stageHits++
+                Write-Verbose "LLMNR resolved: $($d.ip) -> $($d.hostname)"
             } else {
                 $stillUnresolved.Add($d)
             }
         }
+        $stageSw.Stop()
+        Write-Verbose "LLMNR stage: $stageHits/$($unresolvedIps.Count) resolved in $($stageSw.ElapsedMilliseconds)ms"
         $unresolved = $stillUnresolved
     }
 
     # NetBIOS fallback (legacy Windows / SMB devices)
     if (@($unresolved).Count -gt 0) {
         Write-RddLog "Trying NetBIOS fallback for $(@($unresolved).Count) unresolved device(s)..."
+        $stageSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $stageHits = 0
+        $stageStart = @($unresolved).Count
         foreach ($d in $unresolved) {
             $nbName = Resolve-HostnameNetBios -IP $d.ip
             if ($nbName) {
                 $d.hostname       = Format-DisplayHostname -Hostname $nbName
                 $d.hostnameSource = 'nbns'
                 $resolved++
+                $stageHits++
+                Write-Verbose "NetBIOS resolved: $($d.ip) -> $($d.hostname)"
             }
         }
+        $stageSw.Stop()
+        Write-Verbose "NetBIOS stage: $stageHits/$stageStart resolved in $($stageSw.ElapsedMilliseconds)ms"
     }
 
     Write-RddLog "Hostname resolution complete: $resolved/$total resolved."
@@ -1782,8 +1870,12 @@ function Invoke-DeviceEnrichment {
     param([Parameter(Mandatory)][array]$Devices)
 
     Write-RddLog "Enriching $($Devices.Count) device(s) (ports / banner / UPnP)..."
+    $enrichSw = [System.Diagnostics.Stopwatch]::StartNew()
     Write-RddLog 'Running UPnP discovery...'
+    $upnpSw = [System.Diagnostics.Stopwatch]::StartNew()
     $upnpMap = Invoke-UpnpDiscovery
+    $upnpSw.Stop()
+    Write-Verbose "UPnP discovery: $(@($upnpMap.Keys).Count) devices announced in $($upnpSw.ElapsedMilliseconds)ms"
 
     $i = 0
     foreach ($d in $Devices) {
@@ -1793,6 +1885,9 @@ function Invoke-DeviceEnrichment {
                        -PercentComplete ([int]($i / $Devices.Count * 100))
 
         $d.openPorts    = @(Invoke-PortScan -IP $d.ip)
+        if (@($d.openPorts).Count -gt 0) {
+            Write-Verbose "$($d.ip): open ports $((@($d.openPorts) | Sort-Object) -join ', ')"
+        }
         $d.httpBanner   = Get-HttpBanner  -IP $d.ip -OpenPorts $d.openPorts
         $d.sshBanner    = if (22 -in $d.openPorts) { Get-SshBanner    -IP $d.ip } else { '' }
         $d.telnetBanner = if (23 -in $d.openPorts) { Get-TelnetBanner -IP $d.ip } else { '' }
@@ -1819,8 +1914,10 @@ function Invoke-DeviceEnrichment {
     }
 
     Write-Progress -Activity 'Enriching devices' -Completed
+    $enrichSw.Stop()
     $risky = @($Devices | Where-Object { $_.riskLevel -ne 'NONE' }).Count
     Write-RddLog "Enrichment done: $risky/$($Devices.Count) device(s) with risk findings."
+    Write-Verbose "Enrichment finished in $($enrichSw.ElapsedMilliseconds)ms"
 }
 
 # ── Audit Log ──────────────────────────────────────────────────────────────────
@@ -1864,7 +1961,7 @@ function Write-AuditLog {
                 Move-Item -Path $LogPath -Destination $rotated -Force -ErrorAction Stop
             } catch {
                 # Log rotation must never break the scan; carry on appending.
-                $null = $_
+                Write-Verbose "Audit log rotation failed (continuing): $($_.Exception.Message)"
             }
         }
     }
@@ -2007,7 +2104,19 @@ function Get-State {
     param([Parameter(Mandatory)][string]$StatePath)
 
     if (Test-Path $StatePath) {
-        $raw = Get-Content $StatePath -Raw | ConvertFrom-Json
+        Write-Verbose "Get-State: loading $StatePath"
+        try {
+            $raw = Get-Content $StatePath -Raw | ConvertFrom-Json
+        } catch {
+            Write-RddLog "State file '$StatePath' could not be parsed as JSON - creating fresh baseline. Reason: $($_.Exception.Message)" -Level WARN
+            Write-Verbose "Get-State exception: $($_.Exception | Out-String)"
+            return [PSCustomObject]@{
+                schemaVersion = $STATE_SCHEMA_VERSION
+                lastScan      = $null
+                knownDevices  = @()
+                seenRogues    = @()
+            }
+        }
         # Guard against empty/corrupt state file
         if ($null -eq $raw) {
             Write-RddLog "State file '$StatePath' is empty or corrupt - creating fresh baseline." -Level WARN
@@ -2105,14 +2214,26 @@ function Save-State {
     )
 
     # DryRun mode: skip persistence so a test scan leaves no trace.
-    if ((Get-Variable -Name DryRun -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { return }
+    if ((Get-Variable -Name DryRun -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) {
+        Write-Verbose "Save-State: DryRun active, skipping write to $StatePath"
+        return
+    }
 
     $stateDir = Split-Path $StatePath -Parent
     if ($stateDir -and -not (Test-Path $stateDir)) {
         New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
     }
 
-    $State | ConvertTo-Json -Depth 10 | Set-Content -Path $StatePath -Encoding UTF8
+    try {
+        $State | ConvertTo-Json -Depth 10 | Set-Content -Path $StatePath -Encoding UTF8
+        $knownCount  = if ($State.PSObject.Properties['knownDevices']) { @($State.knownDevices).Count } else { 0 }
+        $seenCount   = if ($State.PSObject.Properties['seenRogues'])   { @($State.seenRogues).Count }   else { 0 }
+        Write-Verbose "Save-State: wrote $knownCount device(s), $seenCount seenRogue(s) to $StatePath"
+    } catch {
+        Write-RddLog "Failed to write state file '$StatePath': $($_.Exception.Message)" -Level ERROR
+        Write-Verbose "Save-State exception: $($_.Exception | Out-String)"
+        throw
+    }
 }
 
 # ── Alert ──────────────────────────────────────────────────────────────────────
@@ -2221,7 +2342,11 @@ function Invoke-SmtpTest {
         Write-RddLog "Test email sent to $($SmtpConfig.to)."
         $global:LASTEXITCODE = 0
     } catch {
-        Write-RddLog "SMTP test failed: $_" -Level ERROR
+        Write-RddLog "SMTP test failed: $($_.Exception.Message)" -Level ERROR
+        Write-Verbose "SMTP test exception: $($_.Exception | Out-String)"
+        if ($_.Exception.InnerException) {
+            Write-Verbose "SMTP test inner: $($_.Exception.InnerException | Out-String)"
+        }
         $global:LASTEXITCODE = 1
     }
 }
@@ -2600,11 +2725,16 @@ Run <code style="background:#edf2f7;padding:1px 5px;border-radius:2px;font-size:
         $mailParams.Credential = New-Object System.Management.Automation.PSCredential($SmtpConfig.user, $securePass)
     }
 
+    Write-Verbose "SMTP send: $($SmtpConfig.host):$($SmtpConfig.port) useSsl=$useSsl from=$($SmtpConfig.from) to=$($SmtpConfig.to) auth=$([bool]$SmtpConfig.user)"
     try {
         Send-MailMessage @mailParams
         Write-RddLog "Alert sent to $($SmtpConfig.to)."
     } catch {
-        Write-RddLog "Failed to send notification email via SMTP $($SmtpConfig.host):$($SmtpConfig.port) - $_" -Level ERROR
+        Write-RddLog "Failed to send notification email via SMTP $($SmtpConfig.host):$($SmtpConfig.port) - $($_.Exception.Message)" -Level ERROR
+        Write-Verbose "SMTP send exception: $($_.Exception | Out-String)"
+        if ($_.Exception.InnerException) {
+            Write-Verbose "SMTP inner exception: $($_.Exception.InnerException | Out-String)"
+        }
     }
 }
 
@@ -3051,11 +3181,16 @@ function Send-SummaryReport {
         $mailParams.Credential = New-Object System.Management.Automation.PSCredential($SmtpConfig.user, $securePass)
     }
 
+    Write-Verbose "SMTP summary send: $($SmtpConfig.host):$($SmtpConfig.port) useSsl=$useSsl from=$($SmtpConfig.from) to=$($SmtpConfig.to) auth=$([bool]$SmtpConfig.user)"
     try {
         Send-MailMessage @mailParams
         Write-RddLog "Summary report sent to $($SmtpConfig.to)."
     } catch {
-        Write-RddLog "Failed to send summary report: $_" -Level ERROR
+        Write-RddLog "Failed to send summary report: $($_.Exception.Message)" -Level ERROR
+        Write-Verbose "SMTP summary exception: $($_.Exception | Out-String)"
+        if ($_.Exception.InnerException) {
+            Write-Verbose "SMTP summary inner exception: $($_.Exception.InnerException | Out-String)"
+        }
     }
 }
 

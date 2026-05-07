@@ -108,6 +108,8 @@ log are left untouched.
 | `-Version` | Switch | Print the script version and exit. |
 | `-TestSmtp` | Switch | Send a single test email using the configured SMTP settings, then exit. No scan, no state mutation. Use to validate config during initial setup. |
 | `-DryRun` | Switch | (Combine with default scan mode.) Run a full scan but skip `state.json`, audit log, and email side effects. Useful for testing config changes without consequences. |
+| `-Verbose` | Switch | Standard PowerShell switch — adds per-stage tracing: resolved config values, hostname-stage hits/misses with timings, AXFR send/receive details, SMTP connection params, full exception messages on every catch (including stack and inner). See [Diagnosing scan problems](#diagnosing-scan-problems) below. |
+| `-Debug` | Switch | Standard PowerShell switch — same as `-Verbose` plus a hex dump of the first 64 bytes of any AXFR response. Inquire prompts are suppressed (output streams continuously). |
 | `-?` / `Get-Help .\rogue-device-detector.ps1 -Full` | — | Built-in PowerShell help. Shows full parameter docs and usage examples. |
 
 ### Port Allowlist
@@ -268,6 +270,24 @@ Rogues with a port at-or-above the threshold appear in **both** the Rogue
 table (identity view) and the Risk-Findings table (security view). Per-
 device port allowlisting via `-AllowPort` is applied before the threshold
 check, so an explicitly-allowed RDP on a known terminal server stays out.
+
+### Diagnosing scan problems
+
+When something does not behave as expected — AXFR refused, hostnames not resolving, SMTP not sending — re-run the scan with PowerShell's standard tracing switches:
+
+```powershell
+# Per-stage tracing: hostname stage hits/misses with timings, full
+# exception messages on every catch, AXFR send/receive trace, SMTP
+# connection params. Captures everything except the AXFR hex dump.
+.\rogue-device-detector.ps1 -Verbose 2>&1 | Tee-Object scan.log
+
+# Same as -Verbose plus a hex dump of the first 64 bytes of any AXFR
+# response. The hex dump is what you need when reporting an unparseable
+# AXFR reply.
+.\rogue-device-detector.ps1 -Debug 2>&1 | Tee-Object debug.log
+```
+
+The output of `-Debug` is what to attach to a bug report. For AXFR-specific issues, [`tools/Test-Axfr.ps1`](tools/Test-Axfr.ps1) gives a focused side-by-side view of the same wire-level steps.
 
 ### Audit log rotation
 
