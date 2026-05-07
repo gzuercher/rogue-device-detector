@@ -6,7 +6,7 @@ A standalone PowerShell script that detects unauthorized devices on your network
 
 See [release notes](https://github.com/gzuercher/rogue-device-detector/releases) for changes between versions, [SECURITY.md](SECURITY.md) for vulnerability reporting, and [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup.
 
-**What it does:** Scans your network, builds a baseline of known devices, and alerts you when something new shows up. It also monitors known devices for risky open ports and flags devices that disappear.
+**What it does:** Scans your network, builds a baseline of known devices, and alerts you when something new shows up. It also monitors known devices for risky open ports and flags devices that disappear. See [`samples/sample-report.html`](samples/sample-report.html) for an example of what the alert email looks like.
 
 **What it doesn't do:** Real-time monitoring, vulnerability scanning, or anything that requires a cloud backend. It's a single script with a JSON config file.
 
