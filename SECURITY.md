@@ -42,5 +42,5 @@ Out of scope:
   attempt to authenticate or escalate.
 
 The trust boundary for the deployment pipeline is documented in
-[ARCHITECTURE.md](ARCHITECTURE.md#deployment-pipeline). Code-signing for the
+[docs/architecture.md](docs/architecture.md#deployment-pipeline). Code-signing for the
 bootstrap chain is tracked in [ROADMAP.md](ROADMAP.md).
