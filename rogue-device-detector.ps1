@@ -180,7 +180,7 @@ if ($PSBoundParameters.ContainsKey('Debug') -and $PSBoundParameters['Debug']) {
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.5'
+$SCRIPT_VERSION       = '1.6.6'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
@@ -2440,20 +2440,27 @@ function Send-RogueAlert {
         "<pre style=`"background:#1a202c;color:#cbd5e0;padding:10px 12px;margin:0 24px 8px;font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;border-radius:4px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;`">$safe</pre>"
     }
 
-    # Renders the hostname column. Appends a small grey '[src]' subscript when
-    # the resolver source is known (dns/mdns/llmnr/nbns/upnp), so the operator
-    # can judge name confidence at a glance — DNS is canonical, mDNS .local
-    # broadcasts are device-self-asserted, NetBIOS is legacy, etc.
+    # Renders the hostname column. Falls back to the operator-set label
+    # (with a [label] source-tag) when no resolver answered, so a manual
+    # name on a silent device still shows up. Appends a small grey '[src]'
+    # subscript so the operator can judge name confidence at a glance —
+    # DNS is canonical, mDNS .local broadcasts are device-self-asserted,
+    # NetBIOS is legacy, label is operator-curated.
     $hostCell = {
         param($Device)
-        if (-not $Device.hostname -or $Device.hostname -eq $Device.ip) {
-            return '<span style="color:#a0aec0;">-</span>'
+        $hasResolved = $Device.hostname -and $Device.hostname -ne $Device.ip
+        if ($hasResolved) {
+            $name = & $esc $Device.hostname
+            $src  = if ($Device.PSObject.Properties['hostnameSource'] -and $Device.hostnameSource) {
+                ' <span style="color:#a0aec0;font-size:10px;">[' + (& $esc $Device.hostnameSource) + ']</span>'
+            } else { '' }
+            return "$name$src"
         }
-        $name = & $esc $Device.hostname
-        $src  = if ($Device.PSObject.Properties['hostnameSource'] -and $Device.hostnameSource) {
-            ' <span style="color:#a0aec0;font-size:10px;">[' + (& $esc $Device.hostnameSource) + ']</span>'
-        } else { '' }
-        return "$name$src"
+        if ($Device.PSObject.Properties['label'] -and $Device.label) {
+            $name = & $esc $Device.label
+            return "$name <span style=`"color:#a0aec0;font-size:10px;`">[label]</span>"
+        }
+        return '<span style="color:#a0aec0;">-</span>'
     }
 
     # Stack non-empty identifier hints for one device into a multi-line cell.
@@ -2534,7 +2541,8 @@ function Send-RogueAlert {
                 $candLines = foreach ($c in $candidates) {
                     $tag = if ($c.IsExact) { ' <span style="color:#9c4221;">[exact hostname match]</span>' } else { '' }
                     $primaryMac = & $esc $c.Device.mac
-                    $candHost   = & $esc (if ($c.Device.hostname) { $c.Device.hostname } else { '-' })
+                    $candHostName = if ($c.Device.hostname) { $c.Device.hostname } else { '-' }
+                    $candHost   = & $esc $candHostName
                     $candLabel  = if ($c.Device.label) { ' &middot; ' + (& $esc $c.Device.label) } else { '' }
                     $snippet    = & $esc "$invokeToken -ApproveDevice '$($d.mac)' -AliasOf '$($c.Device.mac)'"
                     "<div style=`"margin:2px 0;`"><code style=`"font-family:Consolas,monospace;font-size:12px;`">$candHost &middot; $primaryMac$candLabel</code>$tag<br><code style=`"display:inline-block;margin-top:1px;padding:1px 4px;background:#edf2f7;font-family:Consolas,monospace;font-size:11px;color:#2d3748;`">$snippet</code></div>"
@@ -3409,6 +3417,7 @@ $foundDevices = @($arpEntries | ForEach-Object {
         ip             = $_.IP
         hostname       = $_.IP   # placeholder, overwritten by Resolve-Hostname
         hostnameSource = ''      # which resolver answered: dns/mdns/llmnr/nbns/upnp
+        label          = ''      # filled in below from baseline match (operator-set)
         vendor         = ''
         osGuess        = $osGuess
         osLabel        = $osGuess  # refined later by Get-OsLabel using banners
@@ -3461,6 +3470,12 @@ if ($LearningMode -or -not $stateFileExists) {
             $known.ip       = $device.ip
             $known.hostname = $device.hostname
             $known.osGuess  = $device.osGuess
+            # Carry the operator-set label onto the found-device so the alert
+            # renderer can fall back to it when the resolver cascade returned
+            # nothing (see $hostCell).
+            if ($known.PSObject.Properties['label'] -and $known.label) {
+                $device.label = $known.label
+            }
         } else {
             $newDevices.Add($device)
             $state.knownDevices += [PSCustomObject]@{
@@ -3490,7 +3505,11 @@ if ($LearningMode -or -not $stateFileExists) {
         foreach ($d in $newDevices) {
             $riskTag = if ($d.riskLevel -ne 'NONE') { " [$($d.riskLevel)]" } else { '' }
             $srcTag  = if ($d.PSObject.Properties['hostnameSource'] -and $d.hostnameSource) { " [$($d.hostnameSource)]" } else { '' }
-            $hostStr = if ($d.hostname -and $d.hostname -ne $d.ip) { "$($d.hostname)$srcTag" } else { '-' }
+            $hostStr = if ($d.hostname -and $d.hostname -ne $d.ip) {
+                "$($d.hostname)$srcTag"
+            } elseif ($d.PSObject.Properties['label'] -and $d.label) {
+                "$($d.label) [label]"
+            } else { '-' }
             Write-RddLog "  NEW  MAC: $($d.mac)  IP: $($d.ip)  Hostname: $hostStr  Vendor: $($d.vendor)$riskTag"
             if ($d.riskReasons -and $d.riskReasons.Count -gt 0) {
                 Write-RddLog "       RISK: $($d.riskReasons -join '; ')" -Level WARN
@@ -3553,6 +3572,12 @@ foreach ($device in $foundDevices) {
         $known.ip       = $device.ip
         $known.hostname = $device.hostname
         $known.osGuess  = $device.osGuess
+        # Carry the operator-set label onto the found-device so the alert
+        # renderer can fall back to it when the resolver cascade returned
+        # nothing (see $hostCell in Send-RogueAlert).
+        if ($known.PSObject.Properties['label'] -and $known.label) {
+            $device.label = $known.label
+        }
     } else {
         $rogueDevices.Add($device)
         Write-AuditLog -LogPath $cfg.logPath -EventName 'DEVICE_ROGUE' -Device $device `
