@@ -848,6 +848,28 @@ Describe 'Write-AuditLog' {
         $logPath = Join-Path $TestDrive 'audit-nodevice.csv'
         { Write-AuditLog -LogPath $logPath -Event 'SCAN_START' } | Should -Not -Throw
     }
+
+    It 'does not throw for a baseline device lacking openPorts/riskLevel (DEVICE_ABSENT regression)' {
+        # Stored knownDevices objects have no openPorts/riskLevel properties.
+        # Under Set-StrictMode -Version Latest, accessing a missing property throws
+        # PropertyNotFoundException - this reproduces the DEVICE_ABSENT crash.
+        $logPath = Join-Path $TestDrive 'audit-absent.csv'
+        $absent  = [PSCustomObject]@{
+            mac      = 'AA:BB:CC:11:22:33'
+            ip       = '192.168.8.50'
+            hostname = 'old-laptop'
+            vendor   = 'Acme'
+            label    = 'Reception'
+            lastSeen = '2026-01-01T00:00:00Z'
+        }
+
+        { Write-AuditLog -LogPath $logPath -Event 'DEVICE_ABSENT' -Device $absent } |
+            Should -Not -Throw
+
+        $content = Get-Content $logPath -Raw
+        $content | Should -Match 'DEVICE_ABSENT'
+        $content | Should -Match 'AA:BB:CC:11:22:33'
+    }
 }
 
 # ── Test-PathWritable ──────────────────────────────────────────────────────────

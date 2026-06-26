@@ -180,7 +180,7 @@ if ($PSBoundParameters.ContainsKey('Debug') -and $PSBoundParameters['Debug']) {
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.7'
+$SCRIPT_VERSION       = '1.6.8'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
@@ -1977,16 +1977,23 @@ function Write-AuditLog {
             -Value 'Timestamp,Event,Scanner,MAC,IP,Hostname,Vendor,OpenPorts,Risk,Details'
     }
 
+    # Devices come in two shapes: freshly scanned objects (with openPorts/riskLevel)
+    # and stored baseline objects (without them). Access every field defensively so
+    # missing properties don't throw under Set-StrictMode -Version Latest.
+    $hasProp   = { param($obj, $name) $null -ne $obj -and $null -ne $obj.PSObject.Properties[$name] }
+    $openPorts = if ((& $hasProp $Device 'openPorts') -and $Device.openPorts) { $Device.openPorts -join ' ' } else { '' }
+    $riskLevel = if ((& $hasProp $Device 'riskLevel') -and $Device.riskLevel) { $Device.riskLevel }          else { '' }
+
     $fields = @(
         (Get-Date).ToUniversalTime().ToString('o'),
         $EventName,
         $env:COMPUTERNAME,
-        $(if ($Device) { $Device.mac }                                       else { '' }),
-        $(if ($Device) { $Device.ip }                                        else { '' }),
-        $(if ($Device) { $Device.hostname }                                  else { '' }),
-        $(if ($Device) { $Device.vendor }                                    else { '' }),
-        $(if ($Device -and $Device.openPorts) { $Device.openPorts -join ' '} else { '' }),
-        $(if ($Device -and $Device.riskLevel) { $Device.riskLevel }          else { '' }),
+        $(if (& $hasProp $Device 'mac')      { $Device.mac }      else { '' }),
+        $(if (& $hasProp $Device 'ip')       { $Device.ip }       else { '' }),
+        $(if (& $hasProp $Device 'hostname') { $Device.hostname } else { '' }),
+        $(if (& $hasProp $Device 'vendor')   { $Device.vendor }   else { '' }),
+        $openPorts,
+        $riskLevel,
         $Details
     ) | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }
 
