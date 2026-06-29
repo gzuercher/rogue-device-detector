@@ -180,7 +180,7 @@ if ($PSBoundParameters.ContainsKey('Debug') -and $PSBoundParameters['Debug']) {
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-$SCRIPT_VERSION       = '1.6.7'
+$SCRIPT_VERSION       = '1.6.8'
 $OUI_URL              = 'https://standards-oui.ieee.org/oui/oui.csv'
 $OUI_MAX_AGE_DAYS     = 30
 $STATE_SCHEMA_VERSION = 5
@@ -1388,6 +1388,7 @@ function Resolve-HostnameNetBios {
         [int]$TimeoutMs = 1500
     )
 
+    $client = $null
     try {
         $client = [System.Net.Sockets.UdpClient]::new()
         $client.Client.ReceiveTimeout = $TimeoutMs
@@ -1977,18 +1978,32 @@ function Write-AuditLog {
             -Value 'Timestamp,Event,Scanner,MAC,IP,Hostname,Vendor,OpenPorts,Risk,Details'
     }
 
+    # Devices come in two shapes: freshly scanned objects (with openPorts/riskLevel)
+    # and stored baseline objects (without them). Access every field defensively so
+    # missing properties don't throw under Set-StrictMode -Version Latest.
+    $hasProp   = { param($obj, $name) $null -ne $obj -and $null -ne $obj.PSObject.Properties[$name] }
+    $openPorts = if ((& $hasProp $Device 'openPorts') -and $Device.openPorts) { $Device.openPorts -join ' ' } else { '' }
+    $riskLevel = if ((& $hasProp $Device 'riskLevel') -and $Device.riskLevel) { $Device.riskLevel }          else { '' }
+
     $fields = @(
         (Get-Date).ToUniversalTime().ToString('o'),
         $EventName,
         $env:COMPUTERNAME,
-        $(if ($Device) { $Device.mac }                                       else { '' }),
-        $(if ($Device) { $Device.ip }                                        else { '' }),
-        $(if ($Device) { $Device.hostname }                                  else { '' }),
-        $(if ($Device) { $Device.vendor }                                    else { '' }),
-        $(if ($Device -and $Device.openPorts) { $Device.openPorts -join ' '} else { '' }),
-        $(if ($Device -and $Device.riskLevel) { $Device.riskLevel }          else { '' }),
+        $(if (& $hasProp $Device 'mac')      { $Device.mac }      else { '' }),
+        $(if (& $hasProp $Device 'ip')       { $Device.ip }       else { '' }),
+        $(if (& $hasProp $Device 'hostname') { $Device.hostname } else { '' }),
+        $(if (& $hasProp $Device 'vendor')   { $Device.vendor }   else { '' }),
+        $openPorts,
+        $riskLevel,
         $Details
-    ) | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }
+    ) | ForEach-Object {
+        # CSV formula-injection hardening: hostnames/vendors come from untrusted
+        # devices. A leading = + - @ (or tab/CR) makes Excel/Sheets treat the cell
+        # as a formula on open, so prefix a single quote to neutralise it.
+        $v = [string]$_
+        if ($v -match '^[=+\-@\t\r]') { $v = "'" + $v }
+        '"' + ($v -replace '"', '""') + '"'
+    }
 
     Add-Content -Path $LogPath -Value ($fields -join ',') -Encoding UTF8
 }
@@ -2149,8 +2164,34 @@ function Get-State {
                 -NotePropertyValue ([object[]]@()) -Force
         }
 
-        # Schema migration: add missing fields from older versions
-        $requiredDeviceFields = @{ osGuess = '' }
+        # Schema migration: add missing fields from older versions.
+        #
+        # Baselines persist across script upgrades, so a state.json written by an
+        # older version (or hand-edited) can lack fields that later versions read
+        # with a raw `$d.field`. Under Set-StrictMode -Version Latest that read
+        # throws PropertyNotFoundException and crashes the whole scan/listing -
+        # this is the same class of bug as the DEVICE_ABSENT/openPorts crash.
+        # Backfilling every expected field here neutralises it at the source for
+        # all downstream call sites (Get-AbsentDevices, Show-Baseline, the HTML
+        # report, Invoke-ApproveDevice, ...). Field provenance:
+        #   firstSeen/lastSeen/ip/hostname/vendor/mac - since the initial commit
+        #   approvedBy/approvedAt                      - added with the approval workflow
+        #   label                                      - added in v1.4.2
+        #   osGuess                                    - added later still
+        # Empty-string defaults are safe: every consumer treats '' as "unset"
+        # (e.g. `if ($d.label)`, `$_.lastSeen -and ...`) and short-circuits.
+        $requiredDeviceFields = @{
+            mac        = ''
+            ip         = ''
+            hostname   = ''
+            vendor     = ''
+            osGuess    = ''
+            label      = ''
+            firstSeen  = ''
+            lastSeen   = ''
+            approvedBy = ''
+            approvedAt = ''
+        }
         foreach ($d in @($raw.knownDevices)) {
             foreach ($field in $requiredDeviceFields.Keys) {
                 if (-not ($d.PSObject.Properties[$field])) {
@@ -3223,12 +3264,20 @@ function Test-PathWritable {
         catch { return $false }
     }
 
+    # Remember whether the file already existed: OpenOrCreate will materialise a
+    # 0-byte file as a side effect, and a stray empty state.json silently defeats
+    # the first-run auto-learn check (Test-Path would then report it as existing).
+    $existedBefore = Test-Path -LiteralPath $FilePath
+
     try {
         $stream = [System.IO.File]::Open($FilePath,
             [System.IO.FileMode]::OpenOrCreate,
             [System.IO.FileAccess]::Write,
             [System.IO.FileShare]::ReadWrite)
         $stream.Dispose()
+        if (-not $existedBefore) {
+            Remove-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+        }
         return $true
     } catch {
         return $false

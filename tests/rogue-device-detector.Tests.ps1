@@ -509,6 +509,60 @@ Describe 'Get-State' {
         ($null -eq $result.knownDevices) | Should -BeFalse
         $result.knownDevices.Count       | Should -Be 0
     }
+
+    It 'backfills every expected field on a pre-v1.4.2 baseline device' {
+        # A baseline written before the approval workflow / v1.4.2 lacks
+        # label/approvedBy/approvedAt (and a hand-edited one may lack more).
+        # These persist across upgrades; without backfill a later version's
+        # raw `$d.field` access throws PropertyNotFoundException under StrictMode.
+        $path = Join-Path $TestDrive 'pre-1.4.2-state.json'
+        [PSCustomObject]@{
+            lastScan     = '2024-01-01T00:00:00.0000000Z'
+            knownDevices = @(
+                # Only the original-era fields - no label/approvedBy/approvedAt/osGuess.
+                [PSCustomObject]@{
+                    mac       = 'AA:BB:CC:DD:EE:FF'
+                    ip        = '192.168.1.50'
+                    hostname  = 'legacy-pc'
+                    vendor    = 'Acme'
+                    firstSeen = '2024-01-01T00:00:00Z'
+                    lastSeen  = '2024-01-01T00:00:00Z'
+                }
+            )
+        } | ConvertTo-Json -Depth 5 | Set-Content $path
+
+        $result = Get-State -StatePath $path
+        $d      = $result.knownDevices[0]
+
+        foreach ($field in 'mac','ip','hostname','vendor','osGuess','label','firstSeen','lastSeen','approvedBy','approvedAt') {
+            $d.PSObject.Properties[$field] | Should -Not -BeNullOrEmpty -Because "field '$field' must be backfilled"
+        }
+        # Pre-existing values must be preserved, not clobbered with the default.
+        $d.hostname   | Should -Be 'legacy-pc'
+        $d.label      | Should -Be ''
+        $d.approvedBy | Should -Be ''
+    }
+
+    It 'a backfilled legacy device survives the StrictMode consumer hot path (DEVICE_ABSENT class)' {
+        # Reproduces the recurring crash class: a baseline device missing the
+        # newer fields, read raw by downstream consumers under StrictMode Latest.
+        $path = Join-Path $TestDrive 'legacy-consumer-state.json'
+        [PSCustomObject]@{
+            lastScan     = '2024-01-01T00:00:00.0000000Z'
+            knownDevices = @(
+                [PSCustomObject]@{ mac = '11:22:33:44:55:66'; ip = '10.0.0.9'; hostname = 'old'; lastSeen = '2024-01-01T00:00:00Z' }
+            )
+        } | ConvertTo-Json -Depth 5 | Set-Content $path
+
+        $result = Get-State -StatePath $path
+        $d      = $result.knownDevices[0]
+
+        # Raw access to the late-added fields must not throw post-backfill.
+        { $null = $d.label; $null = $d.approvedBy; $null = $d.approvedAt } | Should -Not -Throw
+        # Get-AbsentDevices reads $_.lastSeen on every baseline device each scan.
+        { Get-AbsentDevices -KnownDevices $result.knownDevices -AbsentDays 21 -Now '2024-06-01T00:00:00Z' } |
+            Should -Not -Throw
+    }
 }
 
 # ── Save-State / Get-State round-trip ─────────────────────────────────────────
@@ -844,9 +898,52 @@ Describe 'Write-AuditLog' {
         $content | Should -Match '""test""'
     }
 
+    It 'neutralises CSV formula injection in untrusted device fields' {
+        $logPath = Join-Path $TestDrive 'audit-formula.csv'
+        $device  = [PSCustomObject]@{
+            mac      = 'AA:BB:CC:DD:EE:FF'
+            ip       = '192.168.1.99'
+            hostname = '=cmd|calc'
+            vendor   = '@SUM(A1)'
+        }
+
+        Write-AuditLog -LogPath $logPath -Event 'DEVICE_NEW' -Device $device
+
+        $content = Get-Content $logPath -Raw
+        # Leading formula triggers must be prefixed with a single quote so a
+        # spreadsheet treats the cell as text, not an executable formula.
+        $content | Should -Match "'=cmd\|calc"
+        $content | Should -Match "'@SUM\(A1\)"
+        # The raw, unprefixed forms must not appear inside a quoted cell.
+        $content | Should -Not -Match '"=cmd'
+        $content | Should -Not -Match '"@SUM'
+    }
+
     It 'does not throw when called without a device object' {
         $logPath = Join-Path $TestDrive 'audit-nodevice.csv'
         { Write-AuditLog -LogPath $logPath -Event 'SCAN_START' } | Should -Not -Throw
+    }
+
+    It 'does not throw for a baseline device lacking openPorts/riskLevel (DEVICE_ABSENT regression)' {
+        # Stored knownDevices objects have no openPorts/riskLevel properties.
+        # Under Set-StrictMode -Version Latest, accessing a missing property throws
+        # PropertyNotFoundException - this reproduces the DEVICE_ABSENT crash.
+        $logPath = Join-Path $TestDrive 'audit-absent.csv'
+        $absent  = [PSCustomObject]@{
+            mac      = 'AA:BB:CC:11:22:33'
+            ip       = '192.168.8.50'
+            hostname = 'old-laptop'
+            vendor   = 'Acme'
+            label    = 'Reception'
+            lastSeen = '2026-01-01T00:00:00Z'
+        }
+
+        { Write-AuditLog -LogPath $logPath -Event 'DEVICE_ABSENT' -Device $absent } |
+            Should -Not -Throw
+
+        $content = Get-Content $logPath -Raw
+        $content | Should -Match 'DEVICE_ABSENT'
+        $content | Should -Match 'AA:BB:CC:11:22:33'
     }
 }
 
@@ -869,6 +966,23 @@ Describe 'Test-PathWritable' {
         $path = Join-Path $TestDrive 'subdir/deep/writable-test.txt'
         Test-PathWritable -FilePath $path | Should -Be $true
         Test-Path (Split-Path $path -Parent) | Should -Be $true
+    }
+
+    It 'does not leave a stray file behind for a non-existent path (first-run regression)' {
+        # OpenOrCreate would materialise a 0-byte file; a stray empty state.json
+        # silently defeats the first-run auto-learn check. The probe must clean up
+        # any file it created itself.
+        $path = Join-Path $TestDrive 'should-not-persist.json'
+        Test-PathWritable -FilePath $path | Should -Be $true
+        Test-Path -LiteralPath $path | Should -Be $false
+    }
+
+    It 'leaves a pre-existing file in place' {
+        $path = Join-Path $TestDrive 'preexisting.json'
+        'keep me' | Set-Content $path
+        Test-PathWritable -FilePath $path | Should -Be $true
+        Test-Path -LiteralPath $path | Should -Be $true
+        Get-Content $path -Raw | Should -Match 'keep me'
     }
 }
 
@@ -1635,6 +1749,56 @@ Describe 'Static analysis: comma-band-array trap' {
         if ($bandHits.Count -gt 0) {
             $hits = ($bandHits | ForEach-Object { $_.Value }) -join "`n  "
             throw "Found $($bandHits.Count) byte-array literal(s) with -band before the first comma — PowerShell will parse the comma first and crash with op_BitwiseAnd. Fix by computing each byte separately. Hits:`n  $hits"
+        }
+    }
+}
+
+# ── Static analysis: no PowerShell 7-only syntax ──────────────────────────────
+#
+# The script declares `#Requires -Version 5.1` and must keep running on Windows
+# PowerShell 5.1. Operators introduced in PowerShell 7 - the ternary `a ? b : c`,
+# null-coalescing `??` / `??=`, null-conditional `?.` / `?[]`, and pipeline-chain
+# `&&` / `||` - are PARSE errors on 5.1, so a single one of them turns the whole
+# script into a hard crash on the target platform that PS7-only review misses.
+# This guard fails fast on PS7 (and locally) instead of waiting for the 5.1 CI
+# lane. It is skipped on 5.1 itself, where the 7-only AST types don't exist and
+# any such syntax would already have failed to parse.
+
+Describe 'Static analysis: no PowerShell 7-only syntax' {
+
+    It 'main script + tests use no ternary / coalescing / pipeline-chain operators' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
+        $files = @(
+            "$PSScriptRoot/../rogue-device-detector.ps1"
+        ) + (Get-ChildItem "$PSScriptRoot" -Filter '*.ps1' | ForEach-Object { $_.FullName })
+
+        $offences = foreach ($file in $files) {
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $file, [ref]$tokens, [ref]$errors)
+
+            # 7-only AST node types.
+            $astHits = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.TernaryExpressionAst] -or
+                $n -is [System.Management.Automation.Language.PipelineChainAst]
+            }, $true)
+            foreach ($h in $astHits) {
+                "{0}:{1}  {2}" -f (Split-Path $file -Leaf),
+                    $h.Extent.StartLineNumber, $h.Extent.Text
+            }
+
+            # 7-only operator tokens (?? ??= ?. ?[ ).
+            $badKinds = 'QuestionQuestion','QuestionQuestionEquals','QuestionDot','QuestionLBracket'
+            foreach ($t in $tokens) {
+                if ($t.Kind -in $badKinds) {
+                    "{0}:{1}  {2}" -f (Split-Path $file -Leaf),
+                        $t.Extent.StartLineNumber, $t.Kind
+                }
+            }
+        }
+
+        if ($offences) {
+            throw "Found PowerShell 7-only syntax that breaks on Windows PowerShell 5.1:`n  $($offences -join "`n  ")"
         }
     }
 }
