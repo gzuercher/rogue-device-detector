@@ -509,6 +509,60 @@ Describe 'Get-State' {
         ($null -eq $result.knownDevices) | Should -BeFalse
         $result.knownDevices.Count       | Should -Be 0
     }
+
+    It 'backfills every expected field on a pre-v1.4.2 baseline device' {
+        # A baseline written before the approval workflow / v1.4.2 lacks
+        # label/approvedBy/approvedAt (and a hand-edited one may lack more).
+        # These persist across upgrades; without backfill a later version's
+        # raw `$d.field` access throws PropertyNotFoundException under StrictMode.
+        $path = Join-Path $TestDrive 'pre-1.4.2-state.json'
+        [PSCustomObject]@{
+            lastScan     = '2024-01-01T00:00:00.0000000Z'
+            knownDevices = @(
+                # Only the original-era fields - no label/approvedBy/approvedAt/osGuess.
+                [PSCustomObject]@{
+                    mac       = 'AA:BB:CC:DD:EE:FF'
+                    ip        = '192.168.1.50'
+                    hostname  = 'legacy-pc'
+                    vendor    = 'Acme'
+                    firstSeen = '2024-01-01T00:00:00Z'
+                    lastSeen  = '2024-01-01T00:00:00Z'
+                }
+            )
+        } | ConvertTo-Json -Depth 5 | Set-Content $path
+
+        $result = Get-State -StatePath $path
+        $d      = $result.knownDevices[0]
+
+        foreach ($field in 'mac','ip','hostname','vendor','osGuess','label','firstSeen','lastSeen','approvedBy','approvedAt') {
+            $d.PSObject.Properties[$field] | Should -Not -BeNullOrEmpty -Because "field '$field' must be backfilled"
+        }
+        # Pre-existing values must be preserved, not clobbered with the default.
+        $d.hostname   | Should -Be 'legacy-pc'
+        $d.label      | Should -Be ''
+        $d.approvedBy | Should -Be ''
+    }
+
+    It 'a backfilled legacy device survives the StrictMode consumer hot path (DEVICE_ABSENT class)' {
+        # Reproduces the recurring crash class: a baseline device missing the
+        # newer fields, read raw by downstream consumers under StrictMode Latest.
+        $path = Join-Path $TestDrive 'legacy-consumer-state.json'
+        [PSCustomObject]@{
+            lastScan     = '2024-01-01T00:00:00.0000000Z'
+            knownDevices = @(
+                [PSCustomObject]@{ mac = '11:22:33:44:55:66'; ip = '10.0.0.9'; hostname = 'old'; lastSeen = '2024-01-01T00:00:00Z' }
+            )
+        } | ConvertTo-Json -Depth 5 | Set-Content $path
+
+        $result = Get-State -StatePath $path
+        $d      = $result.knownDevices[0]
+
+        # Raw access to the late-added fields must not throw post-backfill.
+        { $null = $d.label; $null = $d.approvedBy; $null = $d.approvedAt } | Should -Not -Throw
+        # Get-AbsentDevices reads $_.lastSeen on every baseline device each scan.
+        { Get-AbsentDevices -KnownDevices $result.knownDevices -AbsentDays 21 -Now '2024-06-01T00:00:00Z' } |
+            Should -Not -Throw
+    }
 }
 
 # ── Save-State / Get-State round-trip ─────────────────────────────────────────
@@ -1695,6 +1749,56 @@ Describe 'Static analysis: comma-band-array trap' {
         if ($bandHits.Count -gt 0) {
             $hits = ($bandHits | ForEach-Object { $_.Value }) -join "`n  "
             throw "Found $($bandHits.Count) byte-array literal(s) with -band before the first comma — PowerShell will parse the comma first and crash with op_BitwiseAnd. Fix by computing each byte separately. Hits:`n  $hits"
+        }
+    }
+}
+
+# ── Static analysis: no PowerShell 7-only syntax ──────────────────────────────
+#
+# The script declares `#Requires -Version 5.1` and must keep running on Windows
+# PowerShell 5.1. Operators introduced in PowerShell 7 - the ternary `a ? b : c`,
+# null-coalescing `??` / `??=`, null-conditional `?.` / `?[]`, and pipeline-chain
+# `&&` / `||` - are PARSE errors on 5.1, so a single one of them turns the whole
+# script into a hard crash on the target platform that PS7-only review misses.
+# This guard fails fast on PS7 (and locally) instead of waiting for the 5.1 CI
+# lane. It is skipped on 5.1 itself, where the 7-only AST types don't exist and
+# any such syntax would already have failed to parse.
+
+Describe 'Static analysis: no PowerShell 7-only syntax' {
+
+    It 'main script + tests use no ternary / coalescing / pipeline-chain operators' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
+        $files = @(
+            "$PSScriptRoot/../rogue-device-detector.ps1"
+        ) + (Get-ChildItem "$PSScriptRoot" -Filter '*.ps1' | ForEach-Object { $_.FullName })
+
+        $offences = foreach ($file in $files) {
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                $file, [ref]$tokens, [ref]$errors)
+
+            # 7-only AST node types.
+            $astHits = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.TernaryExpressionAst] -or
+                $n -is [System.Management.Automation.Language.PipelineChainAst]
+            }, $true)
+            foreach ($h in $astHits) {
+                "{0}:{1}  {2}" -f (Split-Path $file -Leaf),
+                    $h.Extent.StartLineNumber, $h.Extent.Text
+            }
+
+            # 7-only operator tokens (?? ??= ?. ?[ ).
+            $badKinds = 'QuestionQuestion','QuestionQuestionEquals','QuestionDot','QuestionLBracket'
+            foreach ($t in $tokens) {
+                if ($t.Kind -in $badKinds) {
+                    "{0}:{1}  {2}" -f (Split-Path $file -Leaf),
+                        $t.Extent.StartLineNumber, $t.Kind
+                }
+            }
+        }
+
+        if ($offences) {
+            throw "Found PowerShell 7-only syntax that breaks on Windows PowerShell 5.1:`n  $($offences -join "`n  ")"
         }
     }
 }

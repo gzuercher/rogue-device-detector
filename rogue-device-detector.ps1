@@ -2164,8 +2164,34 @@ function Get-State {
                 -NotePropertyValue ([object[]]@()) -Force
         }
 
-        # Schema migration: add missing fields from older versions
-        $requiredDeviceFields = @{ osGuess = '' }
+        # Schema migration: add missing fields from older versions.
+        #
+        # Baselines persist across script upgrades, so a state.json written by an
+        # older version (or hand-edited) can lack fields that later versions read
+        # with a raw `$d.field`. Under Set-StrictMode -Version Latest that read
+        # throws PropertyNotFoundException and crashes the whole scan/listing -
+        # this is the same class of bug as the DEVICE_ABSENT/openPorts crash.
+        # Backfilling every expected field here neutralises it at the source for
+        # all downstream call sites (Get-AbsentDevices, Show-Baseline, the HTML
+        # report, Invoke-ApproveDevice, ...). Field provenance:
+        #   firstSeen/lastSeen/ip/hostname/vendor/mac - since the initial commit
+        #   approvedBy/approvedAt                      - added with the approval workflow
+        #   label                                      - added in v1.4.2
+        #   osGuess                                    - added later still
+        # Empty-string defaults are safe: every consumer treats '' as "unset"
+        # (e.g. `if ($d.label)`, `$_.lastSeen -and ...`) and short-circuits.
+        $requiredDeviceFields = @{
+            mac        = ''
+            ip         = ''
+            hostname   = ''
+            vendor     = ''
+            osGuess    = ''
+            label      = ''
+            firstSeen  = ''
+            lastSeen   = ''
+            approvedBy = ''
+            approvedAt = ''
+        }
         foreach ($d in @($raw.knownDevices)) {
             foreach ($field in $requiredDeviceFields.Keys) {
                 if (-not ($d.PSObject.Properties[$field])) {
