@@ -844,6 +844,27 @@ Describe 'Write-AuditLog' {
         $content | Should -Match '""test""'
     }
 
+    It 'neutralises CSV formula injection in untrusted device fields' {
+        $logPath = Join-Path $TestDrive 'audit-formula.csv'
+        $device  = [PSCustomObject]@{
+            mac      = 'AA:BB:CC:DD:EE:FF'
+            ip       = '192.168.1.99'
+            hostname = '=cmd|calc'
+            vendor   = '@SUM(A1)'
+        }
+
+        Write-AuditLog -LogPath $logPath -Event 'DEVICE_NEW' -Device $device
+
+        $content = Get-Content $logPath -Raw
+        # Leading formula triggers must be prefixed with a single quote so a
+        # spreadsheet treats the cell as text, not an executable formula.
+        $content | Should -Match "'=cmd\|calc"
+        $content | Should -Match "'@SUM\(A1\)"
+        # The raw, unprefixed forms must not appear inside a quoted cell.
+        $content | Should -Not -Match '"=cmd'
+        $content | Should -Not -Match '"@SUM'
+    }
+
     It 'does not throw when called without a device object' {
         $logPath = Join-Path $TestDrive 'audit-nodevice.csv'
         { Write-AuditLog -LogPath $logPath -Event 'SCAN_START' } | Should -Not -Throw
@@ -891,6 +912,23 @@ Describe 'Test-PathWritable' {
         $path = Join-Path $TestDrive 'subdir/deep/writable-test.txt'
         Test-PathWritable -FilePath $path | Should -Be $true
         Test-Path (Split-Path $path -Parent) | Should -Be $true
+    }
+
+    It 'does not leave a stray file behind for a non-existent path (first-run regression)' {
+        # OpenOrCreate would materialise a 0-byte file; a stray empty state.json
+        # silently defeats the first-run auto-learn check. The probe must clean up
+        # any file it created itself.
+        $path = Join-Path $TestDrive 'should-not-persist.json'
+        Test-PathWritable -FilePath $path | Should -Be $true
+        Test-Path -LiteralPath $path | Should -Be $false
+    }
+
+    It 'leaves a pre-existing file in place' {
+        $path = Join-Path $TestDrive 'preexisting.json'
+        'keep me' | Set-Content $path
+        Test-PathWritable -FilePath $path | Should -Be $true
+        Test-Path -LiteralPath $path | Should -Be $true
+        Get-Content $path -Raw | Should -Match 'keep me'
     }
 }
 

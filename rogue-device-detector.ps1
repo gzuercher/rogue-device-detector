@@ -1388,6 +1388,7 @@ function Resolve-HostnameNetBios {
         [int]$TimeoutMs = 1500
     )
 
+    $client = $null
     try {
         $client = [System.Net.Sockets.UdpClient]::new()
         $client.Client.ReceiveTimeout = $TimeoutMs
@@ -1995,7 +1996,14 @@ function Write-AuditLog {
         $openPorts,
         $riskLevel,
         $Details
-    ) | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }
+    ) | ForEach-Object {
+        # CSV formula-injection hardening: hostnames/vendors come from untrusted
+        # devices. A leading = + - @ (or tab/CR) makes Excel/Sheets treat the cell
+        # as a formula on open, so prefix a single quote to neutralise it.
+        $v = [string]$_
+        if ($v -match '^[=+\-@\t\r]') { $v = "'" + $v }
+        '"' + ($v -replace '"', '""') + '"'
+    }
 
     Add-Content -Path $LogPath -Value ($fields -join ',') -Encoding UTF8
 }
@@ -3230,12 +3238,20 @@ function Test-PathWritable {
         catch { return $false }
     }
 
+    # Remember whether the file already existed: OpenOrCreate will materialise a
+    # 0-byte file as a side effect, and a stray empty state.json silently defeats
+    # the first-run auto-learn check (Test-Path would then report it as existing).
+    $existedBefore = Test-Path -LiteralPath $FilePath
+
     try {
         $stream = [System.IO.File]::Open($FilePath,
             [System.IO.FileMode]::OpenOrCreate,
             [System.IO.FileAccess]::Write,
             [System.IO.FileShare]::ReadWrite)
         $stream.Dispose()
+        if (-not $existedBefore) {
+            Remove-Item -LiteralPath $FilePath -Force -ErrorAction SilentlyContinue
+        }
         return $true
     } catch {
         return $false
