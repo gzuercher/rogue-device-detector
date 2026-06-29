@@ -63,16 +63,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shell: [pwsh, powershell]
+        include:
+          - shell: pwsh
+            label: PowerShell 7
+          - shell: powershell
+            label: Windows PowerShell 5.1
 
-    name: test (${{ matrix.shell == 'powershell' && 'Windows PowerShell 5.1' || 'PowerShell 7' }})
+    name: test (${{ matrix.label }})
+
+    # The per-step `shell:` key does not allow the matrix context, so select the
+    # PowerShell engine for the whole job here instead.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Pester 5
-        shell: ${{ matrix.shell }}
         run: |
           # PS 5.1's default TLS is too old for the PowerShell Gallery.
           [Net.ServicePointManager]::SecurityProtocol = `
@@ -81,7 +90,6 @@ jobs:
           Install-Module Pester -MinimumVersion 5.0 -Force -Scope CurrentUser
 
       - name: Run tests
-        shell: ${{ matrix.shell }}
         run: |
           # PS 5.1 ships an in-box Pester 3.4; force the freshly installed v5.
           Remove-Module Pester -ErrorAction SilentlyContinue
